@@ -1,0 +1,43 @@
+# Commissioning automatic battery control
+
+kWattson starts in **monitor mode**: it reads, forecasts, plans and advises, but sends nothing
+to your inverter. You can follow the *Suggested inverter schedule* on the Plan page by hand
+(e.g. set FoxESS "Feed-in First" for the morning on very sunny days) with zero risk.
+
+Automatic control is only possible when **all** guards pass:
+- the system is marked *controllable* and its plugin supports control;
+- control was commissioned for the current system settings (changing them requires re-commissioning);
+- no tariff is waiting for a confirmed start date;
+- fresh readings with device-verified timestamps, no fault, known battery level;
+- a fresh plan from the optimiser (not the fallback) made with fresh readings;
+- fresh weather (if you have PV).
+
+If any guard fails while a command is active, the device is **released** to its own normal mode
+immediately. If the problem lasts 30 minutes, or the device reports a fault, automatic mode is
+switched off and you are notified. A command the device doesn't confirm on read-back, or a battery that
+doesn't respond twice in a row, also stops automatic control.
+
+## Before you enable it
+1. Run for at least a week in monitor mode. Check *Plan* and *Decisions* make sense to you.
+2. Confirm the tariff: activate the new plan with the retailer-confirmed start date/time.
+3. Check physical settings: inverter AC limit, export limit (confirm your approved limit with your
+   network/installer), battery capacity, charge/discharge limits and reserve.
+4. Run *Test connection* (read-only) on the system.
+5. Know how to stop it: the **Stop automatic control** button, and the inverter's own app.
+6. Be present for the first commands and watch the inverter app.
+
+## FoxESS specifics
+- Control uses the Cloud Open API *scheduler* (time groups). Each command writes one ≤20-minute group
+  and enables the scheduler; *release* disables the scheduler.
+- **Residual risk:** FoxESS time groups repeat **daily**. If kWattson crashes or loses internet
+  while a group is active, that group can recur at the same time each day until replaced. The worst
+  case is one ≤20-minute force charge/discharge window per day, bounded by your reserve. To clear it
+  manually: FoxESS app → device → *Mode Scheduler* → turn off.
+- Force-charge power may be capped by the inverter's own settings.
+- Write support has not yet been verified on hardware by this project. Treat the first commissioning
+  as a test.
+
+## Stopping
+- Dashboard: **Stop automatic control** (always visible in automatic mode).
+- Console: `docker exec kwattson kwattson stop-control` (releases devices too).
+- If the app or the internet is down: disable the scheduler in the vendor app.

@@ -1,0 +1,32 @@
+# nginx reverse proxy for kWattson (e.g. SWAG / Nginx Proxy Manager "advanced" / plain nginx).
+# The app must be reached through exactly one origin, matching APP_URL.
+
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name solar.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/solar.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/solar.example.com/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    client_max_body_size 2m;
+
+    # Optional extra layer: restrict to your VPN / country, or add basic auth here.
+
+    location / {
+        proxy_pass http://127.0.0.1:8085;
+        proxy_http_version 1.1;
+        # The app checks Host and Origin against APP_URL: pass Host through unchanged.
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $remote_addr;   # overwrite, don't append client-supplied values
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_read_timeout 60s;
+    }
+}
+
+server {
+    listen 80;
+    server_name solar.example.com;
+    return 301 https://$host$request_uri;
+}

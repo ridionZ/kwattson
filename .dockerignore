@@ -1,0 +1,21 @@
+# Send only application and dashboard build inputs.
+**
+!Dockerfile
+!pyproject.toml
+!README.md
+!LICENSE
+!deploy/
+!deploy/requirements.lock
+!frontend/
+!frontend/package.json
+!frontend/package-lock.json
+!frontend/tsconfig.json
+!frontend/vite.config.ts
+!frontend/index.html
+!frontend/src/
+!frontend/src/**
+!frontend/public/
+!frontend/public/**
+!kwattson/
+!kwattson/**/
+!kwattson/**/*.py

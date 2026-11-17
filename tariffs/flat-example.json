@@ -1,0 +1,30 @@
+{
+  "id": "flat-example",
+  "name": "Flat rate (example)",
+  "retailer": "",
+  "plan_code": "",
+  "status": "active",
+  "active_from": null,
+  "supply_daily": 1.1,
+  "periods": [
+    {
+      "name": "anytime",
+      "label": "Any time",
+      "start": "00:00",
+      "end": "24:00",
+      "days": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6
+      ],
+      "import_rate": 0.3,
+      "export_rate": 0.05
+    }
+  ],
+  "allowances": [],
+  "notes": "Example single-rate plan. Replace the numbers with the ones on your bill (usage and supply include GST)."
+}

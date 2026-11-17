@@ -1,0 +1,149 @@
+{
+  "id": "covau-solarmax-qld",
+  "name": "CovaU SolarMax (QLD, Energex)",
+  "retailer": "CovaU",
+  "plan_code": "COV1117614MRE3",
+  "status": "pending",
+  "active_from": null,
+  "supply_daily": 1.51998,
+  "periods": [
+    {
+      "name": "ev_off_peak",
+      "label": "EV Off-Peak",
+      "start": "00:00",
+      "end": "06:00",
+      "days": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6
+      ],
+      "import_rate": 0.165,
+      "export_rate": 0.05
+    },
+    {
+      "name": "off_peak",
+      "label": "Off-Peak",
+      "start": "06:00",
+      "end": "11:00",
+      "days": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6
+      ],
+      "import_rate": 0.26906,
+      "export_rate": 0.05
+    },
+    {
+      "name": "free_usage",
+      "label": "Free Usage",
+      "start": "11:00",
+      "end": "14:00",
+      "days": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6
+      ],
+      "import_rate": 0.0,
+      "export_rate": 0.05
+    },
+    {
+      "name": "off_peak_2",
+      "label": "Off-Peak",
+      "start": "14:00",
+      "end": "15:00",
+      "days": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6
+      ],
+      "import_rate": 0.26906,
+      "export_rate": 0.05
+    },
+    {
+      "name": "peak",
+      "label": "Peak",
+      "start": "15:00",
+      "end": "18:00",
+      "days": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6
+      ],
+      "import_rate": 0.49555,
+      "export_rate": 0.05
+    },
+    {
+      "name": "peak_fit_peak",
+      "label": "Peak / Peak FiT",
+      "start": "18:00",
+      "end": "21:00",
+      "days": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6
+      ],
+      "import_rate": 0.49555,
+      "export_rate": 0.15
+    },
+    {
+      "name": "off_peak_3",
+      "label": "Off-Peak",
+      "start": "21:00",
+      "end": "24:00",
+      "days": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6
+      ],
+      "import_rate": 0.26906,
+      "export_rate": 0.05
+    }
+  ],
+  "allowances": [
+    {
+      "kind": "import",
+      "periods": [
+        "free_usage"
+      ],
+      "kwh_per_day": 50.0,
+      "rate_after": 0.26906
+    },
+    {
+      "kind": "export",
+      "periods": [
+        "peak_fit_peak"
+      ],
+      "kwh_per_day": 30.0,
+      "rate_after": 0.05
+    }
+  ],
+  "notes": "Imported from AER CDR COV1117614MRE3@EME (effective 2026-10-01); rates incl GST, feed-in as published. Retailer times are AEST (no daylight saving)."
+}

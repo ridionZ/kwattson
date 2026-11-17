@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kwattson"
+description = "Self-hosted home energy controller: forecasts solar and load, plans battery use around your tariff, explains every decision."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+dynamic = ["version"]
+dependencies = [
+  "fastapi>=0.115,<1",
+  "uvicorn>=0.30,<1",
+  "httpx>=0.27,<1",
+  "numpy>=2,<3",
+  "scipy>=1.14,<2",
+  "pydantic>=2.7,<3",
+  "cryptography>=43,<47",
+  "argon2-cffi>=23,<26",
+  "pyotp>=2.9,<3",
+]
+
+[project.optional-dependencies]
+mg = ["saic-ismart-client-ng>=0.16,<0.17"]
+dev = ["pytest>=8,<10"]
+
+[project.scripts]
+kwattson = "kwattson.cli:main"
+
+# Third-party hardware plugins register here (see docs/PLUGINS.md), e.g.:
+# [project.entry-points."kwattson.plugins"]
+# acme = "kwattson_acme:AcmeInverter"
+
+[tool.setuptools.dynamic]
+version = {attr = "kwattson.__version__"}
+
+[tool.setuptools.packages.find]
+include = ["kwattson*"]
+
+[tool.setuptools.package-data]
+kwattson = ["web/static/*", "web/static/**/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

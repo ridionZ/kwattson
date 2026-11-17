@@ -1,0 +1,183 @@
+{
+  "$defs": {
+    "Allowance": {
+      "additionalProperties": false,
+      "description": "A daily kWh allowance at the period's rate; beyond it ``rate_after`` applies.",
+      "properties": {
+        "kind": {
+          "pattern": "^(import|export)$",
+          "title": "Kind",
+          "type": "string"
+        },
+        "periods": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Periods",
+          "type": "array"
+        },
+        "kwh_per_day": {
+          "maximum": 1000,
+          "minimum": 0,
+          "title": "Kwh Per Day",
+          "type": "number"
+        },
+        "rate_after": {
+          "maximum": 5,
+          "minimum": -2,
+          "title": "Rate After",
+          "type": "number"
+        }
+      },
+      "required": [
+        "kind",
+        "periods",
+        "kwh_per_day",
+        "rate_after"
+      ],
+      "title": "Allowance",
+      "type": "object"
+    },
+    "Period": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "maxLength": 40,
+          "minLength": 1,
+          "pattern": "^[a-z0-9_]+$",
+          "title": "Name",
+          "type": "string"
+        },
+        "label": {
+          "default": "",
+          "maxLength": 60,
+          "title": "Label",
+          "type": "string"
+        },
+        "start": {
+          "pattern": "^\\d\\d:\\d\\d$",
+          "title": "Start",
+          "type": "string"
+        },
+        "end": {
+          "pattern": "^\\d\\d:\\d\\d$",
+          "title": "End",
+          "type": "string"
+        },
+        "days": {
+          "items": {
+            "type": "integer"
+          },
+          "title": "Days",
+          "type": "array"
+        },
+        "import_rate": {
+          "maximum": 5,
+          "minimum": -2,
+          "title": "Import Rate",
+          "type": "number"
+        },
+        "export_rate": {
+          "maximum": 5,
+          "minimum": -2,
+          "title": "Export Rate",
+          "type": "number"
+        }
+      },
+      "required": [
+        "name",
+        "start",
+        "end",
+        "import_rate",
+        "export_rate"
+      ],
+      "title": "Period",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "maxLength": 40,
+      "minLength": 1,
+      "pattern": "^[a-z0-9_-]+$",
+      "title": "Id",
+      "type": "string"
+    },
+    "name": {
+      "maxLength": 80,
+      "minLength": 1,
+      "title": "Name",
+      "type": "string"
+    },
+    "retailer": {
+      "default": "",
+      "maxLength": 80,
+      "title": "Retailer",
+      "type": "string"
+    },
+    "plan_code": {
+      "default": "",
+      "maxLength": 40,
+      "title": "Plan Code",
+      "type": "string"
+    },
+    "status": {
+      "default": "active",
+      "pattern": "^(active|pending|retired)$",
+      "title": "Status",
+      "type": "string"
+    },
+    "active_from": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "UTC ISO timestamp the retailer confirmed; None = base plan",
+      "title": "Active From"
+    },
+    "supply_daily": {
+      "maximum": 20,
+      "minimum": 0,
+      "title": "Supply Daily",
+      "type": "number"
+    },
+    "periods": {
+      "items": {
+        "$ref": "#/$defs/Period"
+      },
+      "maxItems": 48,
+      "minItems": 1,
+      "title": "Periods",
+      "type": "array"
+    },
+    "allowances": {
+      "items": {
+        "$ref": "#/$defs/Allowance"
+      },
+      "maxItems": 10,
+      "title": "Allowances",
+      "type": "array"
+    },
+    "notes": {
+      "default": "",
+      "maxLength": 1000,
+      "title": "Notes",
+      "type": "string"
+    }
+  },
+  "required": [
+    "id",
+    "name",
+    "supply_daily",
+    "periods"
+  ],
+  "title": "TariffPlan",
+  "type": "object"
+}

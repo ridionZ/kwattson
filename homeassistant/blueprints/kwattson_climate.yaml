@@ -1,0 +1,142 @@
+blueprint:
+  name: kWattson — run the AC when energy is cheap
+  description: >
+    Starts heating/cooling when kWattson signals cheap or spare-solar energy and hot/cold weather,
+    but only if you opted in, someone is home and the indoor temperature calls for it.
+    It ALWAYS stops the AC it started: when the signal ends, when kWattson goes offline,
+    or after a hard maximum runtime — even if kWattson is unreachable.
+    It never turns off an AC that it did not start.
+  domain: automation
+  input:
+    climate_entity:
+      name: Air conditioner
+      selector: { entity: { domain: climate } }
+    signal_sensor:
+      name: kWattson climate signal sensor
+      default: sensor.kwattson_climate_signal
+      selector: { entity: { domain: sensor } }
+    online_sensor:
+      name: kWattson online sensor
+      default: binary_sensor.kwattson_online
+      selector: { entity: { domain: binary_sensor } }
+    opt_in:
+      name: Opt-in switch
+      default: input_boolean.kwattson_ac_automation
+      selector: { entity: { domain: input_boolean } }
+    running_flag:
+      name: "Helper: AC started by this automation"
+      default: input_boolean.kwattson_ac_running
+      selector: { entity: { domain: input_boolean } }
+    presence:
+      name: Someone is home (zone.home count or a group/person)
+      default: zone.home
+      selector: { entity: {} }
+    indoor_temperature:
+      name: Indoor temperature sensor
+      selector: { entity: { domain: sensor, device_class: temperature } }
+    cool_above:
+      name: Only cool if indoor is above (°C)
+      default: 25
+      selector: { number: { min: 18, max: 32, step: 0.5, unit_of_measurement: °C } }
+    cool_setpoint:
+      name: Cooling setpoint (°C)
+      default: 23
+      selector: { number: { min: 16, max: 30, step: 0.5, unit_of_measurement: °C } }
+    heat_below:
+      name: Only heat if indoor is below (°C)
+      default: 18
+      selector: { number: { min: 10, max: 24, step: 0.5, unit_of_measurement: °C } }
+    heat_setpoint:
+      name: Heating setpoint (°C)
+      default: 21
+      selector: { number: { min: 14, max: 28, step: 0.5, unit_of_measurement: °C } }
+    max_minutes:
+      name: Hard maximum runtime (minutes)
+      default: 120
+      selector: { number: { min: 15, max: 240, step: 5, unit_of_measurement: min } }
+
+mode: queued
+max: 5
+
+trigger:
+  - platform: state
+    entity_id: !input signal_sensor
+    to: [cool, heat]
+    id: start
+  - platform: state
+    entity_id: !input signal_sensor
+    to: none
+    for: { minutes: 5 }
+    id: stop
+  - platform: state
+    entity_id: !input online_sensor
+    to: ["off", unavailable]
+    for: { minutes: 10 }
+    id: stop
+  - platform: state
+    entity_id: !input running_flag
+    to: "on"
+    for: { minutes: !input max_minutes }
+    id: stop
+  - platform: state
+    entity_id: !input opt_in
+    to: "off"
+    id: stop
+  - platform: homeassistant
+    event: start
+    id: stop
+
+variables:
+  climate_entity_id: !input climate_entity
+  cool_setpoint: !input cool_setpoint
+  heat_setpoint: !input heat_setpoint
+  presence_entity: !input presence
+  indoor_entity: !input indoor_temperature
+  signal_entity: !input signal_sensor
+  cool_above: !input cool_above
+  heat_below: !input heat_below
+
+action:
+  - choose:
+      - conditions:
+          - condition: trigger
+            id: start
+          - condition: state
+            entity_id: !input opt_in
+            state: "on"
+          - condition: state
+            entity_id: !input running_flag
+            state: "off"
+          - condition: template
+            value_template: >
+              {% set p = states(presence_entity) %}
+              {{ (p | int(0)) > 0 if presence_entity.startswith('zone.') else p in ['home', 'on'] }}
+          - condition: template
+            value_template: >
+              {% set mode = states(signal_entity) %}
+              {% set t = states(indoor_entity) | float(none) %}
+              {{ t is not none and ((mode == 'cool' and t > cool_above) or (mode == 'heat' and t < heat_below)) }}
+        sequence:
+          - variables:
+              mode: "{{ states(signal_entity) }}"
+          # Never take over an AC that someone is already using.
+          - condition: template
+            value_template: "{{ is_state(climate_entity_id, 'off') }}"
+          - service: input_boolean.turn_on
+            target: { entity_id: !input running_flag }
+          - service: climate.set_temperature
+            target: { entity_id: !input climate_entity }
+            data:
+              hvac_mode: "{{ mode }}"
+              temperature: "{{ cool_setpoint if mode == 'cool' else heat_setpoint }}"
+      - conditions:
+          - condition: trigger
+            id: stop
+          - condition: state
+            entity_id: !input running_flag
+            state: "on"
+        sequence:
+          - service: climate.turn_off
+            target: { entity_id: !input climate_entity }
+          - service: input_boolean.turn_off
+            target: { entity_id: !input running_flag }

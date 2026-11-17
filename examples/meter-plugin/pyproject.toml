@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kwattson-example-meter"
+version = "0.1.0"
+description = "Synthetic read-only meter for trying the kWattson plugin workflow"
+requires-python = ">=3.11"
+dependencies = ["kwattson"]
+
+[project.entry-points."kwattson.plugins"]
+example_meter = "example_meter:ExampleMeter"
+
+[tool.setuptools]
+py-modules = ["example_meter"]

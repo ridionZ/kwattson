@@ -1,0 +1,68 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# Private runtime data — never commit
+data/
+*.sqlite3*
+*.sqlite
+master.key
+setup-token
+*.key
+.env
+*.jsonl
+backups/
+
+# Local working files
+_old/
+HANDOVER.md
+*.png
+*.tar.gz
+
+# Screenshots for the README are fine to commit
+!docs/screenshots/alerts-settings-desktop.png
+!docs/screenshots/history-desktop.png
+!docs/screenshots/overview-dark-desktop.png
+!docs/screenshots/overview-desktop.png
+!docs/screenshots/overview-mobile.png
+!docs/screenshots/plan-desktop.png
+!docs/screenshots/plan-mobile.png
+!docs/screenshots/settings-desktop.png
+!docs/screenshots/wizard-desktop.png
+!docs/screenshots/setup-checklist-desktop.png
+!docs/screenshots/vehicle-mobile.png
+
+# Front-end build tooling
+node_modules/
+frontend/*/dist/
+
+# Large optional skill installed by tools/install-skills.sh
+.claude/skills/modern-web-guidance/
+
+# Third-party skills installed by tools/install-skills.sh (referenced, not redistributed)
+.claude/skills/frontend-design/
+.claude/skills/frontend-ui-engineering/
+.claude/skills/webapp-testing/
+
+# Local-only design notes and editable logo sources
+docs/design/
+docs/brand/src/
+
+# Local setup, account exports and agent workspaces
+.env.*
+*.db
+*.db-*
+*.sqlite-*
+*.pem
+*.log
+*.whl
+*.tgz
+my-settings*.json
+settings-export*.json
+private/
+.claude/settings.local.json

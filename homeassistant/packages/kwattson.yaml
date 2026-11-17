@@ -1,0 +1,58 @@
+# kWattson → Home Assistant package.
+# 1. In kWattson: Security → API tokens → create a "read" token.
+# 2. secrets.yaml:
+#      kwattson_state_url: https://solar.example.com/api/ha/state
+#      kwattson_token: "Bearer kw_xxxxxxxx"
+# 3. configuration.yaml:  homeassistant: { packages: !include_dir_named packages }
+#    and copy this file into config/packages/.
+
+rest:
+  - resource: !secret kwattson_state_url
+    headers:
+      Authorization: !secret kwattson_token
+    scan_interval: 120
+    timeout: 20
+    sensor:
+      - name: kWattson battery
+        unique_id: kwattson_battery_soc
+        value_template: "{{ value_json.battery_soc | round(1) if value_json.battery_soc is not none else none }}"
+        unit_of_measurement: "%"
+        device_class: battery
+      - name: kWattson solar power
+        unique_id: kwattson_solar_kw
+        value_template: "{{ value_json.solar_kw }}"
+        unit_of_measurement: kW
+        device_class: power
+      - name: kWattson grid power
+        unique_id: kwattson_grid_kw
+        value_template: "{{ value_json.grid_kw }}"
+        unit_of_measurement: kW
+        device_class: power
+      - name: kWattson import price
+        unique_id: kwattson_price
+        value_template: "{{ value_json.price_cents }}"
+        unit_of_measurement: c/kWh
+        json_attributes: [feed_in_cents, tariff_period]
+      - name: kWattson planned action
+        unique_id: kwattson_action
+        value_template: "{{ value_json.action }}"
+        json_attributes: [reason, mode, modelled_saving_24h]
+      - name: kWattson climate signal
+        unique_id: kwattson_climate
+        # "cool", "heat" or "none"; attributes say for how long and why.
+        value_template: "{{ value_json.climate.mode if value_json.climate and value_json.climate.available else 'none' }}"
+        json_attributes_path: "$.climate"
+        json_attributes: [available, duration_minutes, valid_until, estimated_cost_aud, cents_per_kwh, reason]
+    binary_sensor:
+      - name: kWattson online
+        unique_id: kwattson_online
+        value_template: "{{ value_json.available }}"
+        device_class: connectivity
+
+input_boolean:
+  kwattson_ac_automation:
+    name: Let kWattson pre-cool / pre-heat
+    icon: mdi:air-conditioner
+  kwattson_ac_running:
+    name: kWattson started the AC
+    icon: mdi:robot

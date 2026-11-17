@@ -1,0 +1,31 @@
+# Example compose file. On Unraid you can use this with the Compose Manager
+# plugin, or copy the same settings into a Docker template (see deploy/UNRAID.md).
+services:
+  kwattson:
+    image: kwattson:latest
+    build: ..
+    container_name: kwattson
+    restart: unless-stopped
+    environment:
+      # The exact public origin you browse to (through nginx). Required.
+      APP_URL: https://solar.example.com
+      TZ: Australia/Brisbane
+      # IP of your nginx proxy as seen by the container, so login rate limits see real client IPs.
+      FORWARDED_ALLOW_IPS: 172.17.0.1
+      # LAN Home Assistant (or other private hosts) the app may call. Comma separated.
+      OUTBOUND_ALLOW_HOSTS: ""
+      # Raise to 31536000 once HTTPS is working reliably.
+      HSTS_SECONDS: "300"
+    volumes:
+      - /mnt/user/appdata/kwattson:/data
+    ports:
+      # Bind to the host so only nginx (same machine) reaches it. Adjust if nginx runs elsewhere.
+      - "127.0.0.1:8085:8080"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 768m
+    pids_limit: 128
