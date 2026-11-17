@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Container version="2">
+  <Name>kwattson</Name>
+  <Repository>ghcr.io/ridionz/kwattson:latest</Repository>
+  <Registry>https://github.com/ridionZ/kwattson/pkgs/container/kwattson</Registry>
+  <Network>bridge</Network>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <Overview>Monitor home solar, batteries and electric vehicles. See a two-day battery plan based on your electricity prices. The setup wizard starts in monitoring mode.</Overview>
+  <Requires>An HTTPS reverse proxy. Enter the address you use to open the dashboard below.</Requires>
+  <Category>HomeAutomation:</Category>
+  <Project>https://github.com/ridionZ/kwattson</Project>
+  <Support>https://github.com/ridionZ/kwattson/issues</Support>
+  <ReadMe>https://github.com/ridionZ/kwattson/blob/main/deploy/UNRAID.md</ReadMe>
+  <TemplateURL>https://raw.githubusercontent.com/ridionZ/kwattson/main/templates/kwattson.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/ridionZ/kwattson/main/icon.svg</Icon>
+  <Screenshot>https://raw.githubusercontent.com/ridionZ/kwattson/main/docs/screenshots/overview-desktop.png</Screenshot>
+  <License>MIT</License>
+  <ExtraParams>--publish 127.0.0.1:8085:8080 --read-only --tmpfs /tmp:size=64m,mode=1777 --cap-drop ALL --security-opt no-new-privileges:true --memory 768m --pids-limit 128</ExtraParams>
+  <Config Name="Dashboard HTTPS address" Target="APP_URL" Default="" Description="Required. Enter your reverse proxy address, for example https://energy.example.com. Include the port if it is not 443." Type="Variable" Display="always" Required="true" Mask="false"/>
+  <Config Name="Application data" Target="/data" Default="/mnt/user/appdata/kwattson" Mode="rw" Description="Stores settings, credentials, readings and backups. The container runs as user 99 and group 100." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/kwattson</Config>
+  <Config Name="Trusted reverse proxy IP" Target="FORWARDED_ALLOW_IPS" Default="127.0.0.1" Description="Set to the IP of your proxy as seen by the container so login rate limits use each client's IP." Type="Variable" Display="always" Required="true" Mask="false">127.0.0.1</Config>
+  <Config Name="Allowed local services" Target="OUTBOUND_ALLOW_HOSTS" Default="" Description="Optional comma-separated hostnames of local services the app may contact, for example homeassistant.local." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+</Container>

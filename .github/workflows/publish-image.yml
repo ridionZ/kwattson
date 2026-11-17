@@ -1,0 +1,39 @@
+name: Publish Unraid image
+on: workflow_dispatch
+permissions:
+  contents: read
+  packages: write
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    concurrency: publish-kwattson-image
+    env:
+      IMAGE: ghcr.io/ridionz/kwattson
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Build image
+        run: |
+          docker build --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" --label org.opencontainers.image.licenses=MIT \
+            -t "$IMAGE:$GITHUB_SHA" .
+      - name: Check first start
+        run: |
+          docker run -d --rm --name first-start --read-only --tmpfs /tmp --cap-drop ALL \
+            --security-opt no-new-privileges:true -p 127.0.0.1:8085:8080 \
+            -e APP_URL=https://energy.example.com "$IMAGE:$GITHUB_SHA"
+          trap 'docker stop first-start >/dev/null' EXIT
+          curl --fail --silent --show-error --retry 30 --retry-connrefused --retry-delay 1 \
+            http://127.0.0.1:8085/healthz
+          curl --fail --silent -H 'Host: energy.example.com' http://127.0.0.1:8085/api/auth/status |
+            jq -e '.setup_required and (.demo == false)'
+      - name: Publish tested image
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$REGISTRY_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker push "$IMAGE:$GITHUB_SHA"
+          docker tag "$IMAGE:$GITHUB_SHA" "$IMAGE:latest"
+          docker push "$IMAGE:latest"

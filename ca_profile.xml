@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CommunityApplications>
+  <Profile>kWattson monitors household solar, batteries and electric vehicles. Installation and hardware plugin guides are in the project repository. For support, open an issue there.</Profile>
+  <Icon>https://raw.githubusercontent.com/ridionZ/kwattson/main/icon.svg</Icon>
+  <WebPage>https://github.com/ridionZ/kwattson</WebPage>
+</CommunityApplications>
