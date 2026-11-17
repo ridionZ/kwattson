@@ -6,20 +6,14 @@ You need a reverse proxy that serves HTTPS and a hostname for the dashboard.
 ## Install with the prefilled form
 
 Once the public listing is approved, open **Apps**, search for **kWattson** and select
-**Install**. To use the same form on your own server before approval, open the Unraid terminal.
-For a new checkout run:
+**Install**. To use the same form on your own server before approval, open the Unraid terminal and download the template.
+This preserves an existing saved template.
 
 ```sh
-git clone https://github.com/ridionZ/kwattson.git /mnt/user/appdata/kwattson-src
-```
-
-Then run the following. This also works for an existing checkout and preserves any saved
-template with the same name.
-
-```sh
-cd /mnt/user/appdata/kwattson-src && git pull --ff-only &&
+template_file=$(mktemp) &&
+  curl -fsSL https://raw.githubusercontent.com/ridionZ/kwattson/main/templates/kwattson.xml -o "$template_file" &&
   mkdir -p /boot/config/plugins/dockerMan/templates-user &&
-  cp -n templates/kwattson.xml /boot/config/plugins/dockerMan/templates-user/my-kwattson.xml
+  cp -n "$template_file" /boot/config/plugins/dockerMan/templates-user/my-kwattson.xml
 ```
 
 Select **Docker → Add Container → Template → kwattson**. If you already installed kWattson
@@ -52,9 +46,11 @@ open the dashboard, set **WebUI** in Advanced View to the same address.
 
 ## Build locally or use Compose
 
-If the registry image is unavailable, build it on Unraid from the checkout above:
+To build the image on Unraid, clone the public repository first. If you already have the checkout,
+use `git pull --ff-only` inside it to update the source.
 
 ```sh
+git clone https://github.com/ridionZ/kwattson.git /mnt/user/appdata/kwattson-src
 cd /mnt/user/appdata/kwattson-src && docker build -t kwattson:latest .
 ```
 
