@@ -2,7 +2,7 @@
 
 1. **Build the image** (Unraid terminal, or any Docker host then push to your registry):
    ```sh
-   git clone <your repo> /mnt/user/appdata/kwattson-src
+   git clone https://github.com/ridionZ/kwattson.git /mnt/user/appdata/kwattson-src
    cd /mnt/user/appdata/kwattson-src && docker build -t kwattson:latest .
    ```
 2. **Create the container** — either `docker compose -f deploy/docker-compose.yml up -d`
