@@ -37,9 +37,11 @@ from .weather import freshness_hours
 from .db import Database, decode, encode
 from .ingest import select_intervals
 
-LOAD_VERSION = 'profile-temperature-v2'
-SOLAR_VERSION = 'hourly-ratio-v2'
+LOAD_VERSION = 'profile-temperature-v3'
+SOLAR_VERSION = 'hourly-ratio-v3'
 VERSION = f'{LOAD_VERSION}+{SOLAR_VERSION}'
+WEATHER_PREFERRED_HOURS = 6
+WEATHER_MAX_HOURS = 24
 COLD_START_SHAPE = [.45, .35, .3, .3, .3, .35, .75, 1.15, .85, .65, .55, .6, .65, .65, .65, .7, .9, 1.25, 1.6, 1.5, 1.1, .85, .65, .5]
 
 
@@ -283,7 +285,7 @@ def build(db: Database, settings: Settings, now: datetime | None = None) -> tupl
     weather = _weather(db, now, horizon)
     weather_age = freshness_hours(db, now)
     use_weather = settings.site.weather_enabled or db.meta('demo_mode', False)
-    weather_ok = use_weather and weather_age is not None and 0 <= weather_age <= 6
+    weather_ok = use_weather and weather_age is not None and 0 <= weather_age <= WEATHER_MAX_HOURS
     holidays = db.rows('SELECT * FROM holidays WHERE end>? AND start<?', (stamp(now), stamp(horizon)))
     overrides = [{**o, 'data': decode(o['data'])} for o in
                  db.rows('SELECT * FROM overrides WHERE cancelled_at IS NULL AND expires>? AND starts<=?', (stamp(now), stamp(now)))]
@@ -301,7 +303,11 @@ def build(db: Database, settings: Settings, now: datetime | None = None) -> tupl
     points = []
     for i, (at, hours) in enumerate(slots):
         local = at.astimezone(zone)
-        w = weather.get(_hour_key(at + timedelta(minutes=15))) if weather_ok else None
+        w = weather.get(_hour_key(at + timedelta(minutes=15))) if use_weather else None
+        age = (now - datetime.fromisoformat(w['fetched_at'])).total_seconds() / 3600 if w else None
+        if age is None or not 0 <= age <= WEATHER_MAX_HOURS:
+            w = None
+        cautious_weather = use_weather and (not w or age > WEATHER_PREFERRED_HOURS)
         temperature = w['temperature'] if w else None
         radiation = w['radiation'] if w else None
         centre, low, high, load_basis, samples = predict_house(load_params, settings, local, temperature)
@@ -331,7 +337,7 @@ def build(db: Database, settings: Settings, now: datetime | None = None) -> tupl
             solar_low += lo * hours
             solar_high += hi * hours
         solar = sum(by_system.values())
-        if risk == 'conservative':
+        if risk == 'conservative' or cautious_weather:
             planned_house = centre + 0.5 * (high - centre)
             scale = 1 - 0.5 * (1 - solar_low / solar) if solar > 0 else 1
         elif risk == 'optimistic':
@@ -339,6 +345,8 @@ def build(db: Database, settings: Settings, now: datetime | None = None) -> tupl
             scale = 1 + 0.5 * (solar_high / solar - 1) if solar > 0 else 1
         else:
             planned_house, scale = centre, 1.0
+        if cautious_weather and w:
+            solar_basis.append(f'weather fetched {age:.0f} h ago; cautious planning')
         points.append(dict(
             ts=stamp(at), hours=hours, lead_minutes=int((at - now).total_seconds() // 60),
             house_kwh=centre * hours, house_p10=low * hours, house_p90=high * hours, ev_kwh=ev[i],
@@ -348,7 +356,7 @@ def build(db: Database, settings: Settings, now: datetime | None = None) -> tupl
             temperature=temperature, radiation=radiation, load_basis=load_basis,
             solar_basis='; '.join(solar_basis) or 'no PV', samples=samples, holiday=holiday['name'] if holiday else None))
 
-    model = dict(version=VERSION, created_at=stamp(now), risk=risk, weather_fresh=weather_ok,
+    model = dict(version=VERSION, created_at=stamp(now), risk=risk, weather_fresh=weather_ok and weather_age <= WEATHER_PREFERRED_HOURS, weather_usable=weather_ok,
                  weather_age_hours=None if weather_age is None else round(weather_age, 2),
                  load=dict((k, v) for k, v in load_params.items() if k not in ('profiles', 'counts', 'bands')),
                  solar={k: dict(samples=v['samples'], fallback=v['fallback']) for k, v in solar_params['systems'].items()},

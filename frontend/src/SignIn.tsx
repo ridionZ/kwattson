@@ -6,6 +6,8 @@ import Button from '@mui/material/Button';
 import Alert from '@mui/material/Alert';
 import Typography from '@mui/material/Typography';
 import Collapse from '@mui/material/Collapse';
+import Checkbox from '@mui/material/Checkbox';
+import FormControlLabel from '@mui/material/FormControlLabel';
 import Link from '@mui/material/Link';
 import { post, errorText } from './lib/api';
 import { Wordmark } from './components/Brand';
@@ -14,6 +16,7 @@ export default function SignIn({ onSignedIn, demo }: { onSignedIn: () => void; d
   const [username, setUsername] = useState(demo ? 'demo' : '');
   const [password, setPassword] = useState('');
   const [otp, setOtp] = useState('');
+  const [remember, setRemember] = useState(false);
   const [showOtp, setShowOtp] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -23,7 +26,7 @@ export default function SignIn({ onSignedIn, demo }: { onSignedIn: () => void; d
     setBusy(true);
     setError(null);
     try {
-      await post('/api/auth/login', { username, password, otp });
+      await post('/api/auth/login', { username, password, otp, remember });
       onSignedIn();
     } catch (err) {
       const msg = errorText(err);
@@ -49,6 +52,8 @@ export default function SignIn({ onSignedIn, demo }: { onSignedIn: () => void; d
               slotProps={{ htmlInput: { inputMode: 'numeric', pattern: '[0-9]*', maxLength: 10 } }}
               onChange={(e) => setOtp(e.target.value)} size="medium" />
           </Collapse>
+          <FormControlLabel control={<Checkbox checked={remember} onChange={(_, checked) => setRemember(checked)} />}
+            label="Remember me for 30 days" sx={{ my: -0.5 }} />
           {error && <Alert severity="error" role="alert">{error}</Alert>}
           <Button type="submit" variant="contained" size="large" disabled={busy}>{busy ? 'Signing in…' : 'Sign in'}</Button>
           {!showOtp && (

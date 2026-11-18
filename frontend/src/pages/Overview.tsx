@@ -47,7 +47,7 @@ export default function Overview() {
   const now = useNow();
   // Everyone can see what's scheduled; only members and admins can cancel it.
   const sched = useLoad(() => Promise.all([get<Holiday[]>('/api/holidays'), get<Override[]>('/api/overrides')]), []);
-  const alerts = useLoad<NotificationsDoc>(() => get('/api/notifications?limit=10'));
+  const alerts = useLoad<NotificationsDoc>(() => get('/api/notifications?limit=10&unread=true'), [st?.unread]);
   const toast = useToast();
 
   if (!st) return statusError ? <ErrorState message={statusError} onRetry={reloadStatus} /> : <OverviewSkeleton />;
@@ -58,11 +58,11 @@ export default function Overview() {
   const items = sched.data ? describe(sched.data[0], sched.data[1], vehicles, now) : [];
   const refresh = () => { void sched.reload(); void reloadStatus(); };
 
-  async function markAll() {
+  async function dismissAlert(id?: number) {
     try {
-      await post('/api/notifications/seen');
+      await post('/api/notifications/seen' + (id == null ? '' : `?notification_id=${id}`));
       await Promise.all([alerts.reload(), reloadStatus()]);
-      toast('All alerts marked as read.');
+      if (id == null) toast('Overview alerts cleared.');
     } catch (e) {
       toast(errorText(e), 'error');
     }
@@ -90,7 +90,7 @@ export default function Overview() {
             </Typography>
             {can('admin') && !st.weather && <Button href="#/settings/home/location">Configure weather</Button>}
           </Section>}
-          {hasSystems && <ElectricityCost periods={st.money ?? {}} today={st.today} />}
+          {hasSystems && <ElectricityCost periods={st.money ?? {}} today={st.today} projected={st.money?.projected_today} />}
           {hasSystems && <Advice st={st} />}
         </Grid>
         <Grid size={{ xs: 12, md: 4 }} sx={{ display: 'grid', gap: 2.5, alignContent: 'start' }}>
@@ -104,8 +104,8 @@ export default function Overview() {
               <Scheduled items={items} canEdit={can('member')} onChanged={refresh} />}
           </Section>}
           <Section title="Alerts" titleId="overview-alerts"
-            action={can('member') && alerts.data?.notifications.some((n) => !n.seen) && <Button size="small" onClick={markAll}>Mark all read</Button>}>
-            {alerts.error ? <ErrorState message={alerts.error} onRetry={alerts.reload} /> : !alerts.data ? <LoadingBlock /> : <AlertsList doc={alerts.data} />}
+            action={can('member') && alerts.data?.notifications.some((n) => !n.seen) && <Button size="small" onClick={() => void dismissAlert()}>Clear all</Button>}>
+            {alerts.error ? <ErrorState message={alerts.error} onRetry={alerts.reload} /> : !alerts.data ? <LoadingBlock /> : <AlertsList doc={alerts.data} onDismiss={can('member') ? dismissAlert : undefined} />}
             {can('admin') && <Button size="small" href="#/settings/alerts" sx={{ mt: 1.5 }}>Alert settings</Button>}
           </Section>
         </Grid>
@@ -381,7 +381,7 @@ function Figure({ label, value, sub, positive }: { label: ReactNode; value: stri
   );
 }
 
-function ElectricityCost({ periods, today }: { periods: Record<string, { net_aud: number; coverage: number } | null>; today?: any }) {
+function ElectricityCost({ periods, today, projected }: { periods: Record<string, { net_aud: number; coverage: number } | null>; today?: any; projected?: number | null }) {
   return (
     <Section title="Electricity cost" help={<HelpTip label="Electricity cost">
       Estimates use recorded imports and exports and include daily supply charges for days with readings. Weeks start on Monday in your site time zone.
@@ -392,6 +392,10 @@ function ElectricityCost({ periods, today }: { periods: Record<string, { net_aud
           return <Figure key={key} label={label} value={f.netCost(period?.net_aud)} positive={(period?.net_aud ?? 0) < -0.005}
             sub={period ? (period.coverage < 0.99 ? `${f.pct(period.coverage * 100)} of period measured` : undefined) : 'No readings'} />;
         })}
+      </Box>
+      <Box sx={{ mt: 2, pt: 1.5, borderTop: 1, borderColor: 'divider' }}>
+        <Figure label="Today’s projected total" value={f.netCost(projected)} positive={(projected ?? 0) < -0.005}
+          sub={projected == null ? 'Waiting for readings and a plan through midnight' : 'Readings so far plus the plan through midnight, including supply'} />
       </Box>
       {today && <Stack spacing={0.5} sx={{ mt: 2, pt: 1.5, borderTop: 1, borderColor: 'divider' }}>
         <Facts rows={[

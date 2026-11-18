@@ -67,6 +67,8 @@ def test_solarmax_premium_export_and_free_allowance(db, settings):
         free = sum(r['import_kwh'] for r in rows if local_day(r) == day and r['buy'] == 0)
         assert free <= 50 + 1e-4  # never models more free energy than the allowance
     assert any(r['action'] == 'force_charge' and r['buy'] == 0 for r in rows)
+    assert all(r['action'] not in ('force_discharge', 'export_priority') and
+               min(r['discharge_kwh'], r['export_kwh']) <= 1e-6 for r in rows if r['buy'] == 0)
     assert any(r['action'] == 'force_discharge' and r['sell'] == pytest.approx(0.15) for r in rows)
 
 

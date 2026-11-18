@@ -159,24 +159,51 @@ function Spec({ label, value, unit }: { label: string; value: string; unit?: str
 
 /* --------------------------------------------------------- automatic control */
 function ControlCard({ onEnable }: { onEnable: () => void }) {
-  const { status, can } = useApp();
+  const { status, reloadStatus, can } = useApp();
   const { doc } = useSettings();
   const auto = status?.mode === 'automatic';
+  const [busy, setBusy] = useState(false);
+  const toast = useToast();
   const guards: string[] = (status?.guards ?? []).filter((g: string) => !/monitor mode/i.test(g));
   const controllable = (doc.settings.systems as any[]).filter((s) => s.enabled && s.battery && s.controllable);
+  async function toggle() {
+    if (!auto && !status?.control_commissioned) {
+      onEnable();
+      return;
+    }
+    setBusy(true);
+    try {
+      const result = await post(auto ? '/api/control/stop' : '/api/control/enable');
+      await reloadStatus();
+      if (auto) {
+        toast(result.problems?.length ? 'Automatic control is off. Release still needs confirmation.' : 'Automatic control is off.',
+          result.problems?.length ? 'warning' : 'success');
+      } else {
+        toast(result.initial_control?.reasons?.length ? 'Automatic control is on and waiting to resume.' : 'Automatic control is on.');
+      }
+    } catch (error) {
+      toast(errorText(error), 'error');
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <Section title="Automatic control" help={<HelpTip label="automatic control">
       In automatic mode kWattson sends the plan to controllable systems every few minutes and checks each command took effect.
-      Anything unexpected stops control and returns the inverter to self-use. Stop it at any time from the header.
+      When a check fails, kWattson pauses commands, returns to self-use and resumes when checks pass.
     </HelpTip>}>
       <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2} sx={{ alignItems: { sm: 'center' }, justifyContent: 'space-between' }}>
         <Box>
-          <Typography variant="body1" sx={{ fontWeight: 700 }}>{auto ? 'On: kWattson is controlling the battery' : 'Off: monitoring and advice only'}</Typography>
+          <Typography variant="body1" sx={{ fontWeight: 700 }}>{auto ? (guards.length ? 'On, waiting to resume' : 'On: kWattson is controlling the battery') : 'Off: monitoring and advice only'}</Typography>
           <Typography variant="body2" color="text.secondary">
             {controllable.length ? `Control allowed on ${controllable.map((s) => s.name).join(', ')}.` : 'No system allows control yet. Edit a system to allow it.'}
           </Typography>
         </Box>
-        {!auto && can('admin') && <Button variant="contained" color="battery" startIcon={<BoltRounded />} onClick={onEnable} disabled={!controllable.length}>Turn on…</Button>}
+        {can('admin') && <Button variant="contained" color={auto ? 'error' : 'battery'} startIcon={<BoltRounded />}
+          onClick={() => void toggle()} disabled={busy || !status || (!auto && !controllable.length)}>
+          {auto ? 'Turn off' : status?.control_commissioned ? 'Turn on' : 'Turn on…'}
+        </Button>}
       </Stack>
       {guards.length > 0 && (
         <Alert severity={auto ? 'warning' : 'info'} sx={{ mt: 2 }}>
@@ -210,8 +237,8 @@ function EnableControlDialog({ onClose }: { onClose: () => void }) {
     setBusy(true);
     setError(null);
     try {
-      await post('/api/control/enable', { password, otp, confirmation: phrase.trim(), acknowledge: true });
-      toast('Automatic control is on.');
+      const result = await post('/api/control/enable', { password, otp, confirmation: phrase.trim(), acknowledge: true });
+      toast(result.initial_control?.reasons?.length ? 'Automatic control is on and waiting to resume.' : 'Automatic control is on.');
       await reloadStatus();
       onClose();
     } catch (e) {

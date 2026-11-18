@@ -145,20 +145,80 @@ def test_enabling_control_builds_and_applies_first_step(db, security, tmp_path, 
     )
     body = EnableControl(password='synthetic', confirmation='ENABLE BATTERY CONTROL', acknowledge=True)
     assert engine.latest_decision() is None
-    if failure:
+    if failure == 'planning':
         with pytest.raises(HTTPException) as error:
             asyncio.run(enable_control(body, req))
-        assert error.value.status_code == (503 if failure == 'planning' else 409)
+        assert error.value.status_code == 503
         assert db.settings().mode == 'monitor'
-        if failure == 'planning':
-            assert not db.meta('control_commissioned')
-            assert db.one('SELECT COUNT(*) AS count FROM commands')['count'] == 0
-        else:
-            assert db.one("SELECT status FROM commands WHERE action='force_charge'")['status'] == 'unverified'
-            assert db.one("SELECT status FROM commands WHERE action='release'")['status'] == 'released'
+        assert not db.meta('control_commissioned')
+        assert db.one('SELECT COUNT(*) AS count FROM commands')['count'] == 0
+        return
+
+    result = asyncio.run(enable_control(body, req))
+    assert result['mode'] == db.settings().mode == 'automatic'
+    assert result['decision_id'] == engine.latest_decision()['id']
+    if failure == 'verification':
+        assert not result['initial_control']['executed']
+        assert db.one("SELECT status FROM commands WHERE action='force_charge'")['status'] == 'unverified'
+        assert db.one("SELECT status FROM commands WHERE action='release'")['status'] == 'released'
+        assert engine.controller.recovery_reasons(now)
     else:
-        result = asyncio.run(enable_control(body, req))
-        assert result['mode'] == db.settings().mode == 'automatic'
-        assert result['decision_id'] == engine.latest_decision()['id']
         assert db.one("SELECT status FROM commands WHERE action='force_charge'")['status'] == 'verified'
         assert db.meta('control_active')[system.id]['start'] == stamp(now)
+        from kwattson.web.api import stop_control
+        asyncio.run(stop_control(req))
+        assert db.settings().mode == 'monitor'
+        def unexpected_reauth(*_):
+            pytest.fail('a commissioned system should not request the password again')
+        monkeypatch.setattr(security, 'reauthenticate', unexpected_reauth)
+        assert asyncio.run(enable_control(EnableControl(), req))['mode'] == 'automatic'
+
+
+def test_unverified_release_is_retried_before_dispatch_resumes(db, security, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from kwattson.plugins.base import CommandResult
+
+    settings = demo_settings()
+    settings.mode = 'automatic'
+    db.save_settings(settings)
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    acknowledged = CommandResult(accepted=True, verified=True, detail={})
+    unconfirmed = CommandResult(accepted=True, verified=False, detail={})
+    device = SimpleNamespace(apply=AsyncMock(side_effect=[unconfirmed, acknowledged]),
+                             release=AsyncMock(side_effect=[unconfirmed, acknowledged]))
+    controller = Controller(db, SimpleNamespace(system=lambda *_: device), Notifications(db, security),
+                            Runtime(data_dir=tmp_path, app_url='http://localhost:8080', dev_http=True, worker=False))
+    command = {'mode': 'force_discharge', 'power_kw': 2, 'target_soc': 25}
+    row = {'ts': now.isoformat(), 'hours': 0.5, 'reason': 'synthetic'}
+    monkeypatch.setattr(controller, 'guards', lambda *_: [])
+    monkeypatch.setattr(controller, 'latest_decision', lambda: {'id': 1})
+    monkeypatch.setattr(controller, 'current_commands', lambda *_: ({'main': {'command': command}}, row))
+    monkeypatch.setattr('kwattson.control.utcnow', lambda: now)
+
+    assert not asyncio.run(controller.cycle(settings, now))['executed']
+    assert db.settings().mode == 'automatic'
+    assert db.meta('control_release_pending')
+    assert not asyncio.run(controller.cycle(settings, now + timedelta(minutes=1)))['executed']
+    assert device.apply.await_count == 1 and device.release.await_count == 1
+    assert asyncio.run(controller.cycle(settings, now + timedelta(minutes=3)))['executed']
+    assert device.apply.await_count == 2 and device.release.await_count == 2
+    assert not db.meta('control_release_pending')
+    assert db.meta('control_recovery') is None
+
+
+def test_remembered_sign_in_survives_idle_limit(db, security):
+    from fastapi import HTTPException
+
+    from kwattson.config import stamp, utcnow
+
+    password = 'synthetic-owner-passphrase'
+    security.create_owner('fixture-user', password)
+    ordinary, _ = security.login('fixture-user', password, '', 'fixture')
+    remembered, _ = security.login('fixture-user', password, '', 'fixture', remember=True)
+    db.execute('UPDATE sessions SET last_seen=?', (stamp(utcnow() - timedelta(hours=2)),))
+    with pytest.raises(HTTPException):
+        security.authenticate(ordinary)
+    session = security.authenticate(remembered)
+    assert datetime.fromisoformat(session['expires']) - datetime.fromisoformat(session['created_at']) == timedelta(days=30)

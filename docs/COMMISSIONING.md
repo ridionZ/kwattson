@@ -8,14 +8,15 @@ Automatic control is only possible when **all** guards pass:
 - the system is marked *controllable* and its plugin supports control;
 - control was commissioned for the current system settings (changing them requires re-commissioning);
 - no tariff is waiting for a confirmed start date;
-- fresh readings with device-verified timestamps, no fault, known battery level;
-- a fresh plan from the optimiser (not the fallback) made with fresh readings;
-- fresh weather (if you have PV).
+- fresh readings with device-verified timestamps, no fault and a known battery level;
+- a fresh verified plan made using current readings;
+- the site location is configured when weather is enabled for PV.
 
-If any guard fails while a command is active, the device is **released** to its own normal mode
-immediately. If the problem lasts 30 minutes, or the device reports a fault, automatic mode is
-switched off and you are notified. A command the device doesn't confirm on read-back, or a battery that
-doesn't respond twice in a row, also stops automatic control.
+If a guard fails, kWattson releases its active commands and leaves Automatic selected.
+Dispatch resumes when the guards pass. An unverified command or two distinct telemetry misses
+start a cooldown of up to 30 minutes. The controller also retries any unconfirmed release before
+it sends more commands. A device fault keeps dispatch paused while the fault is reported.
+Missing weather uses a conservative fallback forecast.
 
 ## Before you enable it
 1. Run for at least a week in monitor mode. Check *Plan* and *Decisions* make sense to you.
@@ -25,7 +26,9 @@ doesn't respond twice in a row, also stops automatic control.
 4. Run *Test connection* (read-only) on the system.
 5. Know how to stop it: the **Stop automatic control** button, and the inverter's own app.
 6. Be present for the first commands and watch the inverter app. Turning on automatic control
-   builds a fresh plan and applies its current step as soon as the control checks pass.
+   builds a fresh plan and applies its current step as soon as the control checks pass. After
+   commissioning, authorized users can turn control on and off without repeating the checklist.
+   Changing the commissioned system configuration requires commissioning again.
 
 ## FoxESS specifics
 - Control uses the Cloud Open API *scheduler* (time groups). Each command writes one ≤20-minute group

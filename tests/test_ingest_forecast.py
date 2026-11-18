@@ -175,3 +175,32 @@ def test_money_periods_use_local_week_boundaries_supply_and_partial_coverage(db,
     assert periods['yesterday']['net_aud'] == pytest.approx(-2)
     assert periods['last_week']['net_aud'] == pytest.approx(1.60)
     assert periods['this_week']['net_aud'] == pytest.approx(1.30 - 2 + 1.30)
+
+
+def test_older_weather_remains_usable_with_cautious_planning(db, settings):
+    fetched = T0 - timedelta(hours=12)
+    for hour in range(2):
+        at = T0 + timedelta(hours=hour)
+        db.execute('INSERT INTO weather_hours VALUES(?,?,?,?,?,?,?)',
+                   (stamp(at), 27, 27, 600, 0, stamp(fetched), 12 + hour))
+    _, points, model = forecast.build(db, settings, T0)
+    assert not model['weather_fresh'] and model['weather_usable']
+    assert points[0]['radiation'] == 600
+    assert points[0]['load_kwh'] > points[0]['house_kwh']
+    assert sum(points[0]['solar_by_system'].values()) < points[0]['solar_kwh']
+    assert 'cautious planning' in points[0]['solar_basis']
+
+
+def test_projected_today_prorates_remaining_plan_and_keeps_supply_once(settings):
+    from types import SimpleNamespace
+
+    from kwattson.outcomes import projected_today
+
+    now = datetime(2026, 11, 18, 23, 15, tzinfo=ZONE)
+    decision = {'id': 7, 'created_at': stamp(now - timedelta(minutes=15))}
+    rows = [
+        {'ts': stamp(now - timedelta(minutes=15)), 'hours': 0.5, 'cost': 0.4},
+        {'ts': stamp(now + timedelta(minutes=15)), 'hours': 1, 'cost': -0.4},
+    ]
+    assert projected_today(SimpleNamespace(rows=lambda *_: rows), settings, now, decision, {'net_aud': 1.35}) == 1.35
+    assert projected_today(SimpleNamespace(rows=lambda *_: rows[:1]), settings, now, decision, {'net_aud': 1.35}) is None

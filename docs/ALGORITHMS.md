@@ -17,7 +17,7 @@ stored with its output so results can be compared across changes.
   charging at home (`ev_estimated=1`). It is subtracted from load to learn *house* load.
 
 ## 2. Forecast (`forecast.py`, version `profile-temperature-v2+hourly-ratio-v2`)
-Weather-enabled forecasts require a weather record for the current hour fetched within six hours. Importing historical weather no longer makes an old forecast appear fresh. Early accuracy uses the same error calculation as the final daily evaluation, counting only finished half-hours with at least 25 minutes of measurements. The comparison charts use those same complete slots and show delivered solar even when output was limited. Electricity use includes the EV. Battery percentage pairs the original plan’s end-of-slot projection with the recorded site battery level, including in monitoring mode.
+Weather-enabled plans use forecasts fetched within 24 hours. Within that limit, records older than six hours get a conservative blend of higher load and lower solar. Missing or older hourly records use the fallback. Early accuracy uses the same error calculation as the final daily evaluation, counting only finished half-hours with at least 25 minutes of measurements. The comparison charts use those same complete slots and show delivered solar even when output was limited. Electricity use includes the EV. Battery percentage pairs the original plan’s end-of-slot projection with the recorded site battery level, including in monitoring mode.
 
 **House load**, per half-hour slot:
 `profile[day type, slot] + b_cool·(CDD − CDD_ref) + b_heat·(HDD − HDD_ref)`
@@ -37,7 +37,7 @@ Weather-enabled forecasts require a weather record for the current hour fetched 
   output or a full battery. It absorbs orientation, tilt, shading and losses without asking for them.
   <5 samples → all-hours median (≥20 samples) → default `pv_kwp × 0.85 / 1000`.
 - p10 = 10th percentile ratio, further reduced by cloud cover; p90 = 90th percentile.
-- Without fresh weather (>6 h old) a cautious clear-sky shape at 45% of nameplate is used.
+- Without usable weather (>24 h old or missing) a cautious clear-sky shape at 45% of nameplate is used.
 - **Important:** PV is *not* capped at the inverter's AC rating. A hybrid inverter can put DC PV
   straight into the battery while its AC output is at the limit. For example, a hybrid receiving
   8 kW from its panels could send 5 kW to the AC side and 3 kW to a DC battery.
@@ -67,7 +67,9 @@ partial, then half-hours). See the module docstring for the full constraint list
   Plan intervals split at tariff boundaries and at the configured buffer (5 minutes by default)
   inside a cheaper import or higher export window. The buffered edges restrict battery grid
   charging or battery export respectively. Billing rates, household use and passive solar
-  export still follow the actual tariff.
+  export still follow the actual tariff. A free or negative import price reserves that window
+  for charging and self-use. Battery export and the active solar feed-in-priority mode are
+  kept outside those windows, while surplus solar can still export naturally.
 - Battery exports retain the normal reserve plus expected net house demand from the end of the
   export step to 06:00 local time, converted to stored energy using discharge efficiency.
   An extra margin uses half the gap between high and typical demand forecasts, capped at four
@@ -124,7 +126,8 @@ or send any charger commands.
 ## 5. Outcomes (`outcomes.py`)
 The Overview cost card applies the tariff to measured grid flows for today, yesterday and the
 current and previous Monday-start weeks. It includes daily supply on dates with readings and reports
-coverage over elapsed time. Plan cost uses the optimiser's saved energy cash flows, so tiered
+coverage over elapsed time. Today’s projection adds the plan’s remaining energy cost to the
+measured total and counts the supply charge once. Plan cost uses the optimiser's saved energy cash flows, so tiered
 allowances are already included. It displays imports, export credits and the net energy result.
 The value of different ending battery levels and modelled wear are shown separately.
 

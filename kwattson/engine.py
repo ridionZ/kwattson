@@ -88,7 +88,7 @@ class Engine:
             self.next['control'] = now + 30
             async with self.control_lock:
                 settings = self.db.settings()
-                if settings.mode == 'automatic' or self.db.meta('control_active'):
+                if settings.mode == 'automatic' or self.db.meta('control_active') or self.db.meta('control_release_pending'):
                     await self.controller.cycle(settings)
         decision = self.latest_decision()
         alerts.check(self.db, settings, self.notifications, self.devices.status, self.transitions, decision['id'] if decision else None)

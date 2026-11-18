@@ -26,7 +26,7 @@ from ..notifications import EVENTS, check_template
 from ..notifications.channels import CHANNELS, describe as describe_channels
 from ..plugins import registry
 from ..plugins.push import system_reading, vehicle_reading
-from ..security import PASSWORDS, digest
+from ..security import PASSWORDS, REMEMBER_DAYS, SESSION_HOURS, digest
 from ..tariffs import TariffPlan, default_tariffs, pending_plans, plan_at, rate_at
 
 router = APIRouter(prefix='/api')
@@ -37,6 +37,7 @@ class Body(BaseModel):
 
 
 class Login(Body):
+    remember: bool = False
     username: str = Field(min_length=1, max_length=80)
     password: str = Field(min_length=1, max_length=256)
     otp: str = Field('', max_length=10)
@@ -114,9 +115,11 @@ class ActivateTariff(Confirm):
     active_from: str
 
 
-class EnableControl(Confirm):
-    confirmation: str
-    acknowledge: bool
+class EnableControl(Body):
+    password: str = Field('', max_length=256)
+    otp: str = Field('', max_length=10)
+    confirmation: str = Field('', max_length=64)
+    acknowledge: bool = False
 
 
 def ctx(request: Request):
@@ -161,9 +164,9 @@ async def setup(body: Setup, request: Request):
 @router.post('/auth/login')
 async def login(body: Login, request: Request):
     db, security, _, runtime = ctx(request)
-    token, csrf = security.login(body.username, body.password, body.otp, client_ip(request))
+    token, csrf = security.login(body.username, body.password, body.otp, client_ip(request), remember=body.remember)
     response = JSONResponse({'csrf': csrf})
-    response.set_cookie(runtime.cookie, token, secure=not runtime.dev_http, httponly=True, samesite='strict', max_age=12 * 3600, path='/')
+    response.set_cookie(runtime.cookie, token, secure=not runtime.dev_http, httponly=True, samesite='strict', max_age=REMEMBER_DAYS * 86400 if body.remember else SESSION_HOURS * 3600, path='/')
     return response
 
 
@@ -321,15 +324,19 @@ async def status(request: Request):
         today = outcomes.today_so_far(db, settings, now)
     except Exception:
         today = None
+    money = outcomes.money_periods(db, settings, now) if systems else {}
+    if systems:
+        money['projected_today'] = outcomes.projected_today(db, settings, now, decision, money.get('today'))
     return {
         'mode': settings.mode, 'server_time': stamp(now), 'timezone': settings.site.timezone, 'site_name': settings.site.name,
         'tariff': rate_at(settings.tariffs, now, settings.zone),
         'pending_tariffs': [dict(id=p.id, name=p.name, retailer=p.retailer) for p in pending_plans(settings.tariffs)],
         'site': site, 'systems': systems, 'vehicles': vehicles,
         'decision': {k: decision[k] for k in ('id', 'created_at', 'summary')} if decision else None,
-        'guards': engine.controller.guards(settings, now), 'control_active': db.meta('control_active', {}),
+        'guards': engine.controller.guards(settings, now) + engine.controller.recovery_reasons(now),
+        'control_commissioned': engine.controller.commissioned(settings), 'control_active': db.meta('control_active', {}),
         'heartbeat': db.meta('worker_heartbeat'), 'advice': engine.advice(), 'today': today,
-        'money': outcomes.money_periods(db, settings, now) if systems else {},
+        'money': money,
         'unread': db.one('SELECT COUNT(*) AS n FROM notifications WHERE seen=0')['n'], 'demo': runtime.demo,
         'battery_kwh': settings.battery_kwh(), 'battery_reserve_pct': _reserve_pct(settings),
         'using_example_tariff': plan_at(settings.tariffs, now) == default_tariffs()[0],
@@ -932,34 +939,42 @@ CONFIRMATION = 'ENABLE BATTERY CONTROL'
 @router.post('/control/enable')
 async def enable_control(body: EnableControl, request: Request):
     db, security, engine, runtime = ctx(request)
-    security.reauthenticate(me(request), body.password, body.otp)
-    if body.confirmation.strip() != CONFIRMATION or not body.acknowledge:
-        raise HTTPException(422, f'Read the commissioning checklist, tick the acknowledgement and type {CONFIRMATION}')
     if not runtime.worker:
         raise HTTPException(409, 'Not enabled. The background worker must be running.')
     async with engine.control_lock:
         current = db.settings()
         if current.mode == 'automatic':
             return {'mode': 'automatic'}
+        first = not engine.controller.commissioned(current)
+        if first:
+            if body.confirmation.strip() != CONFIRMATION or not body.acknowledge:
+                raise HTTPException(422, 'Read the commissioning checklist, tick the acknowledgement and type ' + CONFIRMATION)
+            security.reauthenticate(me(request), body.password, body.otp)
+
         settings = current.model_copy(update={'mode': 'automatic'})
-        blocking = engine.controller.guards(settings, commissioning=True, check_plan=False)
-        if blocking:
-            raise HTTPException(409, 'Not enabled. Fix these first: ' + '; '.join(blocking))
-        try:
-            decision = await engine.replan(settings)
-        except Exception as error:
-            raise HTTPException(503, 'Not enabled. A fresh plan could not be built.') from error
+        blocking = engine.controller.guards(settings, commissioning=first, check_plan=False)
+        decision = None
+        if not blocking:
+            try:
+                decision = await engine.replan(settings)
+            except Exception as error:
+                if first:
+                    raise HTTPException(503, 'Not enabled. A fresh plan could not be built.') from error
+                engine.request_plan()
+                blocking = ['Waiting for a fresh plan']
+            else:
+                blocking = engine.controller.guards(settings, commissioning=first)
         if db.settings() != current:
             raise HTTPException(409, 'Not enabled. Settings changed while planning. Try again.')
-        blocking = engine.controller.guards(settings, commissioning=True)
-        if blocking:
+        if first and blocking:
             raise HTTPException(409, 'Not enabled. Fix these first: ' + '; '.join(blocking))
-        db.set_meta('control_commissioned', {'at': stamp(), 'hash': commissioning_hash(settings)})
+        if first:
+            db.set_meta('control_commissioned', {'at': stamp(), 'hash': commissioning_hash(settings)})
         db.save_settings(settings, actor(request))
         db.audit('control_enabled', {'systems': [s.id for s in settings.systems if s.controllable]}, actor(request))
+        if blocking:
+            return {'mode': 'automatic', 'initial_control': {'executed': False, 'reasons': blocking}}
         result = await engine.controller.cycle(settings)
-        if db.settings().mode != 'automatic':
-            raise HTTPException(409, 'Automatic control stopped when applying the first step. Check Alerts for details.')
         return {'mode': 'automatic', 'decision_id': decision['id'], 'initial_control': result}
 
 
@@ -982,9 +997,11 @@ async def commands(request: Request):
 
 # --------------------------------------------------------- notifications
 @router.get('/notifications')
-async def notifications(request: Request, limit: int = 100):
+async def notifications(request: Request, limit: int = 100, unread: bool = False):
     db, *_ = ctx(request)
-    rows = db.rows('SELECT id, created_at, event, severity, title, body, seen FROM notifications ORDER BY id DESC LIMIT ?', (max(1, min(limit, 500)),))
+    where = ' WHERE seen=0' if unread else ''
+    rows = db.rows('SELECT id, created_at, event, severity, title, body, seen FROM notifications' + where + ' ORDER BY id DESC LIMIT ?',
+                   (max(1, min(limit, 500)),))
     deliveries = db.rows('SELECT d.id, d.notification_id, d.channel_id, d.status, d.attempts, d.next_at, d.result, c.name AS channel '
                          'FROM deliveries d JOIN channels c ON c.id=d.channel_id ORDER BY d.id DESC LIMIT 200')
     for d in deliveries:
@@ -993,9 +1010,12 @@ async def notifications(request: Request, limit: int = 100):
 
 
 @router.post('/notifications/seen')
-async def mark_seen(request: Request):
+async def mark_seen(request: Request, notification_id: int | None = None):
     db, *_ = ctx(request)
-    db.execute('UPDATE notifications SET seen=1 WHERE seen=0')
+    if notification_id is None:
+        db.execute('UPDATE notifications SET seen=1 WHERE seen=0')
+    else:
+        db.execute('UPDATE notifications SET seen=1 WHERE id=?', (notification_id,))
     return {'seen': True}
 
 

@@ -18,10 +18,10 @@ export interface NotificationsDoc {
   deliveries: { id: number; notification_id: number; channel: string; status: string; attempts: number; result: any }[];
 }
 
-export default function AlertsList({ doc, limit = 10 }: { doc: NotificationsDoc; limit?: number }) {
+export default function AlertsList({ doc, limit = 10, onDismiss }: { doc: NotificationsDoc; limit?: number; onDismiss?: (id: number) => void }) {
   const [open, setOpen] = useState<number | null>(null);
   const items = doc.notifications.slice(0, limit);
-  if (!items.length) return <Empty>No alerts yet. You’ll see faults, price spikes and daily summaries here.</Empty>;
+  if (!items.length) return <Empty>{onDismiss ? 'No unread alerts.' : 'No alerts yet.'}</Empty>;
   return (
     <List disablePadding>
       {items.map((n) => {
@@ -39,6 +39,9 @@ export default function AlertsList({ doc, limit = 10 }: { doc: NotificationsDoc;
                 {n.body && <Typography variant="body2" color="text.secondary">{n.body}</Typography>}
                 <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mt: 0.25 }}>
                   <Typography variant="caption" color="text.secondary">{f.dateTime(n.created_at)}</Typography>
+                  {onDismiss && <Button size="small" variant="text" onClick={() => onDismiss(n.id)} sx={{ minHeight: 0, py: 0, px: 0.5, fontSize: '0.75rem' }}>
+                    Dismiss
+                  </Button>}
                   {deliveries.length > 0 && (
                     <Button size="small" variant="text" sx={{ minHeight: 0, py: 0, px: 0.5, fontSize: '0.75rem' }}
                       aria-expanded={open === n.id} onClick={() => setOpen(open === n.id ? null : n.id)}>

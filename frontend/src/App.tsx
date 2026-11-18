@@ -42,7 +42,7 @@ import { get, post, setCsrf, errorText } from './lib/api';
 import { setZone } from './lib/fmt';
 import { useLoad, useRoute, go } from './lib/hooks';
 import { AppCtx, RANK, useApp, type AppState, type Role, type Session } from './lib/app';
-import { ConfirmDialog, ErrorState, LoadingBlock, ToastProvider, useToast } from './components/common';
+import { ErrorState, LoadingBlock, ToastProvider, useToast } from './components/common';
 import AlertsList, { type NotificationsDoc } from './components/AlertsList';
 import SignIn, { Setup } from './SignIn';
 import Overview from './pages/Overview';
@@ -115,9 +115,7 @@ function Shell({ session, onSignedOut, onRefresh }: { session: Session; onSigned
   const [status, setStatus] = useState<any>(null);
   const [statusError, setStatusError] = useState<string | null>(null);
   const [alertsOpen, setAlertsOpen] = useState(false);
-  const [stopOpen, setStopOpen] = useState(false);
   const [stopBusy, setStopBusy] = useState(false);
-  const [stopError, setStopError] = useState<string | null>(null);
 
   const reloadStatus = useCallback(async () => {
     try {
@@ -160,14 +158,12 @@ function Shell({ session, onSignedOut, onRefresh }: { session: Session; onSigned
 
   async function stop() {
     setStopBusy(true);
-    setStopError(null);
     try {
       const r = await post('/api/control/stop');
-      setStopOpen(false);
       toast(r.problems?.length ? `Stopped, with problems: ${r.problems.join('; ')}` : 'Automatic control stopped. kWattson is monitoring only.', r.problems?.length ? 'warning' : 'success');
       await reloadStatus();
     } catch (e) {
-      setStopError(errorText(e));
+      toast(errorText(e), 'error');
     } finally {
       setStopBusy(false);
     }
@@ -212,9 +208,9 @@ function Shell({ session, onSignedOut, onRefresh }: { session: Session; onSigned
               </Box>
             </Box>
             <Box sx={{ flex: 1 }} />
-            {status && <ModeChip automatic={automatic} />}
+            {status && <ModeChip automatic={automatic} paused={automatic && !!status.guards?.length} />}
             {automatic && ctx.can('member') && (
-              <Button variant="contained" color="error" size="small" startIcon={<StopCircleRounded />} onClick={() => setStopOpen(true)}
+              <Button variant="contained" color="error" size="small" startIcon={<StopCircleRounded />} onClick={() => void stop()} disabled={stopBusy}
                 sx={{ whiteSpace: 'nowrap' }}>
                 <Box component="span" sx={{ display: { xs: 'none', sm: 'inline' } }}>Stop automatic control</Box>
                 <Box component="span" sx={{ display: { xs: 'inline', sm: 'none' } }}>Stop</Box>
@@ -261,23 +257,17 @@ function Shell({ session, onSignedOut, onRefresh }: { session: Session; onSigned
           <AlertsDrawer onClose={() => setAlertsOpen(false)} />
         </Drawer>
 
-        <ConfirmDialog open={stopOpen} title="Stop automatic control?" confirm="Stop automatic control" danger busy={stopBusy} error={stopError}
-          onConfirm={stop} onClose={() => setStopOpen(false)}>
-          <Typography variant="body2">
-            kWattson hands the inverter back to its normal self-use mode and keeps monitoring and planning. You can turn automatic control on again in Settings › Solar &amp; batteries.
-          </Typography>
-        </ConfirmDialog>
       </Box>
     </AppCtx.Provider>
   );
 }
 
-function ModeChip({ automatic }: { automatic: boolean }) {
+function ModeChip({ automatic, paused }: { automatic: boolean; paused: boolean }) {
   return (
-    <Tooltip title={automatic ? 'kWattson is controlling the battery' : 'kWattson plans and advises; it does not control the battery'}>
+    <Tooltip title={paused ? 'Waiting to resume automatic control' : automatic ? 'kWattson is controlling the battery' : 'kWattson plans and advises; it does not control the battery'}>
       <Chip component="a" href="#/settings/systems" clickable size="small"
         icon={automatic ? <BoltRounded /> : <VisibilityRounded />}
-        label={automatic ? 'Automatic' : 'Monitoring'}
+        label={paused ? 'Auto paused' : automatic ? 'Automatic' : 'Monitoring'}
         sx={automatic
           ? { bgcolor: '#2DD4BF', color: '#042F2E', '& .MuiChip-icon': { color: '#042F2E' }, '&:hover': { bgcolor: '#5EEAD4' } }
           : { bgcolor: 'rgba(255,255,255,0.10)', color: '#fff', border: '1px solid rgba(255,255,255,0.24)', '& .MuiChip-icon': { color: '#fff' }, '&:hover': { bgcolor: 'rgba(255,255,255,0.18)' } }} />

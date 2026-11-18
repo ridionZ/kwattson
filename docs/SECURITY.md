@@ -7,6 +7,8 @@ privacy and forms, plus OWASP basics.
 
 ## Authentication
 - Argon2id password hashes; 14–256 character passphrases.
+- Sign-in normally expires after 12 hours or one hour idle. The optional **Remember me** checkbox
+  creates a session with a 30-day maximum lifetime. Sign-out and session revocation still apply.
 - Optional TOTP two-step sign-in (strongly recommended); each code is accepted once.
 - First boot can create `admin` from `INITIAL_ADMIN_PASSWORD_FILE` or `INITIAL_ADMIN_PASSWORD`. The password is used only when there are no users. Docker administrators can read container variables, so clear the installer variable after sign-in. Without either setting, the generated console token proves ownership before the first account can be created.
 - Sessions: random 384-bit token in a `__Host-` cookie (`Secure`, `HttpOnly`, `SameSite=Strict`,

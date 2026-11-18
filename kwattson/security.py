@@ -30,6 +30,7 @@ from .db import Database
 
 PASSWORDS = PasswordHasher(time_cost=3, memory_cost=65536, parallelism=2)
 SESSION_HOURS = 12
+REMEMBER_DAYS = 30
 IDLE_MINUTES = 60
 WINDOW = 900
 MAX_FAILURES = 5
@@ -191,7 +192,7 @@ class Security:
                     return c.execute('UPDATE users SET totp_last=? WHERE id=? AND totp_last<?', (count, user['id'], count)).rowcount == 1
         return False
 
-    def login(self, username: str, password: str, otp: str, client: str) -> tuple[str, str]:
+    def login(self, username: str, password: str, otp: str, client: str, remember=False) -> tuple[str, str]:
         key = 'login:' + client
         self.check_limit(key)
         self.check_limit('login:any')
@@ -207,16 +208,22 @@ class Security:
         self.clear_limit(key)
         self.db.execute('UPDATE users SET last_login=? WHERE id=?', (stamp(), user['id']))
         token, csrf = secrets.token_urlsafe(48), secrets.token_urlsafe(32)
-        self.db.execute('INSERT INTO sessions VALUES(?,?,?,?,?,?,?)', (digest(token), user['id'], csrf, stamp(), stamp(),
-                                                                       stamp(utcnow() + timedelta(hours=SESSION_HOURS)), stamp()))
+        now = utcnow()
+        duration = timedelta(days=REMEMBER_DAYS) if remember else timedelta(hours=SESSION_HOURS)
+        self.db.execute('INSERT INTO sessions VALUES(?,?,?,?,?,?,?)', (digest(token), user['id'], csrf, stamp(now), stamp(now),
+                                                                       stamp(now + duration), stamp(now)))
         self.db.audit('login', actor='owner')
         return token, csrf
 
     def authenticate(self, token: str) -> dict:
         row = self.db.one('SELECT s.*, u.username, u.role FROM sessions s JOIN users u ON u.id=s.user_id WHERE token_hash=?', (digest(token or ''),))
         now = utcnow()
-        if (not row or datetime.fromisoformat(row['expires']) < now
-                or datetime.fromisoformat(row['last_seen']) < now - timedelta(minutes=IDLE_MINUTES)):
+        if not row:
+            raise HTTPException(401, 'Sign in required')
+        expires = datetime.fromisoformat(row['expires'])
+        # Legacy sessions have the original 12-hour lifetime and idle timeout.
+        remembered = expires - datetime.fromisoformat(row['created_at']) > timedelta(hours=SESSION_HOURS)
+        if expires <= now or (not remembered and datetime.fromisoformat(row['last_seen']) < now - timedelta(minutes=IDLE_MINUTES)):
             raise HTTPException(401, 'Sign in required')
         if datetime.fromisoformat(row['last_seen']) < now - timedelta(minutes=1):
             self.db.execute('UPDATE sessions SET last_seen=? WHERE token_hash=?', (stamp(now), row['token_hash']))

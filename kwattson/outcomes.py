@@ -23,7 +23,7 @@ from .config import Settings, UTC, stamp, utcnow
 from .db import Database, encode
 from .ingest import select_intervals
 from .optimizer import price_points, self_use
-from .tariffs import bill
+from .tariffs import bill, plan_at
 
 
 def day_bounds(settings: Settings, day) -> tuple[datetime, datetime]:
@@ -139,3 +139,28 @@ def money_periods(db: Database, settings: Settings, now: datetime) -> dict:
     tomorrow = today + timedelta(days=1)
     return dict(yesterday=total(yesterday, today, midnight(today)), today=total(today, tomorrow, now),
                 last_week=total(last_week, week, midnight(week)), this_week=total(week, tomorrow, now))
+
+
+def projected_today(db: Database, settings: Settings, now: datetime, decision: dict | None, measured: dict | None) -> float | None:
+    """Today's observed energy plus the saved plan for the rest of the local day."""
+    if decision is None or now - datetime.fromisoformat(decision['created_at']) > timedelta(minutes=35):
+        return None
+    local_start, local_end = day_bounds(settings, now.astimezone(settings.zone).date())
+    if measured is None and now - local_start.astimezone(UTC) >= timedelta(minutes=30):
+        return None
+    end = local_end.astimezone(UTC)
+    now = now.replace(microsecond=0)
+    rows = db.rows('SELECT ts, hours, cost FROM decision_intervals WHERE decision_id=? AND ts<? ORDER BY ts',
+                   (decision['id'], stamp(end)))
+    covered = remaining = 0.0
+    for r in rows:
+        at = datetime.fromisoformat(r['ts'])
+        duration = timedelta(hours=r['hours'])
+        seconds = (min(end, at + duration) - max(now, at)).total_seconds()
+        if seconds > 0:
+            remaining += r['cost'] * seconds / duration.total_seconds()
+            covered += seconds
+    if abs(covered - (end - now).total_seconds()) > 1:
+        return None
+    actual = measured['net_aud'] if measured else plan_at(settings.tariffs, now).supply_daily
+    return round(actual + remaining, 2)

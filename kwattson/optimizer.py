@@ -47,7 +47,7 @@ from .dispatch import overnight_need, split_points
 from .ingest import select_intervals
 from .tariffs import plan_at
 
-VERSION = 'milp-dc-coupled-v1.2'
+VERSION = 'milp-dc-coupled-v1.3'
 EPS = 1e-6
 
 
@@ -286,7 +286,7 @@ def plan(db: Database, settings: Settings, forecast_id: int, points: list[dict],
         y_import = m.var(lo=0, hi=1, integer=True)
         night = overnight[i]
         sale = None
-        if battery_capacity and p['export_allowed'] and night is not None and not no_battery_export:
+        if battery_capacity and price['buy'] > 0 and p['export_allowed'] and night is not None and not no_battery_export:
             sale = m.var(integer=True, hi=1)
         m.add({**{j: 1 for j in v['imp']}, y_import: -settings.site.grid_import_kw * h}, hi=0)
         m.add({**{j: 1 for j in v['exp']}, y_import: settings.site.export_kw * h}, hi=settings.site.export_kw * h)
@@ -474,7 +474,7 @@ def label_actions(settings: Settings, intervals: list[dict]):
                 mode = 'force_charge'
             elif d['dis'] > 0.1 * h and battery_export and d.get('export_floor_pct') is not None:
                 mode = 'force_discharge'
-            elif r['exp'] > 0.1 * h and room > 0.5 and d['pv_bat'] < min(b.charge_kw * h, room) - 0.1 * h:
+            elif r['price']['buy'] > 0 and r['exp'] > 0.1 * h and room > 0.5 and d['pv_bat'] < min(b.charge_kw * h, room) - 0.1 * h:
                 mode = 'export_priority'
             elif d['dis'] < 0.02 * h and r['imp'] > 0.1 * h and d['soc_pct'] > b.reserve_pct + 1:
                 mode = 'hold'
