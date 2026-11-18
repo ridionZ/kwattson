@@ -32,6 +32,10 @@ WRITE = {'/op/v2/device/scheduler/enable', '/op/v1/device/scheduler/set/flag'}
 VARIABLES = ['pvPower', 'loadsPower', 'feedinPower', 'gridConsumptionPower', 'batChargePower', 'batDischargePower',
              'generationPower', 'SoC', 'batTemperature', 'runningState']
 FAULT_STATES = {'165', '166'}
+SCHEDULER_READ_ATTEMPTS = 5
+SCHEDULER_READ_PAUSE = 2
+SCHEDULER_READ_TIMEOUT = 15
+SCHEDULER_REQUEST_TIMEOUT = 3
 MODES = {'self_use': 'SelfUse', 'hold': 'SelfUse', 'export_priority': 'Feedin',
          'force_charge': 'ForceCharge', 'force_discharge': 'ForceDischarge'}
 
@@ -212,25 +216,76 @@ class FoxESSCloud(SystemPlugin):
         group = self._group(command)
         await self._request('/op/v2/device/scheduler/enable', {'deviceSN': sn, 'groups': [group]}, write=True)
         await self._request('/op/v1/device/scheduler/set/flag', {'deviceSN': sn, 'enable': 1}, write=True)
-        back = await self._request('/op/v2/device/scheduler/get', {'deviceSN': sn})
-        groups = (back.get('result') or {}).get('groups') or []
-        verified = any(_same_group(group, g) for g in groups)
-        return CommandResult(accepted=True, verified=verified, detail={'group': group, 'read_back_groups': len(groups)})
+        checks = []
+        verified = False
+        remaining = (command.end - datetime.now(timezone.utc)).total_seconds()
+        if remaining > 0:
+            try:
+                # The cloud can acknowledge a write before the new group appears on read-back.
+                # Wait briefly for confirmation without resending either write.
+                async with asyncio.timeout(min(remaining, SCHEDULER_READ_TIMEOUT)):
+                    for attempt in range(SCHEDULER_READ_ATTEMPTS):
+                        if attempt:
+                            await asyncio.sleep(SCHEDULER_READ_PAUSE)
+                        try:
+                            async with asyncio.timeout(SCHEDULER_REQUEST_TIMEOUT):
+                                back = await self._request('/op/v2/device/scheduler/get', {'deviceSN': sn})
+                        except (TimeoutError, httpx.TransportError) as error:
+                            checks.append({'error': type(error).__name__})
+                            continue
+                        except httpx.HTTPStatusError as error:
+                            status = error.response.status_code
+                            if status not in (408, 429) and not 500 <= status < 600:
+                                raise
+                            checks.append({'http_status': status})
+                            continue
+                        result = back.get('result')
+                        result = result if isinstance(result, dict) else {}
+                        groups = result.get('groups')
+                        groups = groups if isinstance(groups, list) else []
+                        enabled = _same_number(result.get('enable'), 1)
+                        matched = any(_same_group(group, g) for g in groups)
+                        checks.append({'enabled': enabled, 'groups': len(groups), 'matched': matched})
+                        if enabled and matched:
+                            verified = True
+                            break
+            except TimeoutError:
+                pass
+        last_count = next((check['groups'] for check in reversed(checks) if 'groups' in check), 0)
+        return CommandResult(accepted=True, verified=verified, detail={
+            'group': group, 'read_back_groups': last_count, 'read_back_checks': checks,
+        })
 
     async def release(self) -> CommandResult:
         sn = await self.serial()
         await self._request('/op/v1/device/scheduler/set/flag', {'deviceSN': sn, 'enable': 0}, write=True)
         flag = await self._request('/op/v1/device/scheduler/get/flag', {'deviceSN': sn})
-        disabled = (flag.get('result') or {}).get('enable') in (0, False)
+        disabled = _same_number((flag.get('result') or {}).get('enable'), 0)
         return CommandResult(accepted=True, verified=disabled, detail={'scheduler_enabled': not disabled})
 
 
-def _same_group(sent: dict, got: dict) -> bool:
-    keys = ('startHour', 'startMinute', 'endHour', 'endMinute', 'workMode')
-    if any(sent[k] != got.get(k) for k in keys) or int(got.get('enable', 0)) != 1:
+def _same_number(value, expected: int | float) -> bool:
+    try:
+        return float(value) == expected
+    except (TypeError, ValueError, OverflowError):
         return False
-    extra = got.get('extraParam') or {}
-    return all(abs(float(extra.get(k, -1)) - float(v)) < 1 for k, v in sent['extraParam'].items() if k in extra)
+
+
+def _same_group(sent: dict, got: dict) -> bool:
+    if not isinstance(got, dict) or got.get('workMode') != sent['workMode']:
+        return False
+    keys = ('enable', 'startHour', 'startMinute', 'endHour', 'endMinute')
+    if any(not _same_number(got.get(k), sent[k]) for k in keys):
+        return False
+    extra = got.get('extraParam')
+    if not isinstance(extra, dict):
+        return False
+    required = {'minSocOnGrid'}
+    if sent['workMode'] == 'ForceDischarge':
+        required.update(('fdSoc', 'fdPwr'))
+    elif sent['workMode'] == 'ForceCharge':
+        required.update(('maxSoc', 'fdPwr'))
+    return all(_same_number(extra.get(k), sent['extraParam'][k]) for k in required | (extra.keys() & sent['extraParam'].keys()))
 
 
 def parse_history(payload: dict, zone: str) -> list[SystemReading]:
