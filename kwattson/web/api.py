@@ -449,7 +449,7 @@ async def history(request: Request, days: int = 7):
     rows = select_intervals(db, start)
     return {'intervals': [{k: r[k] for k in ('ts', 'source', 'solar_kwh', 'load_kwh', 'ev_kwh', 'import_kwh', 'export_kwh',
                                                'charge_kwh', 'discharge_kwh', 'soc_end', 'limited_s', 'coverage_s', 'quality')} for r in rows],
-            'note': 'Integrated from power readings. Missing time is left out, never treated as zero.'}
+            'note': 'Uses energy counters where available and power readings otherwise. Missing time is left out.'}
 
 
 @router.get('/live')

@@ -63,3 +63,13 @@ def test_fox_solar_only_can_connect_without_battery_data():
     assert plugin._parse([{'variable': 'pvPower', 'value': 2.5}], None).pv_kw == 2.5
     with pytest.raises(PluginError):
         plugin._parse([], None)
+
+
+def test_foxess_maps_cumulative_energy_without_altering_instantaneous_power():
+    plugin = FoxESSCloud(SimpleNamespace(timezone='UTC'), FoxConfig(), SimpleNamespace(battery=None))
+    parsed = plugin._parse([{'variable': 'loadsPower', 'value': 0.75},
+                            {'variable': 'loads', 'value': 5234.1},
+                            {'variable': 'gridConsumption', 'value': 400},
+                            {'variable': 'feedin', 'value': 'unavailable'}], '2026-11-19 00:05:00 UTC+0000')
+    assert parsed.load_kw == 0.75
+    assert parsed.extra['energy_counters_kwh'] == {'load_kwh': 5234.1, 'import_kwh': 400}

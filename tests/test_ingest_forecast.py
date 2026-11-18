@@ -204,3 +204,35 @@ def test_projected_today_prorates_remaining_plan_and_keeps_supply_once(settings)
     ]
     assert projected_today(SimpleNamespace(rows=lambda *_: rows), settings, now, decision, {'net_aud': 1.35}) == 1.35
     assert projected_today(SimpleNamespace(rows=lambda *_: rows[:1]), settings, now, decision, {'net_aud': 1.35}) is None
+
+
+def test_energy_counters_win_and_split_across_half_hour_end(db, settings):
+    for minute, totals in (
+        (25, {'load_kwh': 100.0, 'import_kwh': 50.0, 'export_kwh': 30.0, 'solar_kwh': 120.0}),
+        (35, {'load_kwh': 100.4, 'import_kwh': 50.2, 'export_kwh': 30.0, 'solar_kwh': 120.8}),
+    ):
+        r = reading(minute)
+        r.extra['energy_counters_kwh'] = totals
+        store_site(db, combine(settings, {'main': r}))
+    rows = intervals(db)
+    assert len(rows) == 2
+    for slot in rows.values():
+        assert slot['load_kwh'] == pytest.approx(0.2)
+        assert slot['import_kwh'] == pytest.approx(0.1)
+        assert slot['export_kwh'] == 0
+        assert slot['solar_kwh'] == pytest.approx(0.4)
+        assert slot['quality'] == 'partial_with_counters'
+
+
+def test_bad_counters_use_power_only_for_affected_metric(db, settings):
+    for minute, totals in (
+        (0, {'load_kwh': 100.0, 'import_kwh': 50.0, 'solar_kwh': 120.0}),
+        (5, {'load_kwh': 0.0, 'import_kwh': 50.0, 'solar_kwh': 999.0}),
+    ):
+        r = reading(minute, solar=0.6)
+        r.extra['energy_counters_kwh'] = totals
+        store_site(db, combine(settings, {'main': r}))
+    slot = intervals(db)[stamp(T0)]
+    assert slot['load_kwh'] == pytest.approx(2 / 12)
+    assert slot['solar_kwh'] == pytest.approx(0.6 / 12)
+    assert slot['import_kwh'] == 0

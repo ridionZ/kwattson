@@ -19,9 +19,10 @@ curtailed), `fault`, `time_verified`, `systems` (JSON per-system readings).
 
 **intervals** — half-hour energy. `source`: `telemetry` (integrated from site_readings), or imports such
 as `meter`. `solar_kwh`, `load_kwh` (includes EV), `ev_kwh`, `import_kwh`, `export_kwh`, `charge_kwh`,
-`discharge_kwh`, `soc_end`, `limited_s` (seconds output-limited), `coverage_s` (seconds actually measured;
-<1800 = partial), `quality` (`observed` ≥ 1500 s, else `partial`). Use `ingest.select_intervals` to
-pick one row per slot.
+`discharge_kwh`, `soc_end`, `limited_s` (seconds output-limited), `coverage_s` (seconds actually
+measured; <1800 = partial), `quality` (`observed` ≥ 1500 s, else `partial`). A `_with_counters`
+quality suffix indicates that at least one metric used a device energy counter. Use
+`ingest.select_intervals` to pick one row per slot.
 
 **daily_history** — imported daily totals (e.g. FoxESS monthly reports): JSON `data` with solar/import/
 export/house/charge/discharge kWh. No intraday detail.

@@ -83,7 +83,7 @@ def cmd_set_secret(args):
 
 
 def cmd_import_foxess_history(args):
-    from .ingest import rebuild_intervals, store_system, combine
+    from .ingest import rebuild_intervals, store_site_row, store_system, combine
     from .plugins.foxess import parse_history
     runtime, db, security = _open(args)
     settings = db.settings()
@@ -97,10 +97,7 @@ def cmd_import_foxess_history(args):
             site = combine(settings, {system.id: r})
             if site:
                 with db.connect() as c:
-                    c.execute('INSERT OR REPLACE INTO site_readings VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)', (
-                        stamp(site['ts']), site['soc'], site['stored_kwh'], site['capacity_kwh'], site['solar_kw'], site['load_kw'],
-                        site['import_kw'], site['export_kw'], site['charge_kw'], site['discharge_kw'], 0.0, 0, site['output_limited'],
-                        0, 1, '{}', stamp()))
+                    store_site_row(c, site)
             first = min(first, r.ts) if first else r.ts
             last = max(last, r.ts) if last else r.ts
         total += len(readings)
@@ -139,7 +136,7 @@ def cmd_import_foxess_reports(args):
 
 def cmd_backfill(args):
     from .devices import Devices
-    from .ingest import rebuild_intervals, store_system, combine
+    from .ingest import rebuild_intervals, store_site_row, store_system, combine
     from . import weather
     runtime, db, security = _open(args)
     settings = db.settings()

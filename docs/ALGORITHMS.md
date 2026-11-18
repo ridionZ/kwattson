@@ -4,11 +4,18 @@ Everything here is deliberately simple and explainable. Each component has a ver
 stored with its output so results can be compared across changes.
 
 ## 1. Data pipeline
+
+FoxESS cumulative kWh readings take precedence for house use, grid import/export and PV
+generation when the same meters report valid counters at both ends of a sampling interval.
+The change in each counter gives the energy for that sample span. A span crossing a half-hour
+boundary is apportioned by time. Missing counters, resets and implausible jumps use the
+power-based estimate for that metric. Gaps over 15 minutes remain uncovered.
+
 - Each enabled system is polled every `site.poll_seconds` (default 2 min on new installs). Readings are stored
   per system (`system_readings`) and combined into a site reading (`site_readings`): PV and battery
   powers summed; grid import/export and load from the site-meter system; load derived from the AC
   energy balance if the meter doesn't report it.
-- Power is integrated into half-hour **intervals** with the trapezoid rule. Segments longer than
+- Power-based estimates use the trapezoid rule in half-hour **intervals**. Segments longer than
   15 minutes are not integrated (gap). Every new reading recomputes the affected slots from the
   stored readings, so late/out-of-order data can't double count.
 - `output_limited` marks readings where a DC-coupled inverter was at ≥97% of its AC limit with PV

@@ -29,8 +29,9 @@ HOSTS = {'global': 'https://www.foxesscloud.com'}
 READ = {'/op/v0/device/list', '/op/v1/device/real/query', '/op/v0/device/history/query', '/op/v1/device/detail', '/op/v0/device/battery/soc/get',
         '/op/v2/device/scheduler/get', '/op/v1/device/scheduler/get/flag'}
 WRITE = {'/op/v2/device/scheduler/enable', '/op/v1/device/scheduler/set/flag'}
+COUNTERS = {'loads': 'load_kwh', 'gridConsumption': 'import_kwh', 'feedin': 'export_kwh', 'PVEnergyTotal': 'solar_kwh'}
 VARIABLES = ['pvPower', 'loadsPower', 'feedinPower', 'gridConsumptionPower', 'batChargePower', 'batDischargePower',
-             'generationPower', 'SoC', 'batTemperature', 'runningState']
+             'generationPower', 'SoC', 'batTemperature', 'runningState', *COUNTERS]
 FAULT_STATES = {'165', '166'}
 SCHEDULER_READ_ATTEMPTS = 5
 SCHEDULER_READ_PAUSE = 2
@@ -67,6 +68,18 @@ def _number(value):
         return None
     result = float(value)
     return result if math.isfinite(result) else None
+
+
+def energy_counters(values: dict) -> dict:
+    counters = {}
+    for variable, metric in COUNTERS.items():
+        try:
+            value = _number(values.get(variable))
+        except (TypeError, ValueError):
+            continue
+        if value is not None and value >= 0:
+            counters[metric] = value
+    return {'energy_counters_kwh': counters} if counters else {}
 
 
 class FoxESSCloud(SystemPlugin):
@@ -144,7 +157,7 @@ class FoxESSCloud(SystemPlugin):
             ac_output_kw=_number(values.get('generationPower')), import_kw=_number(values.get('gridConsumptionPower')),
             export_kw=_number(values.get('feedinPower')), load_kw=_number(values.get('loadsPower')),
             battery_temp=_number(values.get('batTemperature')), running_state=state,
-            fault=state in FAULT_STATES if state else None)
+            fault=state in FAULT_STATES if state else None, extra=energy_counters(values))
         if reading.soc is None and self.system.battery is not None:
             raise PluginError('FoxESS did not report a battery state of charge')
         if reading.soc is None and all(value is None for value in (reading.pv_kw, reading.ac_output_kw, reading.load_kw)):
@@ -305,5 +318,5 @@ def parse_history(payload: dict, zone: str) -> list[SystemReading]:
             ts=measurement_time(when, zone), time_verified=True, soc=soc, pv_kw=_number(values.get('pvPower')),
             charge_kw=_number(values.get('batChargePower')), discharge_kw=_number(values.get('batDischargePower')),
             import_kw=_number(values.get('gridConsumptionPower')), export_kw=_number(values.get('feedinPower')),
-            load_kw=_number(values.get('loadsPower')), ac_output_kw=_number(values.get('generationPower'))))
+            load_kw=_number(values.get('loadsPower')), ac_output_kw=_number(values.get('generationPower')), extra=energy_counters(values)))
     return readings

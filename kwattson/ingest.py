@@ -1,4 +1,4 @@
-"""Store readings and integrate power into half-hour energy intervals.
+"""Store readings and derive half-hour energy from counters or power samples.
 
 Integration is *recomputed* from stored readings for every half-hour slot a new
 reading can affect, so late or out-of-order readings never double count. Gaps
@@ -8,9 +8,10 @@ being filled with zeros.
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from math import isfinite
 
 from .config import Settings, stamp
-from .db import Database, encode
+from .db import Database, decode, encode
 from .plugins.base import SystemReading, VehicleReading
 
 MAX_GAP = timedelta(minutes=15)
@@ -71,22 +72,62 @@ def combine(settings: Settings, readings: dict[str, SystemReading], ev_kw: float
         output = reading.ac_output_kw if reading.ac_output_kw is not None else (reading.pv_kw or 0) - (reading.charge_kw or 0) + (reading.discharge_kw or 0)
         if system.coupling == 'dc' and (reading.pv_kw or 0) > 0.5 and output >= 0.97 * system.ac_kw:
             limited = True
+    details = {k: v.as_dict() for k, v in readings.items()}
+    counters = {}
+    ac_limit = sum(s.ac_kw for s in systems.values())
+    for metric, ids, maximum in (
+        ('import_kwh', [meter_id], settings.site.grid_import_kw),
+        ('export_kwh', [meter_id], max(settings.site.export_kw, ac_limit)),
+        ('load_kwh', [meter_id], settings.site.grid_import_kw + ac_limit),
+        ('solar_kwh', [s.id for s in systems.values() if s.pv_kwp > 0], sum(s.pv_limit_kw for s in systems.values() if s.pv_kwp > 0)),
+    ):
+        values = {}
+        for sid in ids:
+            r = readings.get(sid)
+            if not r or not r.time_verified or r.ts != meter.ts:
+                break
+            value = r.extra.get('energy_counters_kwh', {}).get(metric)
+            if not isinstance(value, (int, float)) or not isfinite(value) or value < 0:
+                break
+            values[sid] = value
+        if ids and len(values) == len(ids):
+            counters[metric] = {'sources': values, 'max_kw': maximum}
+    if counters:
+        details['_energy'] = counters
     return dict(ts=meter.ts, soc=stored / capacity * 100 if capacity else None, stored_kwh=stored if capacity else None,
                 capacity_kwh=capacity or None, solar_kw=solar, load_kw=load, import_kw=meter.import_kw, export_kw=meter.export_kw,
                 charge_kw=charge, discharge_kw=discharge, ev_kw=min(ev_kw, load), ev_estimated=int(ev_estimated),
                 output_limited=int(limited), fault=int(any(r.fault for r in readings.values())),
                 time_verified=int(all(r.time_verified for r in readings.values())),
-                systems={k: v.as_dict() for k, v in readings.items()})
+                systems=details)
+
+
+def store_site_row(c, site: dict):
+    c.execute('INSERT OR REPLACE INTO site_readings VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)', (
+        stamp(site['ts']), site['soc'], site['stored_kwh'], site['capacity_kwh'], site['solar_kw'], site['load_kw'],
+        site['import_kw'], site['export_kw'], site['charge_kw'], site['discharge_kw'], site['ev_kw'],
+        site['ev_estimated'], site['output_limited'], site['fault'], site['time_verified'], encode(site['systems']), stamp()))
 
 
 def store_site(db: Database, site: dict):
     at = site['ts']
     with db.connect() as c:
-        c.execute('INSERT OR REPLACE INTO site_readings VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)', (
-            stamp(at), site['soc'], site['stored_kwh'], site['capacity_kwh'], site['solar_kw'], site['load_kw'],
-            site['import_kw'], site['export_kw'], site['charge_kw'], site['discharge_kw'], site['ev_kw'],
-            site['ev_estimated'], site['output_limited'], site['fault'], site['time_verified'], encode(site['systems']), stamp()))
+        store_site_row(c, site)
         rebuild_intervals(c, at - MAX_GAP, at + MAX_GAP)
+
+
+def counter_deltas(before: dict, after: dict, seconds: float) -> dict:
+    deltas = {}
+    for metric in before.keys() & after.keys():
+        a, b = before[metric]['sources'], after[metric]['sources']
+        if a.keys() != b.keys():
+            continue
+        changes = [b[source] - a[source] for source in a]
+        total = sum(changes)
+        cap = max(before[metric]['max_kw'], after[metric]['max_kw']) * seconds / 3600
+        if all(change >= 0 for change in changes) and total <= cap + 0.2 * len(changes):
+            deltas[metric] = total
+    return deltas
 
 
 def rebuild_intervals(c, start: datetime, end: datetime, source='telemetry'):
@@ -95,11 +136,13 @@ def rebuild_intervals(c, start: datetime, end: datetime, source='telemetry'):
     rows = c.execute('SELECT * FROM site_readings WHERE ts>=? AND ts<? ORDER BY ts',
                      (stamp(first - MAX_GAP), stamp(last + MAX_GAP))).fetchall()
     slots: dict[datetime, dict] = {}
-    for a, b in zip(rows, rows[1:]):
+    counters = [decode(row['systems']).get('_energy', {}) for row in rows]
+    for i, (a, b) in enumerate(zip(rows, rows[1:])):
         t0, t1 = datetime.fromisoformat(a['ts']), datetime.fromisoformat(b['ts'])
         span = (t1 - t0).total_seconds()
         if not 0 < span <= MAX_GAP.total_seconds():
             continue
+        measured = counter_deltas(counters[i], counters[i + 1], span)
         cursor = t0
         while cursor < t1:
             slot = slot_start(cursor)
@@ -108,10 +151,16 @@ def rebuild_intervals(c, start: datetime, end: datetime, source='telemetry'):
                 seconds = (stop - cursor).total_seconds()
                 # Linear interpolation of power at the sub-segment midpoint (trapezoid rule).
                 mid = ((cursor - t0).total_seconds() + (stop - t0).total_seconds()) / 2 / span
-                bucket = slots.setdefault(slot, {k: 0.0 for k in ENERGY.values()} | {'coverage_s': 0.0, 'limited_s': 0.0, 'soc_end': None})
+                bucket = slots.setdefault(slot, {k: 0.0 for k in ENERGY.values()} | {'coverage_s': 0.0, 'limited_s': 0.0, 'soc_end': None, 'used_counters': False})
+                if measured:
+                    bucket['used_counters'] = True
                 for power, energy in ENERGY.items():
-                    p0, p1 = a[power] or 0.0, b[power] or 0.0
-                    bucket[energy] += (p0 + (p1 - p0) * mid) * seconds / 3600
+                    if energy in measured:
+                        # The counter gives the exact span total, but not when it changed within that span.
+                        bucket[energy] += measured[energy] * seconds / span
+                    else:
+                        p0, p1 = a[power] or 0.0, b[power] or 0.0
+                        bucket[energy] += (p0 + (p1 - p0) * mid) * seconds / 3600
                 bucket['coverage_s'] += seconds
                 if a['output_limited'] and b['output_limited']:
                     bucket['limited_s'] += seconds
@@ -120,11 +169,14 @@ def rebuild_intervals(c, start: datetime, end: datetime, source='telemetry'):
             cursor = stop
     c.execute('DELETE FROM intervals WHERE source=? AND ts>=? AND ts<?', (source, stamp(first), stamp(last)))
     for slot, v in slots.items():
+        quality = 'observed' if v['coverage_s'] >= 1500 else 'partial'
+        if v['used_counters']:
+            quality += '_with_counters'
         c.execute('INSERT INTO intervals(ts, source, solar_kwh, load_kwh, ev_kwh, import_kwh, export_kwh, charge_kwh, discharge_kwh, '
                   'soc_end, limited_s, coverage_s, quality) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
                   (stamp(slot), source, v['solar_kwh'], v['load_kwh'], v['ev_kwh'], v['import_kwh'], v['export_kwh'],
                    v['charge_kwh'], v['discharge_kwh'], v['soc_end'], v['limited_s'], min(1800.0, v['coverage_s']),
-                   'observed' if v['coverage_s'] >= 1500 else 'partial'))
+                   quality))
 
 
 def select_intervals(db: Database, start: str, end: str | None = None) -> list[dict]:
