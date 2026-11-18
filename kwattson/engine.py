@@ -10,7 +10,7 @@ import time
 from datetime import datetime, timedelta
 
 from . import advice, alerts, forecast, optimizer, outcomes, weather
-from .config import Runtime, stamp, utcnow
+from .config import Runtime, Settings, stamp, utcnow
 from .control import Controller
 from .db import Database, decode
 from .devices import Devices
@@ -29,6 +29,7 @@ class Engine:
         self.notifications = Notifications(db, security)
         self.controller = Controller(db, self.devices, self.notifications, runtime)
         self.lock = asyncio.Lock()
+        self.control_lock = asyncio.Lock()
         self.next = dict(poll=0.0, vehicles=0.0, weather=0.0, plan=0.0, control=0.0, hourly=0.0, daily=0.0)
         self.transitions = []
         self.last_error = None
@@ -39,9 +40,9 @@ class Engine:
     def latest_decision(self):
         return self.controller.latest_decision()
 
-    async def replan(self) -> dict:
+    async def replan(self, settings: Settings | None = None) -> dict:
         async with self.lock:
-            settings = self.db.settings()
+            settings = settings or self.db.settings()
             forecast_id, points, model = await asyncio.to_thread(forecast.build, self.db, settings)
             decision = await asyncio.to_thread(optimizer.plan, self.db, settings, forecast_id, points, model)
             if decision['summary']['solver'] != 'HiGHS MILP':
@@ -85,9 +86,10 @@ class Engine:
                 self.notifications.emit('plan_failed', {'reason': f'Planning failed ({type(error).__name__}); no automatic commands are sent.'})
         if now >= self.next['control']:
             self.next['control'] = now + 30
-            settings = self.db.settings()
-            if settings.mode == 'automatic' or self.db.meta('control_active'):
-                await self.controller.cycle(settings)
+            async with self.control_lock:
+                settings = self.db.settings()
+                if settings.mode == 'automatic' or self.db.meta('control_active'):
+                    await self.controller.cycle(settings)
         decision = self.latest_decision()
         alerts.check(self.db, settings, self.notifications, self.devices.status, self.transitions, decision['id'] if decision else None)
         self.transitions.clear()

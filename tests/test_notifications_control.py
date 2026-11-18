@@ -92,3 +92,73 @@ def test_dispatch_command_ends_at_buffered_step(db, security, tmp_path):
                                          'Test higher reserve', step, end))
     assert result['status'] == 'verified'
     assert db.meta('control_active')['main']['target_soc'] == 42
+
+
+@pytest.mark.parametrize('failure', [None, 'planning', 'verification'])
+def test_enabling_control_builds_and_applies_first_step(db, security, tmp_path, monkeypatch, failure):
+    from types import SimpleNamespace
+
+    from fastapi import HTTPException
+
+    from kwattson import optimizer
+    from kwattson.config import stamp
+    from kwattson.engine import Engine
+    from kwattson.ingest import store_system
+    from kwattson.plugins.base import CommandResult, SystemReading
+    from kwattson.plugins.simulator import SimulatedHybrid
+    from kwattson.tariffs import Period, TariffPlan
+    from kwattson.web.api import EnableControl, enable_control
+
+    from conftest import sunny_points
+
+    now = datetime(2026, 12, 1, 11, 10, tzinfo=ZONE)
+    settings = demo_settings()
+    settings.systems[0].pv_kwp = 0
+    settings.tariffs = [TariffPlan(id='test', name='Free then peak', supply_daily=1, periods=[
+        Period(name='free', start='00:00', end='12:00', import_rate=0, export_rate=0),
+        Period(name='peak', start='12:00', end='24:00', import_rate=0.75, export_rate=0),
+    ])]
+    db.save_settings(settings)
+    system = settings.systems[0]
+    store_system(db, system.id, system.plugin, SystemReading(ts=now, time_verified=True, soc=20))
+    runtime = Runtime(data_dir=tmp_path, app_url='http://localhost:8080', dev_http=True, worker=True)
+    engine = Engine(db, security, runtime)
+    monkeypatch.setattr(security, 'reauthenticate', lambda *_: None)
+    monkeypatch.setattr('kwattson.control.utcnow', lambda: now)
+
+    async def replan(proposed):
+        assert proposed.mode == 'automatic'
+        assert db.settings().mode == 'monitor'
+        if failure == 'planning':
+            raise RuntimeError('synthetic planner error')
+        return optimizer.plan(db, proposed, 0, sunny_points(now, hours=24, peak_kw=0), {}, now=now)
+
+    monkeypatch.setattr(engine, 'replan', replan)
+    if failure == 'verification':
+        async def unconfirmed(self, command):
+            return CommandResult(accepted=True, verified=False, detail={})
+        monkeypatch.setattr(SimulatedHybrid, 'apply', unconfirmed)
+
+    req = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(db=db, security=security, engine=engine, runtime=runtime)),
+        state=SimpleNamespace(user={'user_id': 1, 'username': 'fixture'}),
+    )
+    body = EnableControl(password='synthetic', confirmation='ENABLE BATTERY CONTROL', acknowledge=True)
+    assert engine.latest_decision() is None
+    if failure:
+        with pytest.raises(HTTPException) as error:
+            asyncio.run(enable_control(body, req))
+        assert error.value.status_code == (503 if failure == 'planning' else 409)
+        assert db.settings().mode == 'monitor'
+        if failure == 'planning':
+            assert not db.meta('control_commissioned')
+            assert db.one('SELECT COUNT(*) AS count FROM commands')['count'] == 0
+        else:
+            assert db.one("SELECT status FROM commands WHERE action='force_charge'")['status'] == 'unverified'
+            assert db.one("SELECT status FROM commands WHERE action='release'")['status'] == 'released'
+    else:
+        result = asyncio.run(enable_control(body, req))
+        assert result['mode'] == db.settings().mode == 'automatic'
+        assert result['decision_id'] == engine.latest_decision()['id']
+        assert db.one("SELECT status FROM commands WHERE action='force_charge'")['status'] == 'verified'
+        assert db.meta('control_active')[system.id]['start'] == stamp(now)

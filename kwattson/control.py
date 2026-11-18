@@ -43,7 +43,7 @@ class Controller:
             row['summary'] = decode(row['summary'])
         return row
 
-    def guards(self, settings: Settings, now: datetime | None = None) -> list[str]:
+    def guards(self, settings: Settings, now: datetime | None = None, *, commissioning=False, check_plan=True) -> list[str]:
         """Reasons automatic control may not act right now (empty list = clear)."""
         now = now or utcnow()
         reasons = []
@@ -53,7 +53,7 @@ class Controller:
         if not controllable:
             reasons.append('No system is marked controllable')
         commissioned = self.db.meta('control_commissioned')
-        if not commissioned or commissioned.get('hash') != commissioning_hash(settings):
+        if not commissioning and (not commissioned or commissioned.get('hash') != commissioning_hash(settings)):
             reasons.append('Control has not been commissioned for the current system settings')
         if pending_plans(settings.tariffs):
             reasons.append('A tariff is waiting for its confirmed start date')
@@ -70,15 +70,16 @@ class Controller:
                 reasons.append(f'{s.name}: device reports a fault')
             elif latest['soc'] is None:
                 reasons.append(f'{s.name}: battery level unknown')
-        decision = self.latest_decision()
-        if not decision or now - datetime.fromisoformat(decision['created_at']) > timedelta(minutes=35):
-            reasons.append('Plan missing or older than 35 minutes')
-        elif decision['version'] != VERSION or decision['summary'].get('dispatch_policy') != dispatch_policy(settings):
-            reasons.append('Waiting for a plan with the current tariff and battery buffers')
-        elif decision['summary']['solver'] != 'HiGHS MILP':
-            reasons.append('Latest plan is a fallback, not a verified optimisation')
-        elif not decision['summary'].get('telemetry_fresh'):
-            reasons.append('Latest plan was made without fresh battery readings')
+        if check_plan:
+            decision = self.latest_decision()
+            if not decision or now - datetime.fromisoformat(decision['created_at']) > timedelta(minutes=35):
+                reasons.append('Plan missing or older than 35 minutes')
+            elif decision['version'] != VERSION or decision['summary'].get('dispatch_policy') != dispatch_policy(settings):
+                reasons.append('Waiting for a plan with the current tariff and battery buffers')
+            elif decision['summary']['solver'] != 'HiGHS MILP':
+                reasons.append('Latest plan is a fallback, not a verified optimisation')
+            elif not decision['summary'].get('telemetry_fresh'):
+                reasons.append('Latest plan was made without fresh battery readings')
         if any(s.pv_kwp > 0 for s in settings.active_systems()) and settings.site.latitude is None:
             reasons.append('Set your home location (Settings › Home & tariff) so weather forecasts can be fetched')
         elif any(s.pv_kwp > 0 for s in settings.active_systems()) and settings.site.weather_enabled:
@@ -123,6 +124,8 @@ class Controller:
         for system in [s for s in settings.active_systems() if s.controllable and s.battery]:
             command = (systems.get(system.id) or {}).get('command') or {'mode': 'self_use', 'power_kw': 0, 'target_soc': None}
             results[system.id] = await self.send(settings, system, command, decision['id'], now, row['reason'], step_start, step_end)
+            if settings.mode != 'automatic':
+                break
         return {'executed': True, 'results': results}
 
     async def send(self, settings: Settings, system, command: dict, decision_id: int, now: datetime, reason: str, step_start: datetime, step_end: datetime) -> dict:

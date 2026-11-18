@@ -24,7 +24,8 @@ doesn't respond twice in a row, also stops automatic control.
    network/installer), battery capacity, charge/discharge limits and reserve.
 4. Run *Test connection* (read-only) on the system.
 5. Know how to stop it: the **Stop automatic control** button, and the inverter's own app.
-6. Be present for the first commands and watch the inverter app.
+6. Be present for the first commands and watch the inverter app. Turning on automatic control
+   builds a fresh plan and applies its current step as soon as the control checks pass.
 
 ## FoxESS specifics
 - Control uses the Cloud Open API *scheduler* (time groups). Each command writes one ≤20-minute group

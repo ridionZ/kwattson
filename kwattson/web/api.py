@@ -915,27 +915,43 @@ CONFIRMATION = 'ENABLE BATTERY CONTROL'
 
 @router.post('/control/enable')
 async def enable_control(body: EnableControl, request: Request):
-    db, security, engine, _ = ctx(request)
+    db, security, engine, runtime = ctx(request)
     security.reauthenticate(me(request), body.password, body.otp)
     if body.confirmation.strip() != CONFIRMATION or not body.acknowledge:
         raise HTTPException(422, f'Read the commissioning checklist, tick the acknowledgement and type {CONFIRMATION}')
-    settings = db.settings()
-    db.set_meta('control_commissioned', {'at': stamp(), 'hash': commissioning_hash(settings)})
-    settings.mode = 'automatic'
-    blocking = [r for r in engine.controller.guards(settings) if 'monitor mode' not in r]
-    if blocking:
-        db.set_meta('control_commissioned', None)
-        raise HTTPException(409, 'Not enabled. Fix these first: ' + '; '.join(blocking))
-    db.save_settings(settings, actor(request))
-    db.audit('control_enabled', {'systems': [s.id for s in settings.systems if s.controllable]}, actor(request))
-    engine.next['control'] = 0
-    return {'mode': 'automatic'}
+    if not runtime.worker:
+        raise HTTPException(409, 'Not enabled. The background worker must be running.')
+    async with engine.control_lock:
+        current = db.settings()
+        if current.mode == 'automatic':
+            return {'mode': 'automatic'}
+        settings = current.model_copy(update={'mode': 'automatic'})
+        blocking = engine.controller.guards(settings, commissioning=True, check_plan=False)
+        if blocking:
+            raise HTTPException(409, 'Not enabled. Fix these first: ' + '; '.join(blocking))
+        try:
+            decision = await engine.replan(settings)
+        except Exception as error:
+            raise HTTPException(503, 'Not enabled. A fresh plan could not be built.') from error
+        if db.settings() != current:
+            raise HTTPException(409, 'Not enabled. Settings changed while planning. Try again.')
+        blocking = engine.controller.guards(settings, commissioning=True)
+        if blocking:
+            raise HTTPException(409, 'Not enabled. Fix these first: ' + '; '.join(blocking))
+        db.set_meta('control_commissioned', {'at': stamp(), 'hash': commissioning_hash(settings)})
+        db.save_settings(settings, actor(request))
+        db.audit('control_enabled', {'systems': [s.id for s in settings.systems if s.controllable]}, actor(request))
+        result = await engine.controller.cycle(settings)
+        if db.settings().mode != 'automatic':
+            raise HTTPException(409, 'Automatic control stopped when applying the first step. Check Alerts for details.')
+        return {'mode': 'automatic', 'decision_id': decision['id'], 'initial_control': result}
 
 
 @router.post('/control/stop')
 async def stop_control(request: Request):
     db, _, engine, _ = ctx(request)
-    problems = await engine.controller.stop(db.settings(), 'Stopped by owner', actor=actor(request))
+    async with engine.control_lock:
+        problems = await engine.controller.stop(db.settings(), 'Stopped by owner', actor=actor(request))
     return {'mode': 'monitor', 'problems': problems}
 
 
