@@ -14,13 +14,15 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-from .config import Settings, stamp, utcnow
+from .config import Settings, Vehicle, stamp, utcnow
 from .db import Database, decode
+from .vehicle_usage import daily_drain, midnight, project
 
 
 def plan_intervals(db: Database, decision_id: int) -> list[dict]:
     rows = db.rows('SELECT di.*, fp.temperature, fp.radiation FROM decision_intervals di JOIN decisions d ON d.id=di.decision_id '
-                   'LEFT JOIN forecast_points fp ON fp.forecast_id=d.forecast_id AND fp.ts=di.ts WHERE di.decision_id=? ORDER BY di.ts',
+                   'LEFT JOIN forecast_points fp ON fp.forecast_id=d.forecast_id AND fp.ts=('
+                   'SELECT ts FROM forecast_points WHERE forecast_id=d.forecast_id AND ts<=di.ts ORDER BY ts DESC LIMIT 1) WHERE di.decision_id=? ORDER BY di.ts',
                    (decision_id,))
     for r in rows:
         r['systems'] = decode(r['systems'])
@@ -40,37 +42,108 @@ def marginal_cost(row: dict, extra_kwh: float) -> float:
     return cost
 
 
-def ev_advice(settings: Settings, rows: list[dict], vehicle, soc: float | None, now: datetime) -> dict:
-    """Cheapest continuous charging window in the next 24 h for the energy this car needs."""
-    need = max(0.0, (vehicle.target_pct - soc) / 100 * vehicle.capacity_kwh / vehicle.charger_efficiency) if soc is not None else \
-        vehicle.km_per_week * vehicle.kwh_per_100km / 100 / vehicle.charger_efficiency / max(1, len(vehicle.schedule.days) or 2)
-    upcoming = [r for r in rows if datetime.fromisoformat(r['ts']) < now + timedelta(hours=24)]
-    if need < 0.5 or not upcoming:
-        return dict(vehicle=vehicle.id, name=vehicle.name, need_kwh=round(need, 1), recommendation=None)
-    slots_needed = max(1, round(need / (vehicle.charger_kw * 0.5)))
+def charge_window(rows, now, deadline, need, charger_kw, unavailable):
+    """Choose the cheapest continuous window, with a partial top-up if time is short."""
+    slots = []
+    for row in rows:
+        at = datetime.fromisoformat(row['ts'])
+        start, end = max(at, now), min(at + timedelta(hours=row['hours']), deadline)
+        if end <= start or any(a < end and b > start for a, b in unavailable):
+            continue
+        slots.append((start, end, row))
     best = None
-    for start in range(len(upcoming)):
-        window = upcoming[start:start + slots_needed]
-        if len(window) < slots_needed:
-            break
-        energy = need
-        cost = 0.0
-        for r in window:
-            e = min(energy, vehicle.charger_kw * r['hours'])
-            cost += marginal_cost(r, e)
-            energy -= e
-        if best is None or cost < best[0] - 0.01:
-            best = (cost, window)
-    cost, window = best
-    now_cost = sum(marginal_cost(r, min(need, vehicle.charger_kw * r['hours'])) for r in upcoming[:slots_needed])
-    start = datetime.fromisoformat(window[0]['ts'])
-    end = datetime.fromisoformat(window[-1]['ts']) + timedelta(hours=window[-1]['hours'])
-    local = lambda t: t.astimezone(settings.zone).strftime('%a %-I:%M %p')
-    return dict(vehicle=vehicle.id, name=vehicle.name, need_kwh=round(need, 1), soc=soc,
-                recommendation=dict(start=stamp(start), end=stamp(end), cost_aud=round(cost, 2),
-                                    cents_per_kwh=round(cost / need * 100, 1), now_cost_aud=round(now_cost, 2),
-                                    text=f'Charge {local(start)} – {local(end)}: about ${cost:.2f} for {need:.0f} kWh '
-                                         f'({cost / need * 100:.0f}c/kWh) versus ${now_cost:.2f} starting now.'))
+    for i, (start, _, _) in enumerate(slots):
+        remaining, cost, end = need, 0.0, start
+        for at, stop, row in slots[i:]:
+            if at != end:
+                break
+            hours = min((stop - at).total_seconds() / 3600, remaining / charger_kw)
+            scale = hours / row['hours']
+            supplies = {**row, 'curtailed_kwh': row['curtailed_kwh'] * scale,
+                        'export_kwh': row['export_kwh'] * scale}
+            energy = hours * charger_kw
+            cost += marginal_cost(supplies, energy)
+            remaining -= energy
+            end = stop if hours == (stop - at).total_seconds() / 3600 else at + timedelta(hours=hours)
+            if remaining < 1e-6:
+                break
+        delivered = need - remaining
+        score = (-round(delivered, 6), round(cost, 2), start)
+        if best is None or score < best[0]:
+            best = (score, start, end, delivered, cost)
+    return best[1:] if best else None
+
+
+def ev_advice(db: Database, settings: Settings, rows: list[dict], vehicle: Vehicle, now: datetime,
+              unavailable: list[tuple[datetime, datetime]]) -> dict:
+    latest = db.latest_vehicle(vehicle.id)
+    fresh = (latest and latest['plugin'] == vehicle.plugin
+             and timedelta(0) <= now - datetime.fromisoformat(latest['ts']) < timedelta(hours=6))
+    live_soc = latest['soc'] if fresh else None
+    soc = live_soc if live_soc is not None else vehicle.manual_soc
+    # Presence expires faster than battery percentage.
+    present = fresh and now - datetime.fromisoformat(latest['ts']) < timedelta(minutes=30)
+    at_home = latest['at_home'] if present else None
+    history = daily_drain(db, vehicle, now, settings.zone) if soc is not None else {}
+    projection = project(soc, now, settings.zone, vehicle, history)
+    result = dict(vehicle=vehicle.id, name=vehicle.name, soc=soc, at_home=at_home,
+                  projection=projection, need_kwh=0, recommendation=None)
+    if (soc is None or not rows or at_home == 0 or (fresh and latest['charging'])
+            or any(start <= now < end for start, end in unavailable)):
+        return result
+
+    floor = vehicle.reminder_soc_pct
+    low = soc <= floor
+    crossing = next((p for p in projection if any(value is not None and value <= floor
+                     for value in (p['soc_pct'], p['soc_upper_pct']))), None)
+    if not low and crossing is None:
+        return result
+    need = (vehicle.target_pct - soc) / 100 * vehicle.capacity_kwh / vehicle.charger_efficiency
+    if need < 0.5:
+        return result
+
+    last = datetime.fromisoformat(rows[-1]['ts']) + timedelta(hours=rows[-1]['hours'])
+    if low:
+        deadline = now + timedelta(hours=24)
+        reason = f'Battery at {soc:.0f}% (reminder level {floor:.0f}%).'
+    else:
+        day = datetime.fromisoformat(crossing['day']).date()
+        deadline = midnight(day, settings.zone)
+        if deadline <= now:
+            end_today = midnight(day + timedelta(days=1), settings.zone)
+            deadline = now + (end_today - now) * ((soc - floor) / crossing['drain_pct'])
+        if deadline > last:
+            return result
+        basis = 'Estimated' if any(p['source'] == 'estimate' for p in projection if p['day'] <= crossing['day']) else 'Likely'
+        if crossing['soc_pct'] is None:
+            reason = f'Could reach {crossing["soc_upper_pct"]:.0f}% or lower by {day:%a} evening.'
+        else:
+            reason = f'{basis} to reach {crossing["soc_pct"]:.0f}% by {day:%a} evening.'
+    window = charge_window(rows, now, deadline, need, vehicle.charger_kw, unavailable)
+    if window is None:
+        return result
+    start, end, energy, cost = window
+    if energy < 0.5:
+        return result
+    local_start = start.astimezone(settings.zone)
+    local_end = end.astimezone(settings.zone)
+    tomorrow = local_start.date() + timedelta(days=1)
+    tomorrow_rows = [r for r in rows if datetime.fromisoformat(r['ts']).astimezone(settings.zone).date() == tomorrow]
+    if (crossing and crossing['day'] == tomorrow.isoformat()
+            and sum(r['hours'] for r in tomorrow_rows if r.get('radiation') is not None and
+                    8 <= datetime.fromisoformat(r['ts']).astimezone(settings.zone).hour < 16) >= 7.5
+            and sum(r['curtailed_kwh'] + r['export_kwh'] for r in tomorrow_rows) < energy / 2):
+        reason = reason.removesuffix('.') + ', with little spare solar forecast that day.'
+    action = 'Charge' if energy >= need - 1e-6 else 'Top up'
+    if at_home != 1:
+        action = f'If home, {action.lower()}'
+    when = f'{local_start:%a %-I:%M %p}–{local_end:%-I:%M %p}'
+    if local_end.date() != local_start.date():
+        when = f'{local_start:%a %-I:%M %p}–{local_end:%a %-I:%M %p}'
+    return {**result, 'need_kwh': round(need, 1),
+            'recommendation': dict(start=stamp(start), end=stamp(end), cost_aud=round(cost, 2),
+                                   energy_kwh=round(energy, 1), cents_per_kwh=round(cost / energy * 100, 1),
+                                   text=f'{action} {when}. {reason}')}
 
 
 def climate_signal(settings: Settings, rows: list[dict], now: datetime, house_away: bool) -> dict:
@@ -140,11 +213,13 @@ def build(db: Database, settings: Settings, decision_id: int | None, now: dateti
         return dict(vehicles=[], climate=None, clipping=None, schedule=[])
     rows = plan_intervals(db, decision_id)
     away = db.one('SELECT 1 FROM holidays WHERE start<=? AND end>?', (stamp(now), stamp(now))) is not None
+    holidays = db.rows('SELECT start, end FROM holidays WHERE ev_away AND end>?', (stamp(now),))
+    overrides = db.rows("SELECT starts AS start, expires AS end, data FROM overrides WHERE kind='ev_away' "
+                        'AND cancelled_at IS NULL AND expires>?', (stamp(now),))
     vehicles = []
     for v in settings.active_vehicles():
-        latest = db.latest_vehicle(v.id)
-        fresh = latest and now - datetime.fromisoformat(latest['ts']) < timedelta(hours=6)
-        soc = latest['soc'] if fresh and latest['soc'] is not None else v.manual_soc
-        vehicles.append(ev_advice(settings, rows, v, soc, now))
+        away_periods = holidays + [o for o in overrides if decode(o['data']).get('vehicle_id') in (None, v.id)]
+        unavailable = [(datetime.fromisoformat(p['start']), datetime.fromisoformat(p['end'])) for p in away_periods]
+        vehicles.append(ev_advice(db, settings, rows, v, now, unavailable))
     return dict(vehicles=vehicles, climate=climate_signal(settings, rows, now, away), clipping=clipping_today(settings, rows, now),
                 schedule=suggested_schedule(settings, [r for r in rows if datetime.fromisoformat(r['ts']) < now + timedelta(hours=24)]))

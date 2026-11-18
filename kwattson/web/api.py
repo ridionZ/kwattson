@@ -377,9 +377,12 @@ async def latest_plan(request: Request):
 
 
 def _intervals(db, decision_id):
-    rows = db.rows('SELECT di.*, fp.house_kwh, fp.house_p10, fp.house_p90, fp.ev_kwh, fp.solar_p10, fp.solar_p90, fp.temperature, '
+    rows = db.rows('SELECT di.*, fp.house_kwh*di.hours/fp.hours AS house_kwh, fp.house_p10*di.hours/fp.hours AS house_p10, '
+                   'fp.house_p90*di.hours/fp.hours AS house_p90, fp.ev_kwh*di.hours/fp.hours AS ev_kwh, '
+                   'fp.solar_p10*di.hours/fp.hours AS solar_p10, fp.solar_p90*di.hours/fp.hours AS solar_p90, fp.temperature, '
                    'fp.radiation, fp.load_basis, fp.solar_basis FROM decision_intervals di JOIN decisions d ON d.id=di.decision_id '
-                   'LEFT JOIN forecast_points fp ON fp.forecast_id=d.forecast_id AND fp.ts=di.ts WHERE di.decision_id=? ORDER BY di.ts',
+                   'LEFT JOIN forecast_points fp ON fp.forecast_id=d.forecast_id AND fp.ts=('
+                   'SELECT ts FROM forecast_points WHERE forecast_id=d.forecast_id AND ts<=di.ts ORDER BY ts DESC LIMIT 1) WHERE di.decision_id=? ORDER BY di.ts',
                    (decision_id,))
     for r in rows:
         r['systems'] = decode(r['systems'])

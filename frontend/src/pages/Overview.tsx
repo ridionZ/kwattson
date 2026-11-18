@@ -415,7 +415,7 @@ function Advice({ st }: { st: any }) {
     const r = v.recommendation;
     cards.push(
       <AdviceCard key={`ev${v.vehicle}`} icon={<EvStationRounded />} tone={{ fg: t.batteryText, bg: t.batteryContainer }} title={`Best time to charge ${v.name}`}>
-        <strong>{f.when(r.start)} to {f.when(r.end)}</strong>: about {f.money(r.cost_aud)} for {f.kwh(v.need_kwh, 0)}, versus {f.money(r.now_cost_aud)} starting now.
+        {r.text} About {f.money(r.cost_aud)} for {f.kwh(r.energy_kwh, 0)}.
       </AdviceCard>);
   }
   const c = a.climate;

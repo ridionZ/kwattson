@@ -384,13 +384,13 @@ def comparison(db: Database, forecast_id: int, now: datetime) -> dict:
     decision = db.one('SELECT id, mode, summary FROM decisions WHERE forecast_id=? ORDER BY id LIMIT 1', (forecast_id,))
     planned = {}
     if decision and decode(decision['summary']).get('initial_soc_pct') is not None:
-        planned = {r['ts']: r['soc_pct'] for r in db.rows(
-            'SELECT ts, soc_pct FROM decision_intervals WHERE decision_id=?', (decision['id'],))}
+        planned = {stamp(datetime.fromisoformat(r['ts']) + timedelta(hours=r['hours'])): r['soc_pct'] for r in db.rows(
+            'SELECT ts, hours, soc_pct FROM decision_intervals WHERE decision_id=?', (decision['id'],))}
     points = []
     for p, end, actual in _elapsed_slots(db, forecast_id, now):
         points.append(dict(end=stamp(end), forecast_solar=p['solar_kwh'], actual_solar=actual['solar_kwh'] if actual else None,
                            forecast_load=p['house_kwh'] + p['ev_kwh'], actual_load=actual['load_kwh'] if actual else None,
-                           planned_soc=planned.get(p['ts']), actual_soc=actual['soc_end'] if actual else None))
+                           planned_soc=planned.get(stamp(end)), actual_soc=actual['soc_end'] if actual else None))
     return dict(forecast_id=forecast_id, mode=decision['mode'] if decision else None, points=points)
 
 

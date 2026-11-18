@@ -84,7 +84,7 @@ class Engine:
                 log.exception('Planning failed')
                 self.notifications.emit('plan_failed', {'reason': f'Planning failed ({type(error).__name__}); no automatic commands are sent.'})
         if now >= self.next['control']:
-            self.next['control'] = now + 300
+            self.next['control'] = now + 30
             settings = self.db.settings()
             if settings.mode == 'automatic' or self.db.meta('control_active'):
                 await self.controller.cycle(settings)

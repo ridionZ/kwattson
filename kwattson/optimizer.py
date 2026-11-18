@@ -43,11 +43,19 @@ from scipy.sparse import lil_matrix
 
 from .config import Settings, stamp, utcnow
 from .db import Database, encode
+from .dispatch import overnight_need, split_points
 from .ingest import select_intervals
 from .tariffs import plan_at
 
-VERSION = 'milp-dc-coupled-v1.1'  # v1.1: 24 h saving credits stored-energy difference
+VERSION = 'milp-dc-coupled-v1.2'
 EPS = 1e-6
+
+
+def dispatch_policy(settings: Settings) -> str:
+    """Identify the tariff and reserve settings used to schedule live commands."""
+    dispatch = (settings.site.timezone, settings.forecast.tariff_buffer_minutes,
+                settings.forecast.overnight_buffer_pct, [t.model_dump() for t in settings.tariffs])
+    return hashlib.sha256(encode(dispatch).encode()).hexdigest()
 
 
 # ------------------------------------------------------------------ prices
@@ -219,7 +227,11 @@ def plan(db: Database, settings: Settings, forecast_id: int, points: list[dict],
          store: bool = True) -> dict:
     now = now or utcnow()
     systems = settings.active_systems()
+    points = split_points(settings, points)
     prices = price_points(settings, points)
+    overnight = overnight_need(points, settings)
+    battery_capacity = settings.battery_kwh()
+    capacity = battery_capacity or 1
     used = allowance_used(db, settings, now)
     if overrides is None:
         overrides = db.rows('SELECT * FROM overrides WHERE cancelled_at IS NULL AND starts<=? AND expires>?', (stamp(now), stamp(now)))
@@ -272,7 +284,10 @@ def plan(db: Database, settings: Settings, forecast_id: int, points: list[dict],
             if tier['group'] is not None:
                 groups[('exp',) + tier['group']].append(j)
         y_import = m.var(lo=0, hi=1, integer=True)
-        v['y_import'] = y_import
+        night = overnight[i]
+        sale = None
+        if battery_capacity and p['export_allowed'] and night is not None and not no_battery_export:
+            sale = m.var(integer=True, hi=1)
         m.add({**{j: 1 for j in v['imp']}, y_import: -settings.site.grid_import_kw * h}, hi=0)
         m.add({**{j: 1 for j in v['exp']}, y_import: settings.site.export_kw * h}, hi=settings.site.export_kw * h)
         balance = {**{j: 1 for j in v['imp']}, **{j: -1 for j in v['exp']}}
@@ -292,7 +307,7 @@ def plan(db: Database, settings: Settings, forecast_id: int, points: list[dict],
                 ceiling = b.capacity_kwh * b.max_soc_pct / 100
                 start = initial.get(s.id, floor)
                 sv['pv_bat'] = m.var(hi=pv)
-                sv['grid_bat'] = m.var(cost=1e-5, hi=min(s.ac_kw, b.charge_kw) * h)
+                sv['grid_bat'] = m.var(cost=1e-5, hi=min(s.ac_kw, b.charge_kw) * h if p['charge_allowed'] else 0)
                 sv['dis'] = m.var(cost=b.wear_cents_per_kwh / 100, hi=0 if hold else min(b.discharge_kw, s.ac_kw) * h)
                 # Never plan below the current level if already under the floor (no invented energy).
                 # Tiny reward for stored energy, decaying with lead time: among equally good
@@ -302,6 +317,18 @@ def plan(db: Database, settings: Settings, forecast_id: int, points: list[dict],
                 y = m.var(lo=0, hi=1, integer=True)
                 m.add({sv['pv_bat']: 1, sv['grid_bat']: 1, y: -b.charge_kw * h}, hi=0)
                 m.add({sv['dis']: 1, y: b.discharge_kw * h}, hi=b.discharge_kw * h)
+                max_discharge = min(s.ac_kw, b.discharge_kw) * h
+                with_export = {sv['dis']: 1, y_import: -max_discharge}
+                if sale is not None:
+                    with_export[sale] = -max_discharge
+                    expected, uncertainty = night
+                    # Share the net household load by battery capacity and convert it to stored energy.
+                    extra = expected / (capacity * eta)
+                    extra += min(settings.forecast.overnight_buffer_pct / 100, uncertainty / (capacity * eta))
+                    export_floor = floor + extra * b.capacity_kwh
+                    sv['export_floor_pct'] = export_floor / b.capacity_kwh * 100
+                    m.add({sv['soc']: 1, sale: -export_floor}, lo=0)
+                m.add(with_export, hi=0)
                 balance[sv['dis']] = 1
                 balance[sv['grid_bat']] = -1
                 output[sv['dis']] = 1
@@ -347,7 +374,8 @@ def plan(db: Database, settings: Settings, forecast_id: int, points: list[dict],
                 sv = v['sys'][s.id]
                 g = lambda k: float(x[sv[k]]) if k in sv else 0.0
                 per[s.id] = dict(pv_ac=g('pv_ac'), pv_bat=g('pv_bat'), grid_bat=g('grid_bat'), dis=g('dis'), curt=g('curt'),
-                                 soc_kwh=g('soc'), soc_pct=g('soc') / s.battery.capacity_kwh * 100 if s.battery else None)
+                                 soc_kwh=g('soc'), soc_pct=g('soc') / s.battery.capacity_kwh * 100 if s.battery else None,
+                                 export_floor_pct=sv.get('export_floor_pct'))
             intervals.append(dict(p=p, price=price, imp=imp, exp=exp, cost=cost, systems=per, base=base))
         solver = 'HiGHS MILP'
     else:
@@ -360,7 +388,6 @@ def plan(db: Database, settings: Settings, forecast_id: int, points: list[dict],
         solver = 'self-use fallback'
 
     label_actions(settings, intervals)
-    capacity = settings.battery_kwh() or 1
     end_plan = sum(intervals[-1]['systems'][s.id]['soc_kwh'] for s in systems if s.battery) if intervals else 0
     end_base = sum(baseline[-1]['soc'].values()) if baseline else 0
     plan_cash = sum(r['cost'] for r in intervals)
@@ -387,7 +414,7 @@ def plan(db: Database, settings: Settings, forecast_id: int, points: list[dict],
         import_kwh=sum(r['imp'] for r in intervals), export_kwh=sum(r['exp'] for r in intervals),
         allowance_used=[dict(day=k[0], plan=k[1], index=k[2], used_kwh=v) for k, v in used.items()],
         allowance_remaining=[dict(day=k[0], plan=k[1], index=k[2], kwh=v) for k, v in allowance_limits.items()],
-        telemetry_fresh=telemetry_fresh, initial_soc_pct=sum(initial.values()) / capacity * 100 if initial else None,
+        dispatch_policy=dispatch_policy(settings), telemetry_fresh=telemetry_fresh, initial_soc_pct=sum(initial.values()) / capacity * 100 if initial else None,
         action=intervals[0]['action'] if intervals else 'self_use', reason=intervals[0]['reason'] if intervals else '',
         overrides=[o['kind'] for o in overrides], confidence=forecast_model.get('confidence'),
         limitations=['Savings are modelled against a simulated self-use baseline on the same forecast, not measured.',
@@ -445,7 +472,7 @@ def label_actions(settings: Settings, intervals: list[dict]):
             room = b.capacity_kwh * b.max_soc_pct / 100 - d['soc_kwh']
             if d['grid_bat'] > 0.1 * h:
                 mode = 'force_charge'
-            elif d['dis'] > 0.1 * h and battery_export:
+            elif d['dis'] > 0.1 * h and battery_export and d.get('export_floor_pct') is not None:
                 mode = 'force_discharge'
             elif r['exp'] > 0.1 * h and room > 0.5 and d['pv_bat'] < min(b.charge_kw * h, room) - 0.1 * h:
                 mode = 'export_priority'
@@ -454,7 +481,10 @@ def label_actions(settings: Settings, intervals: list[dict]):
             else:
                 mode = 'self_use'
             power = (d['pv_bat'] + d['grid_bat']) / h if mode == 'force_charge' else d['dis'] / h if mode == 'force_discharge' else 0.0
-            commands[s.id] = dict(mode=mode, power_kw=round(power, 2), target_soc=round(d['soc_pct'], 1))
+            target = round(d['soc_pct'], 1)
+            if mode == 'force_discharge':
+                target = max(target, math.ceil(d['export_floor_pct'] * 10 - EPS) / 10)
+            commands[s.id] = dict(mode=mode, power_kw=round(power, 2), target_soc=target)
             d['command'] = commands[s.id]  # stored with the decision; control.py executes exactly this
         order = ['force_charge', 'force_discharge', 'export_priority', 'hold', 'self_use']
         action = min((c['mode'] for c in commands.values()), key=order.index, default='self_use')
@@ -485,8 +515,11 @@ def explain(settings: Settings, intervals: list[dict], i: int, action: str) -> s
         return f"Charge from the grid at {_cents(price['buy'])}{free} during {price['label'].lower()}.{tail}"
     if action == 'force_discharge':
         refill = min((x['price']['buy'] for x in later), default=price['buy'])
-        return (f"Export battery energy at {_cents(price['sell'])}: worth more than the battery's wear "
-                f"and the {_cents(refill)} cheapest refill coming up, while keeping the planned reserve.")
+        floors = [d['export_floor_pct'] for sid, d in r['systems'].items()
+                  if r['commands'].get(sid, {}).get('mode') == 'force_discharge']
+        reserve = ' / '.join(f'{floor:.1f}%' for floor in floors)
+        return (f"Export battery energy at {_cents(price['sell'])}. Keep at least {reserve} for the minimum "
+                f"reserve and forecast household use through 6 am. Cheapest refill ahead is {_cents(refill)}.")
     if action == 'export_priority':
         clip = sum(x['base']['curtailed'] for x in later[:16])
         if clip > 0.2:

@@ -69,3 +69,26 @@ def test_guards_and_failsafe_release(db, security, tmp_path):
     assert result['executed'] is False
     assert db.meta('control_active') == {}
     assert db.one("SELECT * FROM commands WHERE action='release'")['status'] == 'released'
+
+
+def test_dispatch_command_ends_at_buffered_step(db, security, tmp_path):
+    from kwattson.config import stamp
+
+    settings = demo_settings()
+    runtime = Runtime(data_dir=tmp_path, app_url='http://localhost:8080', dev_http=True, worker=False)
+    controller = Controller(db, Devices(db, security), Notifications(db, security), runtime)
+    now = datetime(2026, 12, 1, 20, 52, 10, tzinfo=ZONE)
+    step = now.replace(minute=30, second=0)
+    end = now.replace(minute=55, second=0)
+    command = {'mode': 'force_discharge', 'power_kw': 3, 'target_soc': 39}
+    result = asyncio.run(controller.send(settings, settings.systems[0], command, 1, now, 'Test reserve', step, end))
+    assert result['status'] == 'verified'
+    active = db.meta('control_active')['main']
+    assert active['end'] == stamp(end)
+    assert active['target_soc'] == 39
+
+    changed = {**command, 'target_soc': 42}
+    result = asyncio.run(controller.send(settings, settings.systems[0], changed, 2, now + timedelta(minutes=1),
+                                         'Test higher reserve', step, end))
+    assert result['status'] == 'verified'
+    assert db.meta('control_active')['main']['target_soc'] == 42

@@ -17,12 +17,13 @@ from datetime import datetime, timedelta
 
 from .config import Settings, stamp, utcnow
 from .db import Database, decode, encode
+from .optimizer import VERSION, dispatch_policy
 from .plugins.base import BatteryCommand
 from .tariffs import pending_plans
 from .weather import freshness_hours
 
 COMMAND_MINUTES = 20
-MAX_BLOCKED_CYCLES = 6
+MAX_BLOCKED = timedelta(minutes=30)
 
 
 def commissioning_hash(settings: Settings) -> str:
@@ -34,7 +35,7 @@ def commissioning_hash(settings: Settings) -> str:
 class Controller:
     def __init__(self, db: Database, devices, notifications, runtime):
         self.db, self.devices, self.notifications, self.runtime = db, devices, notifications, runtime
-        self.blocked_cycles = 0
+        self.blocked_since = None
 
     def latest_decision(self):
         row = self.db.one('SELECT * FROM decisions ORDER BY id DESC LIMIT 1')
@@ -72,6 +73,8 @@ class Controller:
         decision = self.latest_decision()
         if not decision or now - datetime.fromisoformat(decision['created_at']) > timedelta(minutes=35):
             reasons.append('Plan missing or older than 35 minutes')
+        elif decision['version'] != VERSION or decision['summary'].get('dispatch_policy') != dispatch_policy(settings):
+            reasons.append('Waiting for a plan with the current tariff and battery buffers')
         elif decision['summary']['solver'] != 'HiGHS MILP':
             reasons.append('Latest plan is a fallback, not a verified optimisation')
         elif not decision['summary'].get('telemetry_fresh'):
@@ -86,7 +89,7 @@ class Controller:
 
     def current_commands(self, decision_id: int, now: datetime) -> tuple[dict, dict] | None:
         row = self.db.one('SELECT * FROM decision_intervals WHERE decision_id=? AND ts<=? ORDER BY ts DESC LIMIT 1', (decision_id, stamp(now)))
-        if not row:
+        if not row or now >= datetime.fromisoformat(row['ts']) + timedelta(hours=row['hours']):
             return None
         return decode(row['systems']), row
 
@@ -95,28 +98,34 @@ class Controller:
         reasons = self.guards(settings, now)
         active = self.db.meta('control_active', {})
         if reasons:
+            if active:
+                await self.release_all(settings, 'Guard failed: ' + reasons[0])
             if settings.mode == 'automatic':
-                self.blocked_cycles += 1
-                if active:
-                    await self.release_all(settings, 'Guard failed: ' + reasons[0])
+                self.blocked_since = self.blocked_since or now
                 fault = any('fault' in r for r in reasons)
-                if fault or self.blocked_cycles >= MAX_BLOCKED_CYCLES:
+                if fault or now - self.blocked_since >= MAX_BLOCKED:
                     await self.stop(settings, f'Automatic control stopped: {reasons[0]}', actor='system')
             return {'executed': False, 'reasons': reasons}
-        self.blocked_cycles = 0
+        self.blocked_since = None
         await self.check_response(settings, now)
+        if settings.mode != 'automatic':
+            return {'executed': False, 'reasons': ['Automatic control stopped during command verification']}
         decision = self.latest_decision()
         found = self.current_commands(decision['id'], now)
         if not found:
+            if active:
+                await self.release_all(settings, 'Current plan interval ended')
             return {'executed': False, 'reasons': ['No plan step for now']}
         systems, row = found
+        step_start = datetime.fromisoformat(row['ts'])
+        step_end = step_start + timedelta(hours=row['hours'])
         results = {}
         for system in [s for s in settings.active_systems() if s.controllable and s.battery]:
             command = (systems.get(system.id) or {}).get('command') or {'mode': 'self_use', 'power_kw': 0, 'target_soc': None}
-            results[system.id] = await self.send(settings, system, command, decision['id'], now, row['reason'])
+            results[system.id] = await self.send(settings, system, command, decision['id'], now, row['reason'], step_start, step_end)
         return {'executed': True, 'results': results}
 
-    async def send(self, settings: Settings, system, command: dict, decision_id: int, now: datetime, reason: str) -> dict:
+    async def send(self, settings: Settings, system, command: dict, decision_id: int, now: datetime, reason: str, step_start: datetime, step_end: datetime) -> dict:
         active = self.db.meta('control_active', {})
         current = active.get(system.id)
         mode = command['mode']
@@ -124,21 +133,29 @@ class Controller:
             if current:
                 return await self.release(settings, system, 'Plan returned to self-use')
             return {'status': 'self_use (no command needed)'}
-        same = current and current['mode'] == mode and abs(current.get('power_kw', 0) - command['power_kw']) < 0.5 \
-            and datetime.fromisoformat(current['end']) - now > timedelta(minutes=8)
-        if same:
-            return {'status': 'unchanged'}
         local = now.astimezone(settings.zone)
-        end = now + timedelta(minutes=COMMAND_MINUTES)
         midnight = (local + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-        end = min(end, midnight).replace(second=0, microsecond=0)
-        if end - now < timedelta(minutes=3):
-            return {'status': 'skipped near midnight'}
+        limit = min(step_end, midnight).replace(second=0, microsecond=0)
+        end = min(now + timedelta(minutes=COMMAND_MINUTES), limit).replace(second=0, microsecond=0)
+        first_minute = step_start.replace(second=0, microsecond=0)
+        if first_minute < step_start:
+            first_minute += timedelta(minutes=1)
+        start = max(now.replace(second=0, microsecond=0), first_minute)
+        same = (current and current['mode'] == mode and abs(current.get('power_kw', 0) - command['power_kw']) < 0.5
+                and current.get('target_soc') == command.get('target_soc'))
+        if same:
+            current_end = datetime.fromisoformat(current['end'])
+            if current_end <= limit and (current_end >= end or current_end - now > timedelta(minutes=8)):
+                return {'status': 'unchanged'}
+        if end <= start:
+            if current and datetime.fromisoformat(current['end']) > limit:
+                return await self.release(settings, system, 'Plan interval is ending')
+            return {'status': 'skipped at end of plan interval'}
         live = self.db.latest_system(system.id)
         min_soc = live['soc'] if mode == 'hold' and live else None
-        cmd = BatteryCommand(mode=mode, start=now.replace(second=0, microsecond=0), end=end, power_kw=command['power_kw'],
+        cmd = BatteryCommand(mode=mode, start=start, end=end, power_kw=command['power_kw'],
                              target_soc=command.get('target_soc'), min_soc=min_soc, reason=reason[:200])
-        key = f'{system.id}:{decision_id}:{mode}:{int(now.timestamp() // 300)}'
+        key = f'{system.id}:{decision_id}:{mode}:{stamp(start)}'
         with self.db.connect() as c:
             if c.execute('SELECT 1 FROM commands WHERE idempotency_key=?', (key,)).fetchone():
                 return {'status': 'duplicate suppressed'}
@@ -168,7 +185,9 @@ class Controller:
         active = self.db.meta('control_active', {})
         changed = False
         for system_id, cmd in list(active.items()):
-            if now - datetime.fromisoformat(cmd['start']) < timedelta(minutes=6):
+            if not (datetime.fromisoformat(cmd['start']) + timedelta(minutes=6) <= now < datetime.fromisoformat(cmd['end'])):
+                continue
+            if cmd.get('checked_at') and now - datetime.fromisoformat(cmd['checked_at']) < timedelta(minutes=5):
                 continue
             live = self.db.latest_system(system_id)
             if not live or live['soc'] is None:
@@ -177,6 +196,7 @@ class Controller:
             expected = cmd['power_kw'] * 0.3
             missed = (cmd['mode'] == 'force_charge' and live['soc'] < target - 1 and (live['charge_kw'] or 0) < expected) or \
                      (cmd['mode'] == 'force_discharge' and live['soc'] > target + 1 and (live['discharge_kw'] or 0) < expected)
+            cmd['checked_at'] = stamp(now)
             cmd['mismatches'] = cmd.get('mismatches', 0) + 1 if missed else 0
             changed = True
             if cmd['mismatches'] >= 2:
@@ -215,7 +235,7 @@ class Controller:
         if settings.mode == 'automatic':
             settings.mode = 'monitor'
             self.db.save_settings(settings, actor)
-        self.blocked_cycles = 0
+        self.blocked_since = None
         self.db.audit('control_stopped', {'why': why, 'release_problems': problems}, actor)
         detail = why + ('. Check the inverter app: ' + '; '.join(problems) if problems else '')
         self.notifications.emit(event, {'reason': detail})

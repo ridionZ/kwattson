@@ -5,6 +5,8 @@ import Stack from '@mui/material/Stack';
 import Typography from '@mui/material/Typography';
 import Button from '@mui/material/Button';
 import Chip from '@mui/material/Chip';
+import Checkbox from '@mui/material/Checkbox';
+import FormControlLabel from '@mui/material/FormControlLabel';
 import Dialog from '@mui/material/Dialog';
 import DialogTitle from '@mui/material/DialogTitle';
 import DialogContent from '@mui/material/DialogContent';
@@ -157,10 +159,15 @@ function VehicleWizard({ editId, onClose }: { editId?: string; onClose: () => vo
   const plugins = doc.plugins.filter((p) => p.kind === 'vehicle');
   const taken = new Set((doc.settings.vehicles as any[]).map((v) => v.id));
   const [step, setStep] = useState(editId ? 1 : 0);
-  const [v, setV] = useState<any>(() => existing ? { ...clone(existing), _cap: str(existing.capacity_kwh), _target: str(existing.target_pct), _charger: str(existing.charger_kw), _km: str(existing.km_per_week), _eff: str(existing.kwh_per_100km), _soc: str(existing.manual_soc) } : {
-    id: '', name: '', plugin: '', plugin_config: {}, enabled: true, capacity_confirmed: false, charger_efficiency: 0.88, reminder_soc_pct: 50,
-    schedule: { days: [0, 1, 2, 3, 4], start_hour: 18 }, _cap: '', _target: '80', _charger: '', _km: '250', _eff: '15', _soc: '',
+  const [v, setV] = useState<any>(() => existing ? { ...clone(existing), _cap: str(existing.capacity_kwh), _target: str(existing.target_pct), _reminder: str(existing.reminder_soc_pct ?? 50), _charger: str(existing.charger_kw), _km: str(existing.km_per_week), _eff: str(existing.kwh_per_100km), _soc: str(existing.manual_soc) } : {
+    id: '', name: '', plugin: '', plugin_config: {}, enabled: true, capacity_confirmed: false, charger_efficiency: 0.88,
+    schedule: { days: [0, 1, 2, 3, 4], start_hour: 18 }, _cap: '', _target: '80', _reminder: '50', _charger: '', _km: '250', _eff: '15', _soc: '',
   });
+  const [weekdayKm, setWeekdayKm] = useState<(string | null)[]>(() =>
+    f.WEEKDAYS.map((_, i) => existing?.weekday_km?.[i] == null ? null : String(existing.weekday_km[i])));
+  function setDayKm(day: number, value: string | null) {
+    setWeekdayKm((previous) => previous.map((entry, i) => i === day ? value : entry));
+  }
   const [secrets, setSecrets] = useState<Record<string, string>>({});
   const [tested, setTested] = useState<'ok' | 'skipped' | null>(editId ? 'skipped' : null);
   const [testMsg, setTestMsg] = useState<{ ok: boolean; text: string } | null>(null);
@@ -181,9 +188,9 @@ function VehicleWizard({ editId, onClose }: { editId?: string; onClose: () => vo
 
   function spec() {
     const num = (s: string) => (s === '' ? null : Number(s));
-    const { _cap, _target, _charger, _km, _eff, _soc, ...rest } = v;
-    return { ...rest, name: v.name.trim(), capacity_kwh: num(_cap), target_pct: num(_target) ?? 80, charger_kw: num(_charger) ?? 2.2,
-      km_per_week: num(_km) ?? 0, kwh_per_100km: num(_eff) ?? 14, manual_soc: num(_soc) };
+    const { _cap, _target, _reminder, _charger, _km, _eff, _soc, ...rest } = v;
+    return { ...rest, name: v.name.trim(), capacity_kwh: num(_cap), target_pct: num(_target) ?? 80, reminder_soc_pct: num(_reminder) ?? 50, charger_kw: num(_charger) ?? 2.2,
+      km_per_week: num(_km) ?? 0, kwh_per_100km: num(_eff) ?? 14, manual_soc: num(_soc), weekday_km: weekdayKm.map((km) => km == null ? null : num(km)) };
   }
   function stepError(i: number, requireTest = true): string | null {
     if (i === 0) return v.plugin ? null : 'Choose how kWattson gets this car’s data.';
@@ -200,9 +207,12 @@ function VehicleWizard({ editId, onClose }: { editId?: string; onClose: () => vo
       const n = Number;
       if (!(n(v._cap) > 5 && n(v._cap) <= 250)) return 'Battery size must be between 5 and 250 kWh.';
       if (!(n(v._target) >= 20 && n(v._target) <= 100)) return 'Target must be between 20 and 100%.';
+      if (v._reminder === '' || !(n(v._reminder) >= 0 && n(v._reminder) <= 100)) return 'Charge reminder level must be between 0 and 100%.';
       if (!(n(v._charger) >= 0.5 && n(v._charger) <= 22)) return 'Charger power must be between 0.5 and 22 kW.';
       if (!(n(v._km) >= 0 && n(v._km) <= 5000)) return 'Driving must be between 0 and 5,000 km per week.';
       if (!(n(v._eff) >= 5 && n(v._eff) <= 60)) return 'Efficiency must be between 5 and 60 kWh per 100 km.';
+      const invalidDay = weekdayKm.findIndex((km) => km != null && (km.trim() === '' || !(n(km) >= 0 && n(km) <= 2000)));
+      if (invalidDay >= 0) return `Enter 0–2,000 km for ${f.WEEKDAYS[invalidDay]} or tick “I don’t know”.`;
       if (v._soc !== '' && !(n(v._soc) >= 0 && n(v._soc) <= 100)) return 'Battery level must be between 0 and 100%.';
     }
     return null;
@@ -311,10 +321,29 @@ function VehicleWizard({ editId, onClose }: { editId?: string; onClose: () => vo
       <Box sx={{ display: 'grid', gap: 2, gridTemplateColumns: { xs: '1fr', sm: '1fr 1fr' } }}>
         <Num label="Battery size" unit="kWh" value={v._cap} onChange={(x) => set({ _cap: x })} required help="Usable capacity from the car’s specs." />
         <Num label="Charge to" unit="%" value={v._target} onChange={(x) => set({ _target: x })} help="The level you usually charge to. Many cars recommend 80% for daily use." />
+        <Num label="Charge reminder level" unit="%" value={v._reminder} onChange={(x) => set({ _reminder: x })} help="Suggest a charge when the battery is at this level or expected to reach it soon." />
         <Num label="Charger power" unit="kW" value={v._charger} onChange={(x) => set({ _charger: x })} help="2.2–2.4 kW for a wall socket, about 7 kW for a single-phase wall charger." />
         <Num label="Driving" unit="km/week" value={v._km} onChange={(x) => set({ _km: x })} />
         <Num label="Efficiency" unit="kWh/100 km" value={v._eff} onChange={(x) => set({ _eff: x })} help="Most small EVs use 13–17 kWh per 100 km." />
         {v.plugin === 'manual' && <Num label="Battery now" unit="%" value={v._soc} onChange={(x) => set({ _soc: x })} help="Optional. Type the level from the car’s app; update it when you remember." />}
+        <Box component="details" sx={{ gridColumn: '1 / -1' }}>
+          <Typography component="summary" variant="body2" sx={{ fontWeight: 600, cursor: 'pointer' }}>Typical driving by day</Typography>
+          <Typography variant="body2" color="text.secondary" sx={{ mt: 1, mb: 2 }}>
+            Optional estimates help predict battery use while kWattson learns from readings. Enter 0 for days you expect to stay home.
+          </Typography>
+          <Stack spacing={1}>
+            {f.WEEKDAYS.map((day, i) => (
+              <Stack key={day} direction="row" spacing={2} sx={{ alignItems: 'center' }}>
+                <TextField label={`${day} km`} type="number" size="small" value={weekdayKm[i] ?? ''} disabled={weekdayKm[i] == null}
+                  onChange={(e) => setDayKm(i, e.target.value)} sx={{ width: 120 }}
+                  slotProps={{ htmlInput: { min: 0, max: 2000, step: 'any' } }} />
+                <FormControlLabel label="I don’t know"
+                  control={<Checkbox checked={weekdayKm[i] == null} onChange={(_, checked) => setDayKm(i, checked ? null : '')}
+                    slotProps={{ input: { 'aria-label': `${day}: I don’t know` } }} />} />
+              </Stack>
+            ))}
+          </Stack>
+        </Box>
         <Box sx={{ gridColumn: '1 / -1' }}>
           <Typography variant="body2" sx={{ fontWeight: 600, mb: 0.75 }} id="days-label">Usual charging days</Typography>
           <ToggleButtonGroup size="small" value={v.schedule.days} aria-labelledby="days-label"

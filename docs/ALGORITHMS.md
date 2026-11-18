@@ -64,6 +64,17 @@ partial, then half-hours). See the module docstring for the full constraint list
 - Tariff: per-interval import/export rate from the active plan. Daily allowances become two price
   tiers; the better tier is capped at what remains of today's allowance (measured use, with
   unmeasured time counted at the connection limit) or the full allowance on future days.
+  Plan intervals split at tariff boundaries and at the configured buffer (5 minutes by default)
+  inside a cheaper import or higher export window. The buffered edges restrict battery grid
+  charging or battery export respectively. Billing rates, household use and passive solar
+  export still follow the actual tariff.
+- Battery exports retain the normal reserve plus expected net house demand from the end of the
+  export step to 06:00 local time, converted to stored energy using discharge efficiency.
+  An extra margin uses half the gap between high and typical demand forecasts, capped at four
+  battery percentage points by default. Stable hours add less. The export floor applies only
+  to selling battery energy. Self-use can spend the retained energy down to the normal reserve.
+  Without a contiguous forecast through 06:00, the plan allows house discharge and solar export
+  as usual and holds off on battery export.
 - Objective: import cost − export credit + `wear_cents_per_kwh` × discharge − terminal value ×
   stored energy at the end. Terminal value = `terminal_value_factor` × 20th-percentile import price
   over the final 24 h × discharge efficiency (low enough not to cause grid charging for it, high
@@ -88,6 +99,27 @@ Marginal cost of extra load in a planned interval: first from planned curtailmen
 planned export (lose the feed-in rate), then import (that interval's price). Used for the cheapest
 EV charging window, the AC opportunity signal (hot/cold forecast + marginal cost ≤ `ac_max_cents`)
 and clipping alerts.
+
+EV advice learns typical battery drain from up to sixteen weeks of vehicle readings. It requires
+three days for each local weekday, each with at least 18 hours covered by readings at most 12
+hours apart. Charging, holidays and excluded days do not contribute to learned drain. Repeating
+two-, three- and four-week rosters are considered when each phase has three samples. The model
+uses a roster for a weekday when holding out individual observations shows an average improvement
+of at least one battery percentage point and 25% over the weekday median.
+
+Optional Monday-to-Sunday driving estimates fill in for weekdays that lack sufficient history,
+using the vehicle's configured efficiency and capacity. Zero kilometres is a valid estimate.
+The seven-day projection assumes no charging and prorates today's typical drain over the remaining
+hours. Unknown days leave the exact projection unavailable. If known driving alone would reach
+the reminder level, advice can use that conditional estimate. Current battery levels at or below
+the charge reminder level can still trigger advice while the model learns.
+
+When projected drain reaches the reminder level within the energy plan's horizon, advice prices
+continuous charging windows before the expected low day, using the plan's spare solar and grid
+prices. If time is short it looks for a partial top-up. A fresh home-presence reading is required
+for notifications. Dashboard advice is conditional when presence is unknown, and marked-away
+periods are unavailable for charging. This is advice only and does not change scheduled EV load
+or send any charger commands.
 
 ## 5. Outcomes (`outcomes.py`)
 Per completed day: tariff applied to measured import/export, plus counterfactuals replaying measured

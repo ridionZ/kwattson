@@ -14,6 +14,8 @@ range-checked; plugin-specific config is validated by the plugin itself
 """
 from __future__ import annotations
 
+from typing import Annotated
+
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -126,6 +128,10 @@ class Vehicle(Strict):
     charger_efficiency: float = Field(0.88, ge=0.6, le=0.99)
     km_per_week: float = Field(300, ge=0, le=5000)
     kwh_per_100km: float = Field(14, ge=5, le=60)
+    weekday_km: list[Annotated[float, Field(ge=0, le=2000)] | None] = Field(
+        default_factory=lambda: [None] * 7, min_length=7, max_length=7,
+        description="Estimated driving kilometres for Monday through Sunday. Null means unknown.",
+    )
     schedule: VehicleSchedule = Field(default_factory=VehicleSchedule)
     reminder_soc_pct: float = Field(50, ge=0, le=100)
 
@@ -151,6 +157,8 @@ class ForecastSettings(Strict):
     holiday_base_load_kw: float = Field(0.35, ge=0, le=10, description='Fridge, standby etc. when away')
     cooling_base_c: float = Field(24, ge=15, le=35)
     heating_base_c: float = Field(17, ge=0, le=25)
+    tariff_buffer_minutes: int = Field(5, ge=0, le=30, description='Minutes inside favourable tariff windows before charging or exporting')
+    overnight_buffer_pct: float = Field(4, ge=0, le=20, description='Maximum extra battery percentage points for overnight forecast uncertainty')
     terminal_value_factor: float = Field(0.8, ge=0, le=1.2,
         description='Value of energy left in the battery at the horizon end, as a fraction of the average import price')
 

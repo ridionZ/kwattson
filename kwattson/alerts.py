@@ -50,19 +50,11 @@ def check(db: Database, settings: Settings, notify, devices_status: dict, transi
         info = advice_mod.build(db, settings, decision_id, now)
         for v in info['vehicles']:
             rec = v.get('recommendation')
-            if rec and v['need_kwh'] >= 5:
+            if rec and v['at_home'] == 1:
                 start = datetime.fromisoformat(rec['start'])
-                if now - timedelta(minutes=5) <= start <= now + timedelta(minutes=30) and rec['cents_per_kwh'] <= 12:
-                    emit('ev_charge_opportunity', {'vehicle': v['name'], 'reason': rec['text']}, key=f'ev-opportunity:{v["vehicle"]}:{day}:{start.hour}')
-        for vehicle in settings.active_vehicles():
-            if local.weekday() in vehicle.schedule.days and local.hour == (vehicle.schedule.start_hour - 1) % 24:
-                latest = db.latest_vehicle(vehicle.id)
-                soc = latest['soc'] if latest else vehicle.manual_soc
-                if soc is None or soc < vehicle.target_pct - 5:
-                    rec = next((v['recommendation'] for v in info['vehicles'] if v['vehicle'] == vehicle.id), None)
-                    tail = f' Cheapest window: {rec["text"]}' if rec else ''
-                    emit('ev_charge_reminder', {'vehicle': vehicle.name, 'reason': f'You usually charge tonight.{tail}'},
-                         key=f'ev-reminder:{vehicle.id}:{day}')
+                if now - timedelta(minutes=5) <= start <= now + timedelta(minutes=30):
+                    event = 'ev_charge_opportunity' if rec['cents_per_kwh'] <= 12 else 'ev_charge_reminder'
+                    emit(event, {'vehicle': v['name'], 'reason': rec['text']}, key=f'ev-charge:{v["vehicle"]}:{day}')
         climate = info['climate']
         if climate and climate['available']:
             emit('climate_opportunity', {'climate_mode': climate['mode'], 'reason': climate['reason']})
@@ -70,12 +62,12 @@ def check(db: Database, settings: Settings, notify, devices_status: dict, transi
         if clip and 6 <= local.hour <= 10 and clip['planned_kwh'] >= a.clipping_alert_kwh:
             emit('clipping_expected', {'kwh': round(clip['planned_kwh'], 1), 'reason':
                  f'Peak solar of about {clip["peak_solar_kw"]:.1f} kW will exceed what the inverter and battery can take. '
-                 'Run the dishwasher, pool pump or car charger around midday to use it.'}, key=f'clip:{day}')
+                 'Run the dishwasher or pool pump around midday to use it.'}, key=f'clip:{day}')
         upcoming = db.one('SELECT * FROM decision_intervals WHERE decision_id=? AND ts>? AND ts<=? AND buy_rate<=0.0001 ORDER BY ts LIMIT 1',
                           (decision_id, stamp(now), stamp(now + timedelta(minutes=45))))
         if upcoming:
             emit('cheap_power_window', {'label': 'Free power', 'reason': 'Free grid power starts soon. Good for laundry, '
-                                        'dishwasher, hot water or the car.'}, key=f'free:{day}')
+                                        'dishwasher or hot water.'}, key=f'free:{day}')
 
     if local.hour == a.daily_summary_hour and local.minute < 30:
         today = outcomes.today_so_far(db, settings, now)

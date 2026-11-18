@@ -28,7 +28,9 @@ doesn't respond twice in a row, also stops automatic control.
 
 ## FoxESS specifics
 - Control uses the Cloud Open API *scheduler* (time groups). Each command writes one ≤20-minute group
-  and enables the scheduler; *release* disables the scheduler.
+  and enables the scheduler. Each group ends by its plan interval's boundary, including the
+  configured buffer around favourable tariff windows. Force-discharge targets retain the
+  planned overnight reserve. *Release* disables the scheduler.
 - **Residual risk:** FoxESS time groups repeat **daily**. If kWattson crashes or loses internet
   while a group is active, that group can recur at the same time each day until replaced. The worst
   case is one ≤20-minute force charge/discharge window per day, bounded by your reserve. To clear it

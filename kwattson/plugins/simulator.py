@@ -53,7 +53,7 @@ class SimulatedHybrid(SystemPlugin):
         state = self.context.recall('state') or {'soc': self.config.start_soc, 'at': now.isoformat()}
         elapsed_h = min(1.0, max(0.0, (now - datetime.fromisoformat(state['at'])).total_seconds() / 3600))
         command = self.context.recall('command')
-        if command and datetime.fromisoformat(command['end']) <= now:
+        if command and not (datetime.fromisoformat(command.get('start', state['at'])) <= now < datetime.fromisoformat(command['end'])):
             command = None
         mode = command['mode'] if command else 'self_use'
 
@@ -67,6 +67,10 @@ class SimulatedHybrid(SystemPlugin):
         pv_ac = min(pv, load, self.system.ac_kw)
         surplus = pv - pv_ac
         if battery:
+            eff = math.sqrt(battery.round_trip_efficiency)
+            if mode == 'force_charge' and command['target_soc'] is not None:
+                room_kw = min(room_kw, max(0.0, command['target_soc'] - soc) / 100 * capacity /
+                              (eff * max(elapsed_h, 1 / 12)))
             if mode == 'export_priority':
                 to_grid = min(surplus, self.system.ac_kw - pv_ac)
                 charge = min(surplus - to_grid, battery.charge_kw, room_kw)
@@ -77,6 +81,8 @@ class SimulatedHybrid(SystemPlugin):
                 grid_charge = max(0.0, grid_charge)
             deficit = load - pv_ac
             if mode == 'force_discharge':
+                target = max(battery.reserve_pct, command['target_soc'] or 0)
+                avail_kw = max(0.0, soc - target) / 100 * capacity * eff / max(elapsed_h, 1 / 12)
                 discharge = min(battery.discharge_kw, avail_kw, command['power_kw'] or battery.discharge_kw, self.system.ac_kw - pv_ac)
             elif mode != 'hold':
                 discharge = min(deficit, battery.discharge_kw, avail_kw, self.system.ac_kw - pv_ac)
@@ -97,7 +103,7 @@ class SimulatedHybrid(SystemPlugin):
         return []
 
     async def apply(self, command: BatteryCommand) -> CommandResult:
-        self.context.remember('command', {'mode': command.mode, 'end': command.end.isoformat(),
+        self.context.remember('command', {'mode': command.mode, 'start': command.start.isoformat(), 'end': command.end.isoformat(),
                                           'power_kw': command.power_kw, 'target_soc': command.target_soc})
         return CommandResult(accepted=True, verified=True, detail={'simulated': True, 'mode': command.mode})
 

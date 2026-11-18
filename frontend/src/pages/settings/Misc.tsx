@@ -91,10 +91,10 @@ function FormFoot({ busy, error, dirty, label = 'Save' }: { busy: boolean; error
   );
 }
 
-function NumField({ label, unit, value, onChange, help, min, max }: { label: string; unit?: string; value: any; onChange: (v: any) => void; help?: ReactNode; min?: number; max?: number }) {
+function NumField({ label, unit, value, onChange, help, min, max, step = 'any' }: { label: string; unit?: string; value: any; onChange: (v: any) => void; help?: ReactNode; min?: number; max?: number; step?: number | 'any' }) {
   return (
     <TextField label={label} type="number" value={value ?? ''} onChange={(e) => onChange(e.target.value === '' ? null : Number(e.target.value))}
-      slotProps={{ htmlInput: { step: 'any', min, max }, input: { endAdornment: (unit || help) ? <InputAdornment position="end">{unit}{help && <HelpTip label={label}>{help}</HelpTip>}</InputAdornment> : undefined } }} />
+      slotProps={{ htmlInput: { step, min, max }, input: { endAdornment: (unit || help) ? <InputAdornment position="end">{unit}{help && <HelpTip label={label}>{help}</HelpTip>}</InputAdornment> : undefined } }} />
   );
 }
 
@@ -436,8 +436,12 @@ function Planning() {
             <NumField label="Away base load" unit="kW" value={v.holiday_base_load_kw} onChange={(x) => set({ holiday_base_load_kw: x })} help="What the house uses while you’re away (fridge, standby)." />
           </Box>
         </Section>
-        <Section title="Battery value">
+        <Section title="Battery planning">
           <Box sx={{ display: 'grid', gap: 2, gridTemplateColumns: { xs: '1fr', sm: '1fr 1fr' } }}>
+            <NumField label="Tariff window buffer" unit="min" value={v.tariff_buffer_minutes} onChange={(x) => set({ tariff_buffer_minutes: x })} min={0} max={30} step={1}
+              help="Start battery charging or export this many minutes into a better rate, and stop this many minutes before it ends." />
+            <NumField label="Maximum overnight buffer" unit="pp" value={v.overnight_buffer_pct} onChange={(x) => set({ overnight_buffer_pct: x })} min={0} max={20}
+              help="Extra battery reserve for uncertain overnight use, above the minimum reserve and expected household demand through 6 am." />
             <NumField label="End-of-plan value" value={v.terminal_value_factor} onChange={(x) => set({ terminal_value_factor: x })} min={0} max={1.5}
               help="How much energy left in the battery at the end of the plan is worth, as a share of future prices. Lower lets the plan use the battery more freely; higher keeps more in reserve." />
           </Box>

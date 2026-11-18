@@ -14,16 +14,19 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 
 from . import optimizer
-from .config import Settings, stamp, utcnow
+from .config import Settings, UTC, stamp, utcnow
 from .db import Database, decode
 from .ingest import select_intervals
 from .outcomes import _split_solar, day_bounds
 
 
-def _points(db: Database, settings: Settings, day) -> tuple[list[dict], float | None, int]:
+def _points(db: Database, settings: Settings, day, until_hour: int | None = None) -> tuple[list[dict], float | None, int]:
     start, end = day_bounds(settings, day)
+    if until_hour is not None:
+        end = start + timedelta(hours=until_hour)
     rows = select_intervals(db, stamp(start), stamp(end))
-    if sum(r['coverage_s'] for r in rows) < 0.9 * 86400:
+    duration = (end.astimezone(UTC) - start.astimezone(UTC)).total_seconds()
+    if sum(r['coverage_s'] for r in rows) < 0.9 * duration:
         return [], None, 0
     solar_model = db.one("SELECT data FROM model_params WHERE name='solar'")
     ratios = decode(solar_model['data'])['systems'] if solar_model else {}
@@ -45,6 +48,10 @@ def _points(db: Database, settings: Settings, day) -> tuple[list[dict], float | 
         points.append(dict(ts=r['ts'], hours=hours, lead_minutes=i * 30, load_kwh=r['load_kwh'], house_kwh=r['load_kwh'] - r['ev_kwh'],
                            house_p10=0, house_p90=0, ev_kwh=r['ev_kwh'], solar_kwh=solar, solar_p10=solar, solar_p90=solar,
                            solar_by_system=_split_solar(settings, solar), temperature=None))
+    # Coverage affects the day-level inclusion threshold. Keep clock intervals
+    # contiguous so the replay can carry the battery reserve through 06:00.
+    if until_hour is not None and any(r['coverage_s'] < 1800 for r in rows):
+        return [], None, 0
     first_soc = next((r['soc_end'] for r in rows if r['soc_end'] is not None), None)
     return points, first_soc, reconstructed
 
@@ -60,6 +67,9 @@ def run(db: Database, settings: Settings, days: int, tariff_ids: list[str] | Non
         points, first_soc, rebuilt = _points(db, settings, day)
         if not points:
             continue
+        tomorrow = day + timedelta(days=1)
+        morning, _, _ = _points(db, settings, tomorrow, until_hour=6)
+        cutoff = stamp(day_bounds(settings, day)[1])
         used_days.append(day.isoformat())
         reconstructed += rebuilt
         for tariff in plans:
@@ -68,15 +78,18 @@ def run(db: Database, settings: Settings, days: int, tariff_ids: list[str] | Non
                                                 'forecast': settings.forecast.model_copy(update={'terminal_value_factor': 0.8})})
             initial = {s.id: s.battery.capacity_kwh * (first_soc or 50) / 100 for s in trial.active_systems() if s.battery}
             start = datetime.fromisoformat(points[0]['ts'])
-            result = optimizer.plan(db, trial, 0, points, {'confidence': 'backtest'}, now=start, initial=initial, overrides=[], store=False)
-            summary = result['summary']
+            result = optimizer.plan(db, trial, 0, points + morning, {'confidence': 'backtest'}, now=start, initial=initial, overrides=[], store=False)
+            daily = [p for p in result['intervals'] if p['ts'] < cutoff]
+            ending = daily[-1]
+            value = result['summary']['terminal_value_per_kwh']
+            stored_gap = (ending['soc_pct'] - ending['baseline_soc_pct']) / 100 * trial.battery_kwh()
             r = results[tariff.id]
             r['days'] += 1
-            r['self_use_aud'] += summary['baseline_cash_aud']
-            r['optimised_aud'] += summary['baseline_cash_aud'] - summary['modelled_saving_aud']
+            r['self_use_aud'] += sum(p['baseline_cost'] for p in daily)
+            r['optimised_aud'] += sum(p['cost'] for p in daily) - stored_gap * value
             r['supply_aud'] += tariff.supply_daily
-            r['clipped_self_use_kwh'] += summary['baseline_curtailed_kwh']
-            r['clipped_optimised_kwh'] += summary['curtailed_kwh']
+            r['clipped_self_use_kwh'] += sum(p['baseline_curtailed_kwh'] for p in daily)
+            r['clipped_optimised_kwh'] += sum(p['curtailed_kwh'] for p in daily)
     for r in results.values():
         for key in list(r):
             if isinstance(r[key], float):
