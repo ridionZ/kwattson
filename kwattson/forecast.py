@@ -394,6 +394,29 @@ def comparison(db: Database, forecast_id: int, now: datetime) -> dict:
     return dict(forecast_id=forecast_id, mode=decision['mode'] if decision else None, points=points)
 
 
+def today_comparison(db: Database, settings: Settings, now: datetime) -> dict:
+    """Use the latest forecast actually available before each completed slot."""
+    local_start = now.astimezone(settings.zone).replace(hour=0, minute=0, second=0, microsecond=0)
+    start = datetime.fromisoformat(stamp(local_start))
+    stop = now.replace(minute=0 if now.minute < 30 else 30, second=0, microsecond=0)
+    args = (stamp(start), stamp(stop))
+    forecasts = {r['ts']: r for r in db.rows(
+        'SELECT * FROM (SELECT p.ts, p.forecast_id, p.solar_kwh, p.house_kwh, p.ev_kwh, '
+        'ROW_NUMBER() OVER (PARTITION BY p.ts ORDER BY f.created_at DESC, f.id DESC) AS recency '
+        'FROM forecast_points p JOIN forecasts f ON f.id=p.forecast_id '
+        'WHERE p.ts>=? AND p.ts<? AND p.hours=0.5 AND f.created_at<=p.ts) WHERE recency=1', args)}
+    observations = {r['ts']: r for r in select_intervals(db, *args) if r['coverage_s'] >= 1500}
+    points = []
+    for i in range(max(0, int((stop - start) / timedelta(minutes=30)))):
+        slot = start + timedelta(minutes=30 * i)
+        p, actual = forecasts.get(stamp(slot)), observations.get(stamp(slot))
+        points.append(dict(end=stamp(slot + timedelta(minutes=30)),
+                           forecast_solar=p['solar_kwh'] if p else None, actual_solar=actual['solar_kwh'] if actual else None,
+                           forecast_load=p['house_kwh'] + p['ev_kwh'] if p else None, actual_load=actual['load_kwh'] if actual else None,
+                           planned_soc=None, actual_soc=actual['soc_end'] if actual else None))
+    return dict(forecast_id=None, points=points)
+
+
 def score_run(db: Database, forecast_id: int, now: datetime) -> dict:
     house, solar = [], []
     for p, _, a in _elapsed_slots(db, forecast_id, now):

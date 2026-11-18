@@ -90,7 +90,7 @@ export default function Overview() {
             </Typography>
             {can('admin') && !st.weather && <Button href="#/settings/home/location">Configure weather</Button>}
           </Section>}
-          {hasSystems && <Today st={st} />}
+          {hasSystems && <ElectricityCost periods={st.money ?? {}} today={st.today} />}
           {hasSystems && <Advice st={st} />}
         </Grid>
         <Grid size={{ xs: 12, md: 4 }} sx={{ display: 'grid', gap: 2.5, alignContent: 'start' }}>
@@ -381,26 +381,27 @@ function Figure({ label, value, sub, positive }: { label: ReactNode; value: stri
   );
 }
 
-function Today({ st }: { st: any }) {
-  const d = st.today;
+function ElectricityCost({ periods, today }: { periods: Record<string, { net_aud: number; coverage: number } | null>; today?: any }) {
   return (
-    <Section title="Today so far" help={<HelpTip title="How this is worked out" label="today so far">
-      Estimated from your readings and tariff, not your bill. “vs plain self-use” replays today through a simulated inverter on its own;
-      “vs no solar” prices the whole day’s use at your tariff. Both are estimates.
+    <Section title="Electricity cost" help={<HelpTip label="Electricity cost">
+      Estimates use recorded imports and exports and include daily supply charges for days with readings. Weeks start on Monday in your site time zone.
     </HelpTip>}>
-      {!d ? <Typography variant="body2" color="text.secondary">Not enough readings yet today (needs half the day covered).</Typography> : (
-        <>
-          <Box sx={{ display: 'grid', gap: 2, gridTemplateColumns: { xs: '1fr 1fr', sm: 'repeat(3, 1fr)' } }}>
-            <Figure label="Net cost" value={f.money(d.net_aud)} sub={`incl. ${f.money(d.supply_aud)} supply`} />
-            <Figure label="vs plain self-use" value={f.better(d.saving_vs_self_use_aud)} positive={d.saving_vs_self_use_aud > 0.005} sub="estimated" />
-            <Figure label="vs no solar" value={f.better(d.no_solar_net_aud - d.net_aud)} positive={d.no_solar_net_aud - d.net_aud > 0.005}
-              sub={`would be ${f.money(d.no_solar_net_aud)} · estimated`} />
-          </Box>
-          <Typography variant="caption" color="text.secondary" component="p" sx={{ mt: 1.5 }}>
-            Solar {f.kwh(d.solar_kwh)} · home {f.kwh(d.load_kwh)} · imported {f.kwh(d.import_kwh)} · exported {f.kwh(d.export_kwh)} · {f.pct(d.coverage * 100)} of the day measured
-          </Typography>
-        </>
-      )}
+      <Box sx={{ display: 'grid', gap: 2, gridTemplateColumns: { xs: 'repeat(2, minmax(0, 1fr))', lg: 'repeat(4, minmax(0, 1fr))' } }}>
+        {[['today', 'Today so far'], ['yesterday', 'Yesterday'], ['this_week', 'This week so far'], ['last_week', 'Last week']].map(([key, label]) => {
+          const period = periods[key];
+          return <Figure key={key} label={label} value={f.netCost(period?.net_aud)} positive={(period?.net_aud ?? 0) < -0.005}
+            sub={period ? (period.coverage < 0.99 ? `${f.pct(period.coverage * 100)} of period measured` : undefined) : 'No readings'} />;
+        })}
+      </Box>
+      {today && <Stack spacing={0.5} sx={{ mt: 2, pt: 1.5, borderTop: 1, borderColor: 'divider' }}>
+        <Facts rows={[
+          ['Today vs plain self-use', f.better(today.saving_vs_self_use_aud)],
+          ['Today vs no solar', f.better(today.no_solar_net_aud - today.net_aud)],
+        ]} />
+        <Typography variant="caption" color="text.secondary">
+          Solar {f.kwh(today.solar_kwh)} · used {f.kwh(today.load_kwh)} · imported {f.kwh(today.import_kwh)} · exported {f.kwh(today.export_kwh)}
+        </Typography>
+      </Stack>}
     </Section>
   );
 }

@@ -147,9 +147,9 @@ function Trends() {
 
 interface ComparisonPoint {
   end: string;
-  forecast_solar: number;
+  forecast_solar: number | null;
   actual_solar: number | null;
-  forecast_load: number;
+  forecast_load: number | null;
   actual_load: number | null;
   planned_soc: number | null;
   actual_soc: number | null;
@@ -162,9 +162,30 @@ interface ComparisonData {
   points: ComparisonPoint[];
 }
 
+type EnergyKey = 'forecast_solar' | 'actual_solar' | 'forecast_load' | 'actual_load';
+
+function energyBins(points: ComparisonPoint[], hours: number) {
+  const groups = new Map<number, ComparisonPoint[]>();
+  for (const point of points) {
+    const start = Date.parse(point.end) - 30 * 60000;
+    const local = f.parts(start);
+    const minutes = (Number(local.hour) % hours) * 60 + Number(local.minute);
+    const key = start - minutes * 60000;
+    const group = groups.get(key) ?? [];
+    group.push(point);
+    groups.set(key, group);
+  }
+  return [...groups.values()].map(slots => {
+    const sum = (field: EnergyKey) => slots.some(p => p[field] == null) ? null : slots.reduce((total, p) => total + p[field]!, 0);
+    return { start: Date.parse(slots[0].end) - 30 * 60000, end: Date.parse(slots[slots.length - 1].end), sum };
+  });
+}
+
 function ForecastCharts() {
   const [selected, setSelected] = useState<number | null>(null);
-  const comparison = useLoad<ComparisonData>(() => get('/api/forecast/comparison' + (selected === null ? '' : '?run_id=' + selected)), [selected]);
+  const [hours, setHours] = useState(1);
+  const query = selected === null ? 'today=true' : `run_id=${selected}`;
+  const comparison = useLoad<ComparisonData>(() => get('/api/forecast/comparison?' + query), [query]);
   const { t } = useTokens();
   const compact = useMediaQuery((th: Theme) => th.breakpoints.down('sm'));
   useEffect(() => {
@@ -172,51 +193,60 @@ function ForecastCharts() {
     return () => clearInterval(timer);
   }, [comparison.reload]);
   const data = comparison.data;
+  const bins = useMemo(() => energyBins(data?.points ?? [], hours), [data, hours]);
   const charts = [
-    { title: 'Solar generation', forecast: 'forecast_solar', measured: 'actual_solar', color: t.solar, unit: 'kWh' },
-    { title: 'Electricity use', forecast: 'forecast_load', measured: 'actual_load', color: t.home, unit: 'kWh' },
-    { title: 'Battery level', forecast: 'planned_soc', measured: 'actual_soc', color: t.battery, unit: '%' },
+    { title: 'Electricity use', forecast: 'forecast_load', measured: 'actual_load', color: t.home },
+    { title: 'Solar generation', forecast: 'forecast_solar', measured: 'actual_solar', color: t.solar },
   ] as const;
-  return <Section title="Predicted and actual">
-    {comparison.error ? <ErrorState message={comparison.error} onRetry={comparison.reload} /> : !data ? <LoadingBlock /> :
-      !data.runs.length ? <Empty>The first comparison will appear when the planner saves a forecast.</Empty> : <Stack spacing={2}>
-        <TextField select label="Forecast made" value={selected ?? data.forecast_id ?? ''}
-          onChange={e => setSelected(Number(e.target.value))} sx={{ width: { xs: '100%', sm: 340 } }}
-          slotProps={{ select: { native: true } }}>
+  const tickEvery = (n: number) => Math.max(1, Math.ceil(n / (compact ? 5 : 12)));
+
+  return <Section title="Estimated and actual">
+    {comparison.error ? <ErrorState message={comparison.error} onRetry={comparison.reload} /> : !data ? <LoadingBlock /> : <Stack spacing={2}>
+      <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1.5}>
+        <TextField select label="Forecast" value={selected ?? ''} onChange={e => setSelected(e.target.value === '' ? null : Number(e.target.value))}
+          sx={{ width: { xs: '100%', sm: 340 } }} slotProps={{ inputLabel: { shrink: true }, select: { native: true } }}>
+          <option value="">Today’s forecasts</option>
           {data.runs.map(run => <option key={run.id} value={run.id}>{f.dateTime(run.created_at)} · #{run.id}</option>)}
         </TextField>
-        {(selected !== null && data.forecast_id !== selected) ? <LoadingBlock /> : !data.points.length ?
-          <Empty>Waiting for the first full half-hour of this forecast to finish.</Empty> : <>
-          <Typography variant="body2" color="text.secondary">Each point marks the end of a half-hour in the forecast’s first day. Electricity use includes EV charging. Gaps indicate insufficient readings.</Typography>
-          {charts.map(chart => {
-            const battery = chart.unit === '%';
-            const predicted = data.points.map(p => p[chart.forecast]);
-            const measured = data.points.map(p => p[chart.measured]);
-            const available = predicted.some(v => v != null) || measured.some(v => v != null);
-            const format = (v: number | null) => battery ? f.pct(v) : f.kwh(v, 2);
-            return <Box key={chart.title} sx={{ minWidth: 0 }}>
-              <Typography component="h3" variant="subtitle1" sx={{ fontWeight: 700 }}>{chart.title} ({chart.unit})</Typography>
-              {battery && <Typography variant="caption" color="text.secondary">{predicted.some(v => v !== null)
-                ? 'Planned level assumes the battery followed the saved schedule.' + (data.mode === 'monitor' ? ' Monitoring mode was active for this plan.' : '')
-                : 'This run has no saved battery projection.'}</Typography>}
-              {available ? <LineChart height={compact ? 190 : 205} skipAnimation title={chart.title + ' comparison'}
-                margin={{ top: 8, right: 16, left: 4, bottom: 0 }}
-                xAxis={[{ scaleType: 'time', data: data.points.map(p => new Date(p.end)), tickNumber: compact ? 4 : 8,
-                  ...(data.points.length === 1 ? { min: new Date(Date.parse(data.points[0].end) - 900000), max: new Date(Date.parse(data.points[0].end) + 900000) } : {}),
-                  valueFormatter: (v: Date, context) => context.location === 'tick' ? f.time(v) : f.dateTime(v), height: 28 }]}
-                yAxis={[{ min: 0, ...(battery ? { max: 100 } : {}), width: 38 }]}
-                series={[
-                  { id: 'prediction', label: battery ? 'Planned' : 'Predicted', color: t.baseline, data: predicted, valueFormatter: format, curve: 'linear', showMark: data.points.length === 1 },
-                  { id: 'actual', label: 'Actual', color: chart.color, data: measured, valueFormatter: format, curve: 'linear', shape: 'circle',
-                    showMark: ({ index }) => measured.length <= 8 || (measured[index - 1] == null && measured[index + 1] == null) },
-                ]}
-                grid={{ horizontal: true }} slotProps={{ legend: { position: { vertical: 'top', horizontal: 'start' } } }}
-                sx={{ '& .MuiLineChart-line[data-series="prediction"]': { strokeDasharray: '6 4' } }} />
-                : <Empty>No battery readings for these half-hours.</Empty>}
-            </Box>;
-          })}
-        </>}
-      </Stack>}
+        <ToggleButtonGroup size="small" exclusive value={hours} onChange={(_, value) => value && setHours(value)} aria-label="Energy chart interval">
+          <ToggleButton value={1}>Hourly</ToggleButton>
+          <ToggleButton value={3}>3-hourly</ToggleButton>
+        </ToggleButtonGroup>
+      </Stack>
+      {(selected !== data.forecast_id) ? <LoadingBlock /> : !bins.length ?
+        <Empty>Waiting for the first complete half-hour to finish.</Empty> : <>
+        <Typography variant="body2" color="text.secondary">
+          {selected === null ? 'Each half-hour uses the latest forecast saved before it began. ' : 'This comparison uses the selected run’s first 24 hours. '}
+          Use includes EV charging. Bars are based on elapsed time, and gaps indicate unavailable data.
+        </Typography>
+        {charts.map(chart => <Box key={chart.title} sx={{ minWidth: 0 }}>
+          <Typography component="h3" variant="subtitle1" sx={{ fontWeight: 700 }}>{chart.title} (kWh)</Typography>
+          <BarChart height={compact ? 188 : 215} skipAnimation title={chart.title + ' comparison'}
+            margin={{ top: 8, right: 16, left: 4, bottom: 0 }}
+            xAxis={[{ scaleType: 'band', data: bins.map(b => b.start), tickLabelInterval: (_, i) => i % tickEvery(bins.length) === 0,
+              valueFormatter: (v: number, ctx) => ctx.location === 'tick' ? f.time(v) : `${f.dateTime(v)} to ${f.time(bins.find(b => b.start === v)?.end)}`, height: 28 }]}
+            yAxis={[{ min: 0, width: 42 }]}
+            series={[
+              { label: 'Estimated', data: bins.map(b => b.sum(chart.forecast)), color: t.baseline, valueFormatter: v => f.kwh(v, 2) },
+              { label: 'Actual', data: bins.map(b => b.sum(chart.measured)), color: chart.color, valueFormatter: v => f.kwh(v, 2) },
+            ]} grid={{ horizontal: true }} />
+        </Box>)}
+        {data.points.some(p => p.planned_soc != null || p.actual_soc != null) && <Box sx={{ minWidth: 0 }}>
+          <Typography component="h3" variant="subtitle1" sx={{ fontWeight: 700 }}>Battery level (%)</Typography>
+          {data.mode === 'monitor' && <Typography variant="caption" color="text.secondary">Monitoring mode was active for this plan.</Typography>}
+          <LineChart height={compact ? 185 : 205} skipAnimation title="Battery level comparison"
+            margin={{ top: 8, right: 16, left: 4, bottom: 0 }}
+            xAxis={[{ scaleType: 'time', data: data.points.map(p => new Date(p.end)), tickNumber: compact ? 4 : 8,
+              ...(data.points.length === 1 ? { min: new Date(Date.parse(data.points[0].end) - 900000), max: new Date(Date.parse(data.points[0].end) + 900000) } : {}),
+              valueFormatter: (v: Date, ctx) => ctx.location === 'tick' ? f.time(v) : f.dateTime(v), height: 28 }]}
+            yAxis={[{ min: 0, max: 100, width: 42 }]}
+            series={[
+              ...(selected !== null ? [{ label: 'Planned', data: data.points.map(p => p.planned_soc), color: t.baseline, valueFormatter: (v: number | null) => f.pct(v), showMark: data.points.length < 3 }] : []),
+              { label: 'Actual', data: data.points.map(p => p.actual_soc), color: t.battery, valueFormatter: v => f.pct(v), showMark: data.points.length < 3 },
+            ]} grid={{ horizontal: true }} />
+        </Box>}
+      </>}
+    </Stack>}
   </Section>;
 }
 
@@ -237,13 +267,6 @@ function Accuracy() {
       <Section title="Model">
         {learning && <Alert severity="info" sx={{ mb: 1.5 }}>Still learning: {f.n(lm.days ?? 0, 0)} days of data so far. Forecasts settle after about two weeks.</Alert>}
         <Facts rows={[['Load history', `${f.n(lm.days ?? 0, 0)} days`], ['Hot / cold samples', `${lm.hot_samples ?? '–'} / ${lm.cold_samples ?? '–'}`]]} />
-      </Section>
-      <Section title="Early accuracy">
-        {acc.data.provisional ? <><Typography variant="body2">Forecast made {f.dateTime(acc.data.provisional.created_at)}. Preliminary average error across completed, measured half-hours.</Typography>
-          <Facts rows={[
-            ['House error', f.kwh(acc.data.provisional.house_mae_kwh, 2) + ' · ' + acc.data.provisional.samples + ' half-hours'],
-            ['Solar error', f.kwh(acc.data.provisional.solar_mae_kwh, 2) + ' · ' + acc.data.provisional.solar_samples + ' half-hours'],
-          ]} /></> : <Typography variant="body2">Waiting for the first complete forecast half-hour with at least 25 minutes of readings.</Typography>}
       </Section>
       <Section title="Forecast error by run">
         <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>Each error is the average difference in kWh per measured half-hour during the forecast’s first day. Smaller is better.</Typography>

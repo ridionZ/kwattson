@@ -102,6 +102,12 @@ export const kw = (v: unknown, digits = 1) => (isNum(v) ? `${num(digits, v)} kW`
 export const kwh = (v: unknown, digits = 1) => (isNum(v) ? `${num(digits, v)} kWh` : '–');
 export const pct = (v: unknown, digits = 0) => (isNum(v) ? `${num(digits, v)}%` : '–');
 export const money = (v: unknown) => (isNum(v) ? num(2, Math.abs(v) < 0.005 ? 0 : v, { style: 'currency', currency: 'AUD' }) : '–');
+/** Positive energy cost is a charge, negative is a credit. */
+export function netCost(v: unknown) {
+  if (!isNum(v)) return '–';
+  if (Math.abs(v) < 0.005) return money(0);
+  return `${money(Math.abs(v))} ${v < 0 ? 'credit' : 'cost'}`;
+}
 /** AUD/kWh → "23.4c" */
 export const cents = (rate: unknown, digits = 1) => (isNum(rate) ? `${num(digits, rate * 100)}c` : '–');
 export function better(v: unknown) {

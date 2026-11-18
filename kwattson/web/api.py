@@ -329,6 +329,7 @@ async def status(request: Request):
         'decision': {k: decision[k] for k in ('id', 'created_at', 'summary')} if decision else None,
         'guards': engine.controller.guards(settings, now), 'control_active': db.meta('control_active', {}),
         'heartbeat': db.meta('worker_heartbeat'), 'advice': engine.advice(), 'today': today,
+        'money': outcomes.money_periods(db, settings, now) if systems else {},
         'unread': db.one('SELECT COUNT(*) AS n FROM notifications WHERE seen=0')['n'], 'demo': runtime.demo,
         'battery_kwh': settings.battery_kwh(), 'battery_reserve_pct': _reserve_pct(settings),
         'using_example_tariff': plan_at(settings.tariffs, now) == default_tariffs()[0],
@@ -369,11 +370,24 @@ def _tariff_today(settings: Settings, now):
 @router.get('/plan')
 async def latest_plan(request: Request):
     db, _, engine, _ = ctx(request)
+    settings = db.settings()
+    now = utcnow()
+    cutoff = now.replace(minute=0 if now.minute < 30 else 30, second=0, microsecond=0)
+    start = cutoff - timedelta(hours=24)
+    observations = {r['ts']: r for r in select_intervals(db, stamp(start), stamp(cutoff))}
+    history = []
+    for i in range(48):
+        at = start + timedelta(minutes=30 * i)
+        ts = stamp(at)
+        r = observations.get(ts)
+        p = rate_at(settings.tariffs, at, settings.zone)
+        actual = {}
+        if r and r['coverage_s'] >= 1500:
+            actual = {key: r[key] for key in ('solar_kwh', 'load_kwh', 'import_kwh', 'export_kwh', 'soc_end', 'coverage_s')}
+        history.append(dict(ts=ts, buy_rate=p['buy'], sell_rate=p['sell'], **actual))
     decision = engine.latest_decision()
-    if not decision:
-        return {'decision': None, 'intervals': []}
-    return {'decision': {k: decision[k] for k in ('id', 'created_at', 'summary', 'version', 'forecast_id', 'tariff_id')},
-            'intervals': _intervals(db, decision['id'])}
+    return {'decision': {k: decision[k] for k in ('id', 'created_at', 'summary', 'version', 'forecast_id', 'tariff_id')} if decision else None,
+            'intervals': _intervals(db, decision['id']) if decision else [], 'history': history, 'as_of': stamp(now)}
 
 
 def _intervals(db, decision_id):
@@ -470,12 +484,14 @@ async def accuracy(request: Request, limit: int = 200):
 
 
 @router.get('/forecast/comparison')
-def forecast_comparison(request: Request, run_id: int | None = None):
+def forecast_comparison(request: Request, run_id: int | None = None, today: bool = False):
     db, *_ = ctx(request)
     now = utcnow()
     available = ('SELECT id, created_at FROM forecasts f WHERE EXISTS '
                  '(SELECT 1 FROM forecast_points p WHERE p.forecast_id=f.id)')
     runs = db.rows(available + ' ORDER BY id DESC LIMIT 200')
+    if today and run_id is None:
+        return {'runs': runs, **forecast.today_comparison(db, db.settings(), now)}
     if not runs:
         return {'runs': [], 'points': [], 'forecast_id': None}
     if run_id is None:

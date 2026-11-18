@@ -19,7 +19,7 @@ from datetime import datetime, timedelta
 
 import numpy as np
 
-from .config import Settings, stamp, utcnow
+from .config import Settings, UTC, stamp, utcnow
 from .db import Database, encode
 from .ingest import select_intervals
 from .optimizer import price_points, self_use
@@ -101,3 +101,41 @@ def update(db: Database, settings: Settings, now: datetime | None = None, days: 
 def today_so_far(db: Database, settings: Settings, now: datetime | None = None) -> dict | None:
     now = now or utcnow()
     return compute_day(db, settings, now.astimezone(settings.zone).date())
+
+
+def money_periods(db: Database, settings: Settings, now: datetime) -> dict:
+    """Known energy and supply charges for the current and previous local periods."""
+    today = now.astimezone(settings.zone).date()
+    week = today - timedelta(days=today.weekday())
+    yesterday = today - timedelta(days=1)
+    last_week = week - timedelta(days=7)
+
+    def midnight(day):
+        return day_bounds(settings, day)[0].astimezone(UTC)
+
+    rows = select_intervals(db, stamp(midnight(last_week)), stamp(now))
+    billed = bill(settings.tariffs, rows, settings.zone)
+    covered = {}
+    for row in rows:
+        at = datetime.fromisoformat(row['ts'])
+        key = at.astimezone(settings.zone).date().isoformat()
+        seconds = min(row['coverage_s'], (now - at).total_seconds())
+        covered[key] = covered.get(key, 0) + seconds
+
+    def total(start, end, stop):
+        keys = [key for key in billed if start.isoformat() <= key < end.isoformat()]
+        if not keys:
+            return None
+        elapsed = (stop - midnight(start)).total_seconds()
+        coverage = sum(covered.get(key, 0) for key in keys) / elapsed if elapsed > 0 else 0
+        return dict(
+            net_aud=sum(billed[key]['net'] for key in keys),
+            import_cost_aud=sum(billed[key]['import_cost'] for key in keys),
+            export_credit_aud=sum(billed[key]['export_credit'] for key in keys),
+            supply_aud=sum(billed[key]['supply'] for key in keys),
+            coverage=min(1, coverage),
+        )
+
+    tomorrow = today + timedelta(days=1)
+    return dict(yesterday=total(yesterday, today, midnight(today)), today=total(today, tomorrow, now),
+                last_week=total(last_week, week, midnight(week)), this_week=total(week, tomorrow, now))

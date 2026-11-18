@@ -122,6 +122,16 @@ periods are unavailable for charging. This is advice only and does not change sc
 or send any charger commands.
 
 ## 5. Outcomes (`outcomes.py`)
+The Overview cost card applies the tariff to measured grid flows for today, yesterday and the
+current and previous Monday-start weeks. It includes daily supply on dates with readings and reports
+coverage over elapsed time. Plan cost uses the optimiser's saved energy cash flows, so tiered
+allowances are already included. It displays imports, export credits and the net energy result.
+The value of different ending battery levels and modelled wear are shown separately.
+
+The default Forecast Accuracy charts pair each completed local half-hour with the latest forecast
+already available when that slot began. Individual saved runs can still be selected. Hourly and
+three-hourly grouped bars sum elapsed half-hours and leave gaps where a series is incomplete.
+
 Per completed day: tariff applied to measured import/export, plus counterfactuals replaying measured
 solar and load through (a) simulated self-use from the measured starting SoC, (b) no battery,
 (c) no solar. Savings vs self-use are adjusted for end-of-day stored energy. Known limits: measured

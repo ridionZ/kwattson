@@ -137,3 +137,41 @@ def test_comparison_matches_saved_plan_and_elapsed_meter_intervals(db, settings)
     assert gap['actual_load'] is None and gap['actual_solar'] is None and gap['actual_soc'] is None
     assert gap['planned_soc'] is not None
     assert all(p['planned_soc'] is None for p in forecast.comparison(db, next_run, now)['points'])
+
+
+def test_today_comparison_uses_latest_available_forecast_without_lookahead(db, settings):
+    start = T0.replace(hour=0)
+    first, _, _ = forecast.build(db, settings, start - timedelta(hours=1))
+    newer, _, _ = forecast.build(db, settings, start - timedelta(minutes=10))
+    future, _, _ = forecast.build(db, settings, start + timedelta(minutes=5))
+    for fid, solar in ((first, 0), (newer, 1.75), (future, 2.5)):
+        db.execute('UPDATE forecast_points SET solar_kwh=? WHERE forecast_id=?', (solar, fid))
+    ingest_all(db, settings, range(0, 35, 5))
+
+    points = forecast.today_comparison(db, settings, start + timedelta(hours=1, minutes=10))['points']
+    first_slot, second_slot = points[-2:]
+    assert first_slot['end'] == stamp(start + timedelta(minutes=30))
+    assert first_slot['forecast_solar'] == 1.75
+    assert first_slot['actual_load'] == pytest.approx(1.0)
+    assert second_slot['forecast_solar'] == 2.5
+    assert second_slot['actual_load'] is None
+    assert points[0]['forecast_solar'] is None
+
+
+def test_money_periods_use_local_week_boundaries_supply_and_partial_coverage(db, settings):
+    from kwattson.outcomes import money_periods
+
+    today = datetime(2026, 11, 18, 6, tzinfo=ZONE)
+    for days_ago, imported, exported in ((7, 2, 0), (2, 1, 0), (1, 0, 60), (0, 1, 0)):
+        at = today - timedelta(days=days_ago, hours=1)
+        db.execute(
+            'INSERT INTO intervals (ts, source, solar_kwh, load_kwh, ev_kwh, import_kwh, export_kwh, '
+            "charge_kwh, discharge_kwh, coverage_s, quality) VALUES (?, 'telemetry', 0, 0, 0, ?, ?, 0, 0, 1800, '{}')",
+            (stamp(at), imported, exported),
+        )
+    periods = money_periods(db, settings, today)
+    assert periods['today']['net_aud'] == pytest.approx(1.30)
+    assert periods['today']['coverage'] == pytest.approx(0.5 / 6)
+    assert periods['yesterday']['net_aud'] == pytest.approx(-2)
+    assert periods['last_week']['net_aud'] == pytest.approx(1.60)
+    assert periods['this_week']['net_aud'] == pytest.approx(1.30 - 2 + 1.30)

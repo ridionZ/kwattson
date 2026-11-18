@@ -1,4 +1,4 @@
-// Stacked plan charts sharing one band time axis and one synced cursor.
+// Stacked plan charts sharing one continuous time axis and one synced cursor.
 // The built-in floating tooltip is off: each chart's legend (directly above it)
 // shows the values at the cursor instead, so all four read out together.
 import { useMemo, useState, type ReactNode } from 'react';
@@ -13,7 +13,6 @@ import TableBody from '@mui/material/TableBody';
 import TableRow from '@mui/material/TableRow';
 import TableCell from '@mui/material/TableCell';
 import { LineChart } from '@mui/x-charts/LineChart';
-import { BarChart } from '@mui/x-charts/BarChart';
 import { ChartsReferenceLine } from '@mui/x-charts/ChartsReferenceLine';
 import type { AxisItemIdentifier } from '@mui/x-charts/models';
 import * as f from '../lib/fmt';
@@ -78,32 +77,26 @@ export function ChartBlock({ id, title, unit, legend, index, children, table }: 
   );
 }
 
-export function useTimeAxis(ts: number[], now: number, compact: boolean) {
+export function useTimeAxis(ts: number[], now: number, compact: boolean, min: number, max: number) {
   return useMemo(() => {
     const boundaries: { x: number; label: string }[] = [];
-    let prev = ts.length ? f.dayKey(ts[0]) : '';
-    for (const t of ts) {
-      const k = f.dayKey(t);
-      if (k !== prev) boundaries.push({ x: t, label: f.dayLabel(t, now) });
-      prev = k;
+    const ticks: number[] = [];
+    let previous = '';
+    for (let time = Math.ceil(min / 900000) * 900000; time <= max; time += 900000) {
+      const local = f.parts(time);
+      const day = `${local.year}-${local.month}-${local.day}`;
+      if (previous && day !== previous) boundaries.push({ x: time, label: f.dayLabel(time, now) });
+      previous = day;
+      if (local.minute === '00' && Number(local.hour) % (compact ? 6 : 3) === 0) ticks.push(time);
     }
-    const step = compact ? 12 : 3;
+    boundaries.push({ x: now, label: 'Now' });
     const axis = {
-      id: 't', scaleType: 'band' as const, data: ts, categoryGapRatio: 0.15,
-      tickInterval: (v: number) => {
-        const p = f.parts(v);
-        return p.minute === '00' && Number(p.hour) % step === 0;
-      },
-      tickLabelInterval: (v: number) => {
-        const p = f.parts(v);
-        return p.minute === '00' && Number(p.hour) % step === 0;
-      },
-      valueFormatter: (v: number) => (f.parts(v).hour === '00' ? f.dayLabel(v, now) : f.hourTick(v)),
-      tickLabelStyle: { fontSize: 11 },
-      height: 24,
+      id: 't', scaleType: 'linear' as const, data: ts, min, max, tickInterval: ticks,
+      valueFormatter: (v: number) => f.parts(v).hour === '00' ? f.dayLabel(v, now) : f.hourTick(v),
+      tickLabelStyle: { fontSize: 11 }, height: 24,
     };
     return { axis, boundaries };
-  }, [ts, now, compact]);
+  }, [ts, now, compact, min, max]);
 }
 
 type Common = {
@@ -132,7 +125,7 @@ function Boundaries({ boundaries, muted }: { boundaries: Common['boundaries']; m
   return (
     <>
       {boundaries.map((b) => (
-        <ChartsReferenceLine key={b.x} x={b.x} lineStyle={{ stroke: muted, strokeDasharray: '2 3' }} />
+        <ChartsReferenceLine key={b.x} x={b.x} lineStyle={{ stroke: muted, strokeDasharray: '2 3', strokeWidth: b.label === 'Now' ? 1.75 : 1 }} />
       ))}
     </>
   );
@@ -143,13 +136,5 @@ export function LineTimeChart(props: Common & { series: any[]; sx?: object }) {
     <LineChart {...shared(props)} series={props.series} sx={props.sx}>
       <Boundaries boundaries={props.boundaries} muted={props.muted} />
     </LineChart>
-  );
-}
-
-export function BarTimeChart(props: Common & { series: any[] }) {
-  return (
-    <BarChart {...shared(props)} series={props.series}>
-      <Boundaries boundaries={props.boundaries} muted={props.muted} />
-    </BarChart>
   );
 }

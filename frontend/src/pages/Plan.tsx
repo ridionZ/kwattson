@@ -1,4 +1,4 @@
-import { useMemo, useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import Box from '@mui/material/Box';
 import Stack from '@mui/material/Stack';
 import Typography from '@mui/material/Typography';
@@ -11,6 +11,8 @@ import TableBody from '@mui/material/TableBody';
 import TableRow from '@mui/material/TableRow';
 import TableCell from '@mui/material/TableCell';
 import Chip from '@mui/material/Chip';
+import ToggleButton from '@mui/material/ToggleButton';
+import ToggleButtonGroup from '@mui/material/ToggleButtonGroup';
 import useMediaQuery from '@mui/material/useMediaQuery';
 import type { Theme } from '@mui/material/styles';
 import RefreshRounded from '@mui/icons-material/RefreshRounded';
@@ -21,8 +23,8 @@ import { useLoad, useNow } from '../lib/hooks';
 import { useApp } from '../lib/app';
 import { ACTIONS, action, foxMode } from '../lib/actions';
 import * as f from '../lib/fmt';
-import { ErrorState, Empty, Facts, HelpTip, LoadingBlock, PageHeader, Section, useToast } from '../components/common';
-import { BarTimeChart, ChartBlock, LineTimeChart, MARGIN, useTimeAxis, type LegendItem } from '../components/TimeCharts';
+import { ErrorState, Empty, Facts, LoadingBlock, PageHeader, Section, useToast } from '../components/common';
+import { ChartBlock, LineTimeChart, MARGIN, useTimeAxis, type LegendItem } from '../components/TimeCharts';
 import { useTokens } from './Overview';
 
 interface Interval {
@@ -31,9 +33,19 @@ interface Interval {
   baseline_curtailed_kwh: number; solar_p10: number | null; solar_p90: number | null; reason: string;
 }
 
+interface MeasuredInterval {
+  ts: string; buy_rate: number; sell_rate: number; coverage_s?: number; solar_kwh?: number; load_kwh?: number;
+  import_kwh?: number; export_kwh?: number; soc_end?: number | null;
+}
+
 export default function Plan() {
   const { status, reloadStatus, can } = useApp();
-  const plan = useLoad<{ decision: any; intervals: Interval[] }>(() => get('/api/plan'));
+  const plan = useLoad<{ decision: any; intervals: Interval[]; history: MeasuredInterval[]; as_of: string }>(
+    () => get('/api/plan'), [status?.decision?.id]);
+  useEffect(() => {
+    const timer = setInterval(() => { if (!document.hidden) void plan.reload(); }, 60000);
+    return () => clearInterval(timer);
+  }, [plan.reload]);
   const [busy, setBusy] = useState(false);
   const toast = useToast();
   const now = useNow();
@@ -53,13 +65,13 @@ export default function Plan() {
   const d = plan.data?.decision;
   return (
     <Box>
-      <PageHeader title="Plan" sub={d ? `Plan made ${f.relative(d.created_at, now)} · next 48 hours` : 'The next 48 hours'}
+      <PageHeader title="Plan" sub={d ? `Plan made ${f.relative(d.created_at, now)}` : undefined}
         actions={can('member') && <Button variant="contained" startIcon={<RefreshRounded />} onClick={replan} disabled={busy}>{busy ? 'Planning…' : 'Re-plan'}</Button>} />
       {plan.error ? <ErrorState message={plan.error} onRetry={plan.reload} /> : !plan.data ? <LoadingBlock height={480} /> :
         !d ? <Empty>No plan has been made yet. The planner runs every few minutes once readings arrive.</Empty> : (
           <Stack spacing={2.5}>
-            <Summary d={d} rows={plan.data.intervals} />
-            <Charts rows={plan.data.intervals} now={now} />
+            <Summary d={d} rows={plan.data.intervals} batteryKwh={status?.battery_kwh ?? 0} />
+            <Charts rows={plan.data.intervals} history={plan.data.history ?? []} now={Date.parse(plan.data.as_of) || now} initialSoc={d.summary.initial_soc_pct ?? null} />
             <Schedule blocks={status?.advice?.schedule ?? []} now={now} plugins={(status?.systems ?? []).map((s: any) => s.plugin)} />
           </Stack>
         )}
@@ -67,50 +79,73 @@ export default function Plan() {
   );
 }
 
-function Summary({ d, rows }: { d: any; rows: Interval[] }) {
+function Summary({ d, rows, batteryKwh }: { d: any; rows: Interval[]; batteryKwh: number }) {
   const [open, setOpen] = useState(false);
-  const { t } = useTokens();
+  const [range, setRange] = useState<'day' | 'full'>('day');
   const s = d.summary;
-  const end = new Date(d.created_at).getTime() + 24 * 3600e3;
-  const day = rows.filter((r) => new Date(r.ts).getTime() < end);
-  const cost = day.reduce((a, r) => a + (r.cost ?? 0), 0);
-  const kept = day.reduce((a, r) => a + (r.baseline_curtailed_kwh ?? 0) - (r.curtailed_kwh ?? 0), 0);
-  const saving = s.modelled_saving_24h_aud;
-  const fig = (label: string, value: string, color?: string, sub?: ReactNode) => (
-    <Box sx={{ minWidth: 0 }}>
-      <Typography variant="caption" component="h3" color="text.secondary" sx={{ fontWeight: 600 }}>{label}</Typography>
-      <Typography variant="h4" component="p" sx={{ color: color ?? 'text.primary', fontSize: { xs: '1.5rem', sm: '1.75rem' } }}>{value}</Typography>
-      {sub && <Typography variant="caption" color="text.secondary">{sub}</Typography>}
-    </Box>
-  );
+  const start = Date.parse(rows[0]?.ts ?? d.created_at);
+  const last = rows[rows.length - 1];
+  const hours = last ? (Date.parse(last.ts) + last.hours * HOUR - start) / HOUR : 0;
+  const full = range === 'full' || hours <= 24;
+  const cutoff = start + 24 * HOUR;
+  const period = full ? rows : rows.filter(r => Date.parse(r.ts) < cutoff);
+  const fraction = (row: Interval) => full ? 1 : Math.min(1, (cutoff - Date.parse(row.ts)) / (row.hours * HOUR));
+  const totals = period.reduce((acc, r) => {
+    const share = fraction(r);
+    return {
+      importKwh: acc.importKwh + r.import_kwh * share,
+      exportKwh: acc.exportKwh + r.export_kwh * share,
+      importCost: acc.importCost + (r.import_kwh > 1e-6 ? r.cost * share : 0),
+      exportCredit: acc.exportCredit - (r.export_kwh > 1e-6 ? r.cost * share : 0),
+      net: acc.net + r.cost * share,
+      baseline: acc.baseline + r.baseline_cost * share,
+      kept: acc.kept + (r.baseline_curtailed_kwh - r.curtailed_kwh) * share,
+    };
+  }, { importKwh: 0, exportKwh: 0, importCost: 0, exportCredit: 0, net: 0, baseline: 0, kept: 0 });
+  const billSaving = totals.baseline - totals.net;
+  // Optimised intervals have one grid flow direction. Fallback intervals may only have a combined cost.
+  const separateGridCosts = period.every(r => r.import_kwh <= 1e-6 || r.export_kwh <= 1e-6);
+  const chargeDifference = (r: Interval | undefined) => r ? r.soc_pct - r.baseline_soc_pct : 0;
+  const finalStep = period[period.length - 1];
+  const stepShare = finalStep ? fraction(finalStep) : 0;
+  const chargeGap = stepShare * chargeDifference(finalStep) + (1 - stepShare) * chargeDifference(period[period.length - 2]);
+  const storedGap = full ? s.end_stored_kwh - s.baseline_end_stored_kwh : chargeGap * batteryKwh / 100;
+  const adjustment = storedGap * (s.terminal_value_per_kwh ?? 0);
   return (
-    <Section title="Summary" help={<HelpTip title="Modelled, not measured" label="modelled figures">
-      These come from the planner’s forecast of your solar and home use. “Plain self-use” is the same forecast run through an inverter left on
-      its default mode. Real results are measured in History.
-    </HelpTip>}>
-      <Box sx={{ display: 'grid', gap: 2, gridTemplateColumns: { xs: '1fr', sm: 'repeat(3, 1fr)' } }}>
-        {fig('Expected cost, next 24 h', cost < -0.005 ? `${f.money(-cost)} credit` : f.money(cost), cost < -0.005 ? t.batteryText : undefined, cost < -0.005 ? 'exports earn more than imports cost · modelled' : 'energy only, modelled')}
-        {fig('Saving vs plain self-use', f.money(saving), saving > 0.005 ? t.batteryText : undefined, 'next 24 h, modelled')}
-        {fig('Solar kept from clipping', f.kwh(Math.max(0, kept)), kept > 0.05 ? t.solarText : undefined, 'next 24 h, modelled')}
-      </Box>
+    <Section title="Plan cost and credits" action={hours > 24 && <ToggleButtonGroup size="small" exclusive value={range}
+      onChange={(_, value) => value && setRange(value)} aria-label="Plan cost period"
+      sx={{ '& .MuiToggleButton-root': { whiteSpace: 'nowrap' } }}>
+      <ToggleButton value="day">First 24 h</ToggleButton>
+      <ToggleButton value="full">Full {Math.round(hours)} h</ToggleButton>
+    </ToggleButtonGroup>}>
+      {period.length ? <>
+        <Stack spacing={0.4} sx={{ mb: 1.5 }}>
+          <Typography variant="h4" component="p">{f.netCost(totals.net)}</Typography>
+          <Typography variant="body2" color="text.secondary">
+            Modelled energy only, from {f.dateTime(start)}. Daily supply and battery wear are separate.
+          </Typography>
+        </Stack>
+        <Facts rows={[
+          ['Grid imports', separateGridCosts ? `${f.netCost(totals.importCost)} · ${f.kwh(totals.importKwh)}` : f.kwh(totals.importKwh)],
+          ['Grid exports', separateGridCosts ? `${f.netCost(-totals.exportCredit)} · ${f.kwh(totals.exportKwh)}` : f.kwh(totals.exportKwh)],
+          ['Net with plain self-use', f.netCost(totals.baseline)],
+          ['Energy saving vs plain self-use', f.better(billSaving)],
+          Math.abs(adjustment) >= 0.005 && ['Battery charge adjustment', f.money(adjustment)],
+          Math.abs(adjustment) >= 0.005 && ['Saving after battery adjustment', f.better(billSaving + adjustment)],
+          ['Solar kept from clipping', f.kwh(Math.max(0, totals.kept))],
+        ]} />
+      </> : <Empty>No intervals are available for this plan.</Empty>}
       <Button size="small" onClick={() => setOpen(!open)} aria-expanded={open} aria-controls="plan-details" sx={{ mt: 1.5, ml: -1 }}
-        endIcon={<ExpandMoreRounded sx={{ transform: open ? 'rotate(180deg)' : 'none', transition: 'transform .2s' }} />}>Details</Button>
+        endIcon={<ExpandMoreRounded sx={{ transform: open ? 'rotate(180deg)' : 'none', transition: 'transform .2s' }} />}>Planner details</Button>
       <Collapse in={open} id="plan-details">
-        <Box sx={{ pt: 1.5, display: 'grid', gap: 2, gridTemplateColumns: { xs: '1fr', md: '1fr 1fr' } }}>
+        <Box sx={{ pt: 1.5 }}>
           <Facts rows={[
-            ['Plan cost, 48 h', `${f.money(-s.plan_cash_aud)} (self-use ${f.money(-s.baseline_cash_aud)})`],
-            ['Saving, 48 h', f.money(s.modelled_saving_aud)],
-            ['Import / export', `${f.kwh(s.import_kwh)} / ${f.kwh(s.export_kwh)}`],
-            ['Battery wear', f.money(s.wear_aud)],
-            ['Battery at end', `${f.kwh(s.end_stored_kwh)} (self-use ${f.kwh(s.baseline_end_stored_kwh)})`],
+            ['Battery wear, full plan', `${f.money(s.wear_aud)} modelled`],
+            ['Battery at full plan end', `${f.kwh(s.end_stored_kwh)} (self-use ${f.kwh(s.baseline_end_stored_kwh)})`],
             ['Stored energy valued at', `${f.cents(s.terminal_value_per_kwh)}/kWh`],
-          ]} />
-          <Facts rows={[
             ['Solver', `${s.solver} · ${s.solver_status === 0 ? 'optimal' : s.solver_message} · ${f.n(s.solve_seconds, 2)} s`],
             ['Planner version', d.version],
             ['Tariff', d.tariff_id],
-            ['Forecast', s.confidence],
-            ['Limitations', <Box component="ul" sx={{ m: 0, pl: 2 }}>{(s.limitations ?? []).map((l: string) => <li key={l}>{l}</li>)}</Box>],
           ]} />
         </Box>
       </Collapse>
@@ -118,134 +153,201 @@ function Summary({ d, rows }: { d: any; rows: Interval[] }) {
   );
 }
 
-function Charts({ rows, now }: { rows: Interval[]; now: number }) {
+type ChartPoint = {
+  time: number; kind: 'actual' | 'forecast'; buy: number; sell: number; action?: string;
+  solar: number | null; home: number | null; p10: number | null; p90: number | null;
+  imp: number | null; exp: number | null;
+};
+
+const HOUR = 3600000;
+const power = (energy: number | null | undefined, hours: number) => energy != null && hours > 0 ? energy / hours : null;
+
+function chartPoints(history: MeasuredInterval[], rows: Interval[], now: number, end: number): ChartPoint[] {
+  const past = history.map((r): ChartPoint => {
+    const duration = (r.coverage_s ?? 0) / 3600;
+    const exported = power(r.export_kwh, duration);
+    return { time: Date.parse(r.ts), kind: 'actual', solar: power(r.solar_kwh, duration), home: power(r.load_kwh, duration),
+      buy: r.buy_rate * 100, sell: r.sell_rate * 100, imp: power(r.import_kwh, duration), exp: exported === null ? null : -exported,
+      p10: null, p90: null };
+  });
+  const lastActual = past[past.length - 1];
+  if (lastActual) {
+    const boundary = Math.min(now - 1, lastActual.time + HOUR / 2);
+    if (boundary > lastActual.time) past.push({ ...lastActual, time: boundary });
+  }
+  const future = rows.flatMap((r): ChartPoint[] => {
+    const start = Date.parse(r.ts);
+    const stop = start + Math.round(r.hours * HOUR);
+    if (stop <= now || start >= end) return [];
+    const point: ChartPoint = { time: Math.max(now, start), kind: 'forecast', action: r.action,
+      solar: power(r.solar_kwh, r.hours), home: power(r.load_kwh, r.hours),
+      p10: power(r.solar_p10, r.hours), p90: power(r.solar_p90, r.hours),
+      buy: r.buy_rate * 100, sell: r.sell_rate * 100, imp: power(r.import_kwh, r.hours), exp: -r.export_kwh / r.hours };
+    return r === rows[rows.length - 1] || stop >= end ? [point, { ...point, time: Math.min(stop, end) }] : [point];
+  });
+  return [...past, ...future];
+}
+
+function Charts({ rows, history, now, initialSoc }: { rows: Interval[]; history: MeasuredInterval[]; now: number; initialSoc: number | null }) {
   const { t, actions } = useTokens();
   const compact = useMediaQuery((th: Theme) => th.breakpoints.down('sm'));
   const [hi, setHi] = useState<number | null>(null);
-  const ts = useMemo(() => rows.map((r) => new Date(r.ts).getTime()), [rows]);
-  const { axis, boundaries } = useTimeAxis(ts, now, compact);
-  const kw = (kwh: number | null | undefined, r: Interval) => (r.hours > 0 && kwh != null ? kwh / r.hours : 0);
-  const data = useMemo(() => {
-    const solar = rows.map((r) => kw(r.solar_kwh, r));
-    const p10 = rows.map((r) => kw(r.solar_p10 ?? r.solar_kwh, r));
-    const p90 = rows.map((r) => kw(r.solar_p90 ?? r.solar_kwh, r));
-    return {
-      solar, p10, p90, band: p90.map((v, i) => Math.max(0, v - p10[i])),
-      home: rows.map((r) => kw(r.load_kwh, r)),
-      imp: rows.map((r) => kw(r.import_kwh, r)),
-      exp: rows.map((r) => -kw(r.export_kwh, r)),
-      soc: rows.map((r) => r.soc_pct),
-      base: rows.map((r) => r.baseline_soc_pct),
-      buy: rows.map((r) => r.buy_rate * 100),
-      sell: rows.map((r) => r.sell_rate * 100),
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [rows]);
-  const idx = hi ?? 0;
-  const timeLabel = (i: number) => `${f.day(ts[i])} ${f.time(ts[i])}`;
+  const container = useRef<HTMLDivElement>(null);
+  const start = now - 24 * HOUR;
+  const end = now + 48 * HOUR;
+  const points = useMemo(() => chartPoints(history, rows, now, end), [history, rows, now, end]);
+  const ts = useMemo(() => points.map(r => r.time), [points]);
+  const batteryLevels = useMemo(() => {
+    const levels = new Map(history.map(r => [Date.parse(r.ts) + HOUR / 2, r.soc_end]));
+    const forecasts = new Map(rows.map(r => [Date.parse(r.ts) + Math.round(r.hours * HOUR), r]));
+    return points.map(p => {
+      if (p.kind === 'actual') return { actual: levels.get(p.time) ?? levels.get(p.time + 1) ?? null, planned: null, baseline: null };
+      const last = forecasts.get(p.time);
+      return {
+        actual: levels.get(p.time) ?? null,
+        planned: last?.soc_pct ?? (p.time === Date.parse(rows[0]?.ts) ? initialSoc : null),
+        baseline: last?.baseline_soc_pct ?? (p.time === Date.parse(rows[0]?.ts) ? initialSoc : null),
+      };
+    });
+  }, [points, rows, history, initialSoc]);
+  const { axis, boundaries } = useTimeAxis(ts, now, compact, start, end);
+  const defaultIndex = points.findIndex(r => r.kind === 'forecast');
+  const idx = hi != null && hi < points.length ? hi : Math.max(0, defaultIndex);
+  const timeLabel = (i: number) => f.dateTime(ts[i]);
   const common = { xAxis: axis, boundaries, hi, setHi, muted: t.baseline };
-  const kwFmt = (v: number) => `${f.n(Math.abs(v), Math.abs(v) < 10 ? 1 : 0)}`;
-  const cur = rows[idx];
-  const a = action(cur?.action);
+  const cur = points[idx];
+  const a = cur?.action ? action(cur.action) : null;
 
-  // Action strip: merge consecutive equal actions.
-  const blocks: { action: string; n: number; start: number }[] = [];
-  rows.forEach((r, i) => {
-    const last = blocks[blocks.length - 1];
-    if (last && last.action === r.action) last.n += 1;
-    else blocks.push({ action: r.action, n: 1, start: i });
+  useEffect(() => {
+    if (!compact) return;
+    const setInitialPosition = requestAnimationFrame(() => {
+      container.current?.querySelectorAll<HTMLElement>('[data-plan-plot]').forEach(plot => {
+        plot.scrollLeft = plot.scrollWidth / 6;
+      });
+    });
+    return () => cancelAnimationFrame(setInitialPosition);
+  }, [compact]);
+
+  function plot(title: string, child: ReactNode) {
+    return <Box data-plan-plot role={compact ? 'region' : undefined} aria-label={compact ? `${title} timeline` : undefined} tabIndex={compact ? 0 : undefined}
+      sx={{ overflowX: compact ? 'auto' : 'hidden' }}
+      onScroll={compact ? e => {
+        const left = e.currentTarget.scrollLeft;
+        container.current?.querySelectorAll<HTMLElement>('[data-plan-plot]').forEach(other => {
+          if (Math.abs(other.scrollLeft - left) > 1) other.scrollLeft = left;
+        });
+      } : undefined}>
+      <Box sx={{ width: compact ? '200%' : '100%' }}>{child}</Box>
+    </Box>;
+  }
+
+  const series = (id: string, key: keyof ChartPoint, color: string, kind?: ChartPoint['kind']) => ({
+    id, color, curve: 'stepAfter', data: points.map(p => !kind || p.kind === kind ? p[key] as number | null : null), showMark: false,
   });
-
-  const legendSolar: LegendItem[] = [
-    { label: 'Solar forecast', color: t.solar, kind: 'line', value: (i) => f.kw(data.solar[i]) },
-    { label: 'Likely range', color: t.solar, kind: 'band', value: (i) => `${f.n(data.p10[i])}–${f.n(data.p90[i])}` },
-    { label: 'Home use', color: t.home, kind: 'line', value: (i) => f.kw(data.home[i]) },
+  const legend = (label: string, color: string, kind: LegendItem['kind'], value: (i: number) => string): LegendItem => ({ label, color, kind, value });
+  const byKind = (key: 'solar' | 'home', kind: ChartPoint['kind']) => (i: number) => f.kw(points[i]?.kind === kind ? points[i]?.[key] : null);
+  const seriesStyle = { '& .MuiLineChart-line': { strokeWidth: 2 }, '& .MuiLineChart-line[data-series^="forecast"]': { strokeDasharray: '5 3' } };
+  const range = (i: number) => points[i]?.p10 == null || points[i]?.p90 == null ? '–' : `${f.n(points[i].p10)}–${f.n(points[i].p90)}`;
+  const legendSolar = [
+    legend('Actual solar', t.solar, 'line', byKind('solar', 'actual')),
+    legend('Forecast solar', t.solar, 'dashed', byKind('solar', 'forecast')),
+    legend('Likely range', t.solar, 'band', range),
+    legend('Actual use', t.home, 'line', byKind('home', 'actual')),
+    legend('Forecast use', t.home, 'dashed', byKind('home', 'forecast')),
   ];
-  const legendGrid: LegendItem[] = [
-    { label: 'Import', color: t.gridIn, kind: 'bar', value: (i) => f.kw(data.imp[i]) },
-    { label: 'Export', color: t.gridOut, kind: 'bar', value: (i) => f.kw(-data.exp[i]) },
+  const legendGrid = [
+    legend('Import', t.gridIn, 'line', i => f.kw(points[i]?.imp)),
+    legend('Export', t.gridOut, 'line', i => f.kw(points[i]?.exp == null ? null : Math.abs(points[i].exp!))),
   ];
-  const legendBat: LegendItem[] = [
-    { label: 'Planned', color: t.battery, kind: 'line', value: (i) => f.pct(data.soc[i]) },
-    { label: 'Plain self-use', color: t.baseline, kind: 'dashed', value: (i) => f.pct(data.base[i]) },
+  const legendBat = [
+    legend('Actual', t.battery, 'line', i => f.pct(batteryLevels[i]?.actual)),
+    legend('Planned', t.battery, 'dashed', i => f.pct(batteryLevels[i]?.planned)),
+    legend('Plain self-use', t.baseline, 'dashed', i => f.pct(batteryLevels[i]?.baseline)),
   ];
-  const legendPrice: LegendItem[] = [
-    { label: 'Buy', color: t.buy, kind: 'step', value: (i) => `${f.n(data.buy[i])}c` },
-    { label: 'Feed-in', color: t.sell, kind: 'step', value: (i) => `${f.n(data.sell[i])}c` },
+  const legendPrice = [
+    legend('Buy', t.buy, 'step', i => f.n(points[i]?.buy) + 'c'),
+    legend('Feed-in', t.sell, 'step', i => f.n(points[i]?.sell) + 'c'),
   ];
+  const tableRows = (items: LegendItem[]) => points.map((_, i) => [timeLabel(i), ...items.map(l => l.value(i))]);
 
   return (
-    <Section title="Next 48 hours" sx={{ overflow: 'visible' }}>
-      <Box sx={{ position: 'sticky', top: { xs: 56, md: 64 }, zIndex: 2, bgcolor: 'background.paper', py: 1, mx: -1, px: 1, borderBottom: 1, borderColor: 'divider' }}
->
-        <Stack direction="row" spacing={1} sx={{ alignItems: 'center', flexWrap: 'wrap', rowGap: 0.5 }}>
-          <Typography variant="body2" sx={{ fontWeight: 700 }}>{hi == null ? `Now · ${f.time(ts[0])}` : timeLabel(idx)}</Typography>
-          <Chip size="small" icon={<a.Icon />} label={a.label}
-            sx={{ bgcolor: (actions as Record<string, string>)[cur?.action] + '33', '& .MuiChip-icon': { color: 'text.primary' } }} />
-          <Typography variant="caption" color="text.secondary" sx={{ display: { xs: 'none', sm: 'block' } }}>
-            {hi == null ? 'Point at or tap a chart to read any half-hour.' : ''}
+    <Section title="Past 24 hours and next 48 hours" sx={{ minWidth: 0 }}>
+      <Box ref={container} sx={{ minWidth: 0 }}>
+        <Stack direction="row" spacing={1} sx={{ alignItems: 'center', flexWrap: 'wrap', rowGap: 0.5, pb: 1, borderBottom: 1, borderColor: 'divider' }}>
+          <Typography variant="body2" sx={{ fontWeight: 700 }}>{hi == null ? `Now · ${f.time(now)}` : timeLabel(idx)}</Typography>
+          {a ? <Chip size="small" icon={<a.Icon />} label={a.label}
+            sx={{ bgcolor: (actions as Record<string, string>)[cur?.action ?? ''] + '33', '& .MuiChip-icon': { color: 'text.primary' } }} />
+            : cur?.kind === 'actual' && <Chip size="small" label="Measured" />}
+          <Typography variant="caption" color="text.secondary">
+            {compact ? 'Swipe any chart to scroll them together.' : 'Point at a chart to read all four at the same time.'}
           </Typography>
         </Stack>
-      </Box>
 
-      <ChartBlock id="c-solar" title="Solar & home" unit="kW" legend={legendSolar} index={idx}
-        table={{ columns: ['Time', 'Solar kW', 'Range kW', 'Home kW'], rows: rows.map((_, i) => [timeLabel(i), f.n(data.solar[i]), `${f.n(data.p10[i])}–${f.n(data.p90[i])}`, f.n(data.home[i])]) }}>
-        <LineTimeChart {...common} height={compact ? 170 : 200} yFormat={kwFmt} yMin={0} desc="Forecast solar generation with its likely range, and forecast home use, in kilowatts."
-          series={[
-            { id: 'p10', data: data.p10, stack: 'band', area: false, showMark: false, color: 'transparent', disableHighlight: true },
-            { id: 'band', data: data.band, stack: 'band', area: true, showMark: false, color: t.solar, disableHighlight: true },
-            { id: 'solar', data: data.solar, showMark: false, color: t.solar, curve: 'monotoneX' },
-            { id: 'home', data: data.home, showMark: false, color: t.home, curve: 'monotoneX' },
-          ]}
-          sx={{ '& .MuiLineChart-area[data-series="band"]': { fillOpacity: 0.24 }, '& .MuiLineChart-line': { strokeWidth: 2.25 }, '& .MuiLineChart-line[data-series="band"], & .MuiLineChart-line[data-series="p10"]': { strokeWidth: 0 } }} />
-      </ChartBlock>
+        <ChartBlock id="c-solar" title="Solar & home" unit="kW" legend={legendSolar} index={idx}
+          table={{ columns: ['Time', ...legendSolar.map(l => l.label)], rows: tableRows(legendSolar) }}>
+          {plot('Solar and home', <LineTimeChart {...common} height={compact ? 172 : 210} yFormat={v => f.n(v)} yMin={0}
+            desc="Measured and forecast solar and electricity use. Dashed lines are forecasts."
+            series={[
+              { ...series('floor', 'p10', 'transparent'), stack: 'range', disableHighlight: true },
+              { id: 'range', color: t.solar, data: points.map(p => p.p10 == null || p.p90 == null ? null : Math.max(0, p.p90 - p.p10)),
+                curve: 'stepAfter', stack: 'range', area: true, showMark: false, disableHighlight: true },
+              series('actual-solar', 'solar', t.solar, 'actual'), series('forecast-solar', 'solar', t.solar, 'forecast'),
+              series('actual-home', 'home', t.home, 'actual'), series('forecast-home', 'home', t.home, 'forecast'),
+            ]}
+            sx={{ ...seriesStyle, '& .MuiLineChart-area[data-series="range"]': { fillOpacity: 0.18 },
+              '& .MuiLineChart-line[data-series="range"]': { strokeWidth: 0 } }} />)}
+        </ChartBlock>
 
-      <ChartBlock id="c-grid" title="Grid" unit="kW, imports up, exports down" legend={legendGrid} index={idx}
-        table={{ columns: ['Time', 'Import kW', 'Export kW'], rows: rows.map((_, i) => [timeLabel(i), f.n(data.imp[i]), f.n(-data.exp[i])]) }}>
-        <BarTimeChart {...common} height={compact ? 120 : 140} yFormat={kwFmt} desc="Planned grid import as bars above zero and export below zero, in kilowatts."
-          series={[
-            { id: 'imp', data: data.imp, stack: 'g', color: t.gridIn },
-            { id: 'exp', data: data.exp, stack: 'g', color: t.gridOut },
-          ]} />
-      </ChartBlock>
+        <ChartBlock id="c-grid" title="Grid" unit="kW, imports up, exports down" legend={legendGrid} index={idx}
+          table={{ columns: ['Time', 'Import', 'Export'], rows: tableRows(legendGrid) }}>
+          {plot('Grid', <LineTimeChart {...common} height={compact ? 130 : 154} yFormat={v => f.n(Math.abs(v))}
+            desc="Grid imports above zero, exports below. Solid lines show measured power; dashed lines show the plan."
+            series={[
+              series('actual-import', 'imp', t.gridIn, 'actual'), series('forecast-import', 'imp', t.gridIn, 'forecast'),
+              series('actual-export', 'exp', t.gridOut, 'actual'), series('forecast-export', 'exp', t.gridOut, 'forecast'),
+            ]} sx={seriesStyle} />)}
+        </ChartBlock>
 
-      <ChartBlock id="c-bat" title="Battery" unit="%" legend={legendBat} index={idx}
-        table={{ columns: ['Time', 'Planned %', 'Self-use %'], rows: rows.map((_, i) => [timeLabel(i), f.n(data.soc[i], 0), f.n(data.base[i], 0)]) }}>
-        <LineTimeChart {...common} height={compact ? 130 : 150} yFormat={(v) => `${v}%`} yMin={0} yMax={100}
-          desc="Planned battery level compared with plain self-use, in percent."
-          series={[
-            { id: 'soc', data: data.soc, showMark: false, color: t.battery, area: true, curve: 'monotoneX' },
-            { id: 'base', data: data.base, showMark: false, color: t.baseline, curve: 'monotoneX' },
-          ]}
-          sx={{ '& .MuiLineChart-line': { strokeWidth: 2.25 }, '& .MuiLineChart-line[data-series="base"]': { strokeDasharray: '6 4' }, '& .MuiLineChart-area[data-series="soc"]': { fillOpacity: 0.18 } }} />
-      </ChartBlock>
+        <ChartBlock id="c-bat" title="Battery" unit="%" legend={legendBat} index={idx}
+          table={{ columns: ['Time', 'Actual', 'Planned', 'Plain self-use'], rows: tableRows(legendBat) }}>
+          {plot('Battery', <LineTimeChart {...common} height={compact ? 132 : 156} yFormat={v => `${v}%`} yMin={0} yMax={100}
+            desc="Measured battery level and the two forecast battery levels, in percent."
+            series={[
+              { id: 'actual-battery', data: batteryLevels.map(p => p.actual), color: t.battery, showMark: false },
+              { id: 'forecast-battery', data: batteryLevels.map(p => p.planned), color: t.battery, showMark: false },
+              { id: 'forecast-baseline', data: batteryLevels.map(p => p.baseline), color: t.baseline, showMark: false },
+            ]} sx={seriesStyle} />)}
+        </ChartBlock>
 
-      <ChartBlock id="c-price" title="Prices" unit="c/kWh" legend={legendPrice} index={idx}
-        table={{ columns: ['Time', 'Buy c', 'Feed-in c', 'Action'], rows: rows.map((r, i) => [timeLabel(i), f.n(data.buy[i]), f.n(data.sell[i]), action(r.action).label]) }}>
-        <LineTimeChart {...common} height={compact ? 120 : 140} yFormat={(v) => `${v}c`} yMin={0}
-          desc="Buy and feed-in prices in cents per kilowatt hour."
-          series={[
-            { id: 'buy', data: data.buy, showMark: false, color: t.buy, curve: 'stepAfter' },
-            { id: 'sell', data: data.sell, showMark: false, color: t.sell, curve: 'stepAfter' },
-          ]}
-          sx={{ '& .MuiLineChart-line': { strokeWidth: 2 } }} />
-        <Box sx={{ pl: `${MARGIN.left + 44}px`, pr: `${MARGIN.right}px`, mt: 0.5 }}>
-          <Box role="img" aria-label="Planned action over time, see the schedule below" sx={{ display: 'flex', height: 12, borderRadius: 1, overflow: 'hidden' }}>
-            {blocks.map((b) => (
-              <Box key={b.start} title={`${action(b.action).label} from ${timeLabel(b.start)}`}
-                sx={{ flexGrow: b.n, flexBasis: 0, bgcolor: (actions as Record<string, string>)[b.action] ?? t.baseline, borderRight: '1px solid', borderColor: 'background.paper' }} />
+        <ChartBlock id="c-price" title="Prices" unit="c/kWh" legend={legendPrice} index={idx}
+          table={{ columns: ['Time', 'Buy', 'Feed-in', 'Action'], rows: points.map((p, i) => [timeLabel(i), ...legendPrice.map(l => l.value(i)), p.action ? action(p.action).label : '–']) }}>
+          {plot('Prices', <>
+            <LineTimeChart {...common} height={compact ? 125 : 148} yFormat={v => `${v}c`} desc="Buy and feed-in prices in cents per kilowatt hour."
+              series={[series('buy', 'buy', t.buy), series('sell', 'sell', t.sell)]} sx={seriesStyle} />
+            <Box sx={{ pl: `${MARGIN.left + 44}px`, pr: `${MARGIN.right}px`, mt: 0.5 }}>
+              <Box role="img" aria-label="Planned actions on the future part of the timeline" sx={{ position: 'relative', height: 10, borderRadius: 1, overflow: 'hidden' }}>
+                {rows.map(r => {
+                  const rStart = Date.parse(r.ts);
+                  const a = Math.max(now, rStart);
+                  const b = Math.min(end, rStart + r.hours * HOUR);
+                  if (b <= a) return null;
+                  return <Box key={r.ts} title={`${action(r.action).label} from ${f.dateTime(a)}`} sx={{ position: 'absolute', height: '100%',
+                    left: `${(a - start) / (end - start) * 100}%`, width: `${(b - a) / (end - start) * 100}%`,
+                    bgcolor: (actions as Record<string, string>)[r.action] ?? t.baseline }} />;
+                })}
+              </Box>
+            </Box>
+          </>)}
+          <Box component="ul" aria-label="Action colours" sx={{ listStyle: 'none', m: 0, mt: 1, p: 0, display: 'flex', flexWrap: 'wrap', columnGap: 2, rowGap: 0.5 }}>
+            {Object.entries(ACTIONS).map(([key, value]) => (
+              <Box component="li" key={key} sx={{ display: 'flex', alignItems: 'center', gap: 0.5, fontSize: '0.75rem', color: 'text.secondary' }}>
+                <Box component="span" aria-hidden sx={{ width: 10, height: 10, borderRadius: 0.5, bgcolor: (actions as Record<string, string>)[key] }} />
+                {value.label}
+              </Box>
             ))}
           </Box>
-        </Box>
-        <Box component="ul" aria-label="Action colours" sx={{ listStyle: 'none', m: 0, mt: 1, p: 0, display: 'flex', flexWrap: 'wrap', columnGap: 2, rowGap: 0.5 }}>
-          {Object.entries(ACTIONS).map(([k, v]) => (
-            <Box component="li" key={k} sx={{ display: 'flex', alignItems: 'center', gap: 0.5, fontSize: '0.75rem', color: 'text.secondary' }}>
-              <Box component="span" aria-hidden sx={{ width: 10, height: 10, borderRadius: 0.5, bgcolor: (actions as Record<string, string>)[k] }} />
-              {v.label}
-            </Box>
-          ))}
-        </Box>
-      </ChartBlock>
+        </ChartBlock>
+      </Box>
     </Section>
   );
 }
