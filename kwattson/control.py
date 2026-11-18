@@ -79,7 +79,7 @@ class Controller:
         if any(s.pv_kwp > 0 for s in settings.active_systems()) and settings.site.latitude is None:
             reasons.append('Set your home location (Settings › Home & tariff) so weather forecasts can be fetched')
         elif any(s.pv_kwp > 0 for s in settings.active_systems()) and settings.site.weather_enabled:
-            age = freshness_hours(self.db)
+            age = freshness_hours(self.db, now)
             if age is None or age > 6:
                 reasons.append('Weather forecast is missing or stale')
         return reasons

@@ -71,7 +71,7 @@ class DraftContext(Context):
         self._state[key] = value
 
     def recall(self, key, default=None):
-        return self._state.get(key, super().recall(key, default))
+        return self._state.get(key, default)
 
     def record_raw(self, payload):
         return None
@@ -189,7 +189,10 @@ def _validate(r: SystemReading):
 
 def _message(error: Exception) -> str:
     """A short, credential-free error description."""
+    from pydantic import ValidationError
     from .plugins.base import PluginError
+    if isinstance(error, ValidationError):
+        return 'Invalid connection settings. Check the values in the connection form.'
     if isinstance(error, (PluginError, ValueError, NotImplementedError)):
         return str(error)[:200]
     return f'{type(error).__name__} (details withheld)'

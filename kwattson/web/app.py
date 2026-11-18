@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import fcntl
 import logging
+import os
 import secrets
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -63,6 +64,12 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
     runtime = runtime or Runtime()
     db = Database(runtime.data_dir / 'kwattson.sqlite3', demo=runtime.demo)
     security = Security(db, runtime)
+    if not runtime.demo and not security.owner_exists():
+        password_file = os.getenv('INITIAL_ADMIN_PASSWORD_FILE')
+        password = (Path(password_file).read_text().rstrip('\r\n') if password_file
+                    else os.getenv('INITIAL_ADMIN_PASSWORD'))
+        if password:
+            security.create_owner('admin', password)
     engine = Engine(db, security, runtime)
     if runtime.demo:
         from ..demo import seed

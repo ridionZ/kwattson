@@ -181,7 +181,7 @@ function ControlCard({ onEnable }: { onEnable: () => void }) {
       {guards.length > 0 && (
         <Alert severity={auto ? 'warning' : 'info'} sx={{ mt: 2 }}>
           <strong>{auto ? 'Paused because:' : 'Before it can run:'}</strong>
-          <Box component="ul" sx={{ m: 0, pl: 2.5 }}>{guards.map((g) => <li key={g}>{g}</li>)}</Box>
+          <Box component="ul" sx={{ m: 0, pl: 2.5 }}>{guards.map((g) => <li key={g}>{g.includes('commissioned') ? 'Complete the checklist under Turn on to commission these system settings.' : g}{/weather/i.test(g) && <Button size="small" href="#/settings/home/location">Check weather</Button>}</li>)}</Box>
         </Alert>
       )}
     </Section>
@@ -192,7 +192,7 @@ const PHRASE = 'ENABLE BATTERY CONTROL';
 const CHECKLIST = [
   'The inverter’s own app shows the same battery level and power as kWattson.',
   'I know how to put the inverter back into self-use from its own app.',
-  'The battery reserve and grid limits in kWattson match the real system.',
+  'I checked the minimum battery level against the inverter and the grid limits against my connection agreement. The planner subtracts house demand before calculating export.',
   'I’ve watched at least a day of plans in monitoring mode and they make sense.',
 ];
 
@@ -273,7 +273,7 @@ function fromDraft(d: Draft, enabled: boolean) {
   };
 }
 
-const STEPS = ['Choose a source', 'Hardware limits', 'Connection', 'Review & save'];
+const STEPS = ['Choose a source', 'Connection', 'Hardware limits', 'Review & save'];
 
 function SystemWizard({ editId, onClose }: { editId?: string; onClose: () => void }) {
   const { doc, reload } = useSettings();
@@ -286,10 +286,11 @@ function SystemWizard({ editId, onClose }: { editId?: string; onClose: () => voi
   const [step, setStep] = useState(editId ? 1 : 0);
   const [draft, setDraft] = useState<Draft>(() => existing ? toDraft(existing) : {
     id: '', name: '', plugin: '', plugin_config: {}, enabled: true, coupling: 'dc', ac_kw: '', pv_kwp: '', pv_dc_max_kw: '', hasBattery: true,
-    capacity_kwh: '', charge_kw: '', discharge_kw: '', reserve_pct: '15', site_meter: !(doc.settings.systems as any[]).some((s) => s.site_meter), controllable: false, battery_extra: {},
+    capacity_kwh: '', charge_kw: '', discharge_kw: '', reserve_pct: '', site_meter: !(doc.settings.systems as any[]).some((s) => s.site_meter), controllable: false, battery_extra: {},
   });
   const [secrets, setSecrets] = useState<Record<string, string>>({});
   const [tested, setTested] = useState<'ok' | 'skipped' | null>(editId ? 'skipped' : null);
+  const [reported, setReported] = useState<Partial<Pick<Draft, 'ac_kw' | 'reserve_pct'>>>({});
   const [testMsg, setTestMsg] = useState<{ ok: boolean; text: string } | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -297,18 +298,27 @@ function SystemWizard({ editId, onClose }: { editId?: string; onClose: () => voi
   const plugin = plugins.find((p) => p.name === draft.plugin);
   const configured = !editId ? [] : doc.configured_secrets[`system:${draft.id}`] ?? [];
   function resetTest() {
+    setReported({});
     setTested(null);
     setTestMsg(null);
     setError(null);
   }
   function set(patch: Partial<Draft>) {
-    resetTest();
+    if (step < 2) resetTest();
+    // Once an owner edits a discovered rating, the field stays fully editable, including blank.
+    if ('ac_kw' in patch || 'reserve_pct' in patch) {
+      setReported(previous => ({ ...previous, ...('ac_kw' in patch ? { ac_kw: undefined } : {}), ...('reserve_pct' in patch ? { reserve_pct: undefined } : {}) }));
+    }
     setDraft((previous) => ({ ...previous, ...patch }));
   }
 
+  const discoverySummary = [reported.ac_kw && ('an inverter rating of ' + reported.ac_kw + ' kW'),
+    reported.reserve_pct && ('a grid-connected reserve of ' + reported.reserve_pct + '%')].filter(Boolean).join(' and ');
+  const hardwareDraft = { ...draft, ac_kw: draft.ac_kw || reported.ac_kw || '', reserve_pct: draft.reserve_pct || reported.reserve_pct || '' };
+
   function stepError(i: number, requireTest = true): string | null {
     if (i === 0) return draft.plugin ? null : 'Choose what you’re connecting.';
-    if (i === 2) {
+    if (i === 1) {
       if (!draft.name.trim()) return 'Give the system a name.';
       if (!editId && taken.has(draft.id)) return 'A system with this name already exists. Choose another name.';
       const missingField = plugin?.config_schema?.required?.find((key: string) => draft.plugin_config[key] == null || draft.plugin_config[key] === '');
@@ -317,30 +327,36 @@ function SystemWizard({ editId, onClose }: { editId?: string; onClose: () => voi
       if (missing.length) return `Enter ${missing.map((m: any) => m.label).join(', ')}.`;
       if (requireTest && draft.plugin !== 'push' && !tested) return 'Test the connection, or choose “Skip test” to carry on without it.';
     }
-    if (i === 1) {
+    if (i === 2) {
       const n = (v: string) => Number(v);
-      if (!(n(draft.ac_kw) > 0 && n(draft.ac_kw) <= 100)) return 'Inverter limit must be between 0 and 100 kW.';
+      if (!(n(hardwareDraft.ac_kw) > 0 && n(hardwareDraft.ac_kw) <= 100)) return 'Inverter limit must be between 0 and 100 kW.';
       if (draft.pv_kwp === '' || n(draft.pv_kwp) < 0 || n(draft.pv_kwp) > 200) return 'Panels must be between 0 and 200 kWp.';
       if (draft.pv_dc_max_kw && !(n(draft.pv_dc_max_kw) > 0 && n(draft.pv_dc_max_kw) <= 200)) return 'Max PV DC must be above 0 and at most 200 kW.';
       if (n(draft.capacity_kwh) > 500 && draft.hasBattery) return 'Battery capacity must be at most 500 kWh.';
       if (draft.hasBattery && (n(draft.charge_kw) > 100 || n(draft.discharge_kw) > 100)) return 'Charge and discharge limits must be at most 100 kW.';
       if (draft.site_meter && draft.enabled && doc.settings.systems.some((s: any) => s.id !== editId && s.enabled && s.site_meter)) return 'Another system already measures the whole house. Turn this switch off.';
       if (draft.hasBattery && !(n(draft.capacity_kwh) > 0.5 && n(draft.charge_kw) > 0 && n(draft.discharge_kw) > 0)) return 'Enter the battery size and its charge and discharge limits.';
-      if (draft.hasBattery && draft.reserve_pct === '') return 'Enter the battery reserve.';
-      if (draft.hasBattery && !(n(draft.reserve_pct) >= 0 && n(draft.reserve_pct) <= 90)) return 'Reserve must be between 0 and 90%.';
+      if (draft.hasBattery && hardwareDraft.reserve_pct === '') return 'Enter the battery reserve.';
+      if (draft.hasBattery && !(n(hardwareDraft.reserve_pct) >= 0 && n(hardwareDraft.reserve_pct) <= 90)) return 'Reserve must be between 0 and 90%.';
     }
     return null;
   }
 
   async function runTest() {
-    const connectionError = stepError(2, false);
+    const connectionError = stepError(1, false);
     if (connectionError) { setError(connectionError); return; }
     setBusy(true);
     resetTest();
     try {
       // Tests the unsaved config; nothing is written. Blank secrets fall back to stored ones.
       const values = Object.fromEntries(Object.entries(secrets).filter(([, v]) => v.trim() !== ''));
-      const r = await post('/api/test-draft/system', { spec: fromDraft(draft, true), secrets: values });
+      const spec = { id: draft.id, name: draft.name.trim(), plugin: draft.plugin, plugin_config: draft.plugin_config };
+      const r = await post('/api/test-draft/system', { spec, secrets: values });
+      const hw = r.hardware ?? {};
+      setReported({
+        ...(typeof hw.ac_kw === 'number' ? { ac_kw: String(hw.ac_kw) } : {}),
+        ...(typeof hw.reserve_pct === 'number' ? { reserve_pct: String(hw.reserve_pct) } : {}),
+      });
       const reading = r?.reading ?? r;
       const soc = reading?.soc;
       setTested('ok');
@@ -356,7 +372,7 @@ function SystemWizard({ editId, onClose }: { editId?: string; onClose: () => voi
     setBusy(true);
     setError(null);
     try {
-      await put('/api/devices/system', { spec: fromDraft(draft, draft.enabled), secrets, original: existing ?? null });
+      await put('/api/devices/system', { spec: fromDraft(hardwareDraft, draft.enabled), secrets, original: existing ?? null });
       await reload();
       toast(editId ? `${draft.name} saved.` : `${draft.name} added. kWattson will start reading it on its next poll.`);
       onClose();
@@ -405,7 +421,7 @@ function SystemWizard({ editId, onClose }: { editId?: string; onClose: () => voi
         })}
       </Box>
     ),
-    2: plugin && (
+    1: plugin && (
       <Box sx={{ display: 'grid', gap: 2 }}>
         <TextField label="Name" value={draft.name} required autoFocus={!editId}
           onChange={(e) => set({ name: e.target.value, ...(editId ? {} : { id: slug(e.target.value) }) })}
@@ -432,10 +448,10 @@ function SystemWizard({ editId, onClose }: { editId?: string; onClose: () => voi
         </Box>}
       </Box>
     ),
-    1: (
+    2: (
       <Box sx={{ display: 'grid', gap: 2, gridTemplateColumns: { xs: '1fr', sm: '1fr 1fr' } }}>
-        <Typography variant="body2" color="text.secondary" sx={{ gridColumn: '1 / -1' }}>Use the ratings on your inverter and battery, or ask your installer. For a solar-only system, turn off “Has a battery”.</Typography>
-        <Num label="Inverter AC limit" unit="kW" value={draft.ac_kw} onChange={(v) => set({ ac_kw: v })} required help="The most AC power the inverter can output. Solar above this is clipped unless a DC-coupled battery soaks it up." />
+        <Typography variant="body2" color="text.secondary" sx={{ gridColumn: '1 / -1' }}>{discoverySummary ? 'The connection reported ' + discoverySummary + '. Check the values below.' : 'Enter the ratings from your inverter and battery.'} For a solar-only system, turn off “Has a battery”.</Typography>
+        <Num label="Inverter AC limit" unit="kW" value={hardwareDraft.ac_kw} onChange={(v) => set({ ac_kw: v })} required help="The most AC power the inverter can output. Solar above this is clipped unless a DC-coupled battery soaks it up." />
         <Num label="Panels" unit="kWp" value={draft.pv_kwp} required onChange={(v) => set({ pv_kwp: v })} help="Nameplate size of the solar array on this inverter. Use 0 for a battery-only inverter." />
         <Num label="Max PV DC" unit="kW" value={draft.pv_dc_max_kw} onChange={(v) => set({ pv_dc_max_kw: v })} help="The most DC solar power the inverter accepts. Leave blank if you don’t know." />
         <TextField select label="Coupling" value={draft.coupling} onChange={(e) => set({ coupling: e.target.value as 'dc' | 'ac' })}
@@ -451,7 +467,7 @@ function SystemWizard({ editId, onClose }: { editId?: string; onClose: () => voi
         </Box>
         {draft.hasBattery && <>
           <Num label="Battery capacity" unit="kWh" value={draft.capacity_kwh} onChange={(v) => set({ capacity_kwh: v })} required help="Usable capacity, as the inverter reports it." />
-          <Num label="Reserve" unit="%" value={draft.reserve_pct} onChange={(v) => set({ reserve_pct: v })} help="The plan never takes the battery below this. Keep some for blackouts." />
+          <Num label="Reserve" unit="%" value={hardwareDraft.reserve_pct} onChange={(v) => set({ reserve_pct: v })} help="The plan never takes the battery below this. Keep some for blackouts." />
           <Num label="Charge limit" unit="kW" value={draft.charge_kw} onChange={(v) => set({ charge_kw: v })} required />
           <Num label="Discharge limit" unit="kW" value={draft.discharge_kw} onChange={(v) => set({ discharge_kw: v })} required />
         </>}
@@ -473,9 +489,9 @@ function SystemWizard({ editId, onClose }: { editId?: string; onClose: () => voi
           ['Type', plugin?.title ?? draft.plugin],
           ['Name', draft.name],
           ['Connection', tested === 'ok' ? 'Tested and working' : draft.plugin === 'push' && !editId ? 'Waiting for the first push' : 'Not tested'],
-          ['Inverter', `${f.kw(Number(draft.ac_kw))} AC · ${draft.coupling.toUpperCase()} coupled`],
+          ['Inverter', `${f.kw(Number(hardwareDraft.ac_kw))} AC · ${draft.coupling.toUpperCase()} coupled`],
           ['Panels', `${f.n(Number(draft.pv_kwp || 0))} kWp${draft.pv_dc_max_kw ? ` · max DC ${f.kw(Number(draft.pv_dc_max_kw))}` : ''}`],
-          ['Battery', draft.hasBattery ? `${f.kwh(Number(draft.capacity_kwh))}, ${f.kw(Number(draft.charge_kw))} in / ${f.kw(Number(draft.discharge_kw))} out, reserve ${f.pct(Number(draft.reserve_pct))}` : 'None'],
+          ['Battery', draft.hasBattery ? `${f.kwh(Number(draft.capacity_kwh))}, ${f.kw(Number(draft.charge_kw))} in / ${f.kw(Number(draft.discharge_kw))} out, reserve ${f.pct(Number(hardwareDraft.reserve_pct))}` : 'None'],
           ['Whole-house meter', draft.site_meter ? 'Yes' : 'No'],
         ]} />
         <Alert severity="info" variant="outlined" sx={{ mt: 2 }}>{draft.controllable ? 'This system allows battery commands when automatic control is on.' : 'This system will be monitored. Battery commands are disabled for it.'}</Alert>
@@ -493,8 +509,8 @@ function SystemWizard({ editId, onClose }: { editId?: string; onClose: () => voi
       <Box sx={{ px: 3, pb: 2 }}>
         {editId ? (
           <Tabs value={step} onChange={(_, v) => { if (busy) return; setError(null); setStep(v); }} aria-label="Edit sections">
-            <Tab value={1} label="Hardware limits" id="etab-1" aria-controls="epanel" />
-            <Tab value={2} label="Connection" id="etab-2" aria-controls="epanel" />
+            <Tab value={1} label="Connection" id="etab-1" aria-controls="epanel" />
+            <Tab value={2} label="Hardware limits" id="etab-2" aria-controls="epanel" />
             <Tab value={3} label="Review" id="etab-3" aria-controls="epanel" />
           </Tabs>
         ) : (

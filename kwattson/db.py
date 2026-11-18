@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -131,9 +132,29 @@ class Database:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         with self.connect() as c:
-            c.executescript(SCHEMA)
             c.execute('BEGIN IMMEDIATE')
-            row = c.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+            has_meta = c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'").fetchone()
+            row = c.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone() if has_meta else None
+            if row:
+                version = int(row['value'])
+                if version > SCHEMA_VERSION:
+                    raise RuntimeError('Database was created by a newer version of this app')
+                if version < SCHEMA_VERSION:
+                    # A second connection can snapshot the committed WAL under our writer lock.
+                    with tempfile.NamedTemporaryFile(dir=self.path.parent, prefix='.migration-', delete=False) as tmp:
+                        snapshot = Path(tmp.name)
+                    try:
+                        self.backup(snapshot)
+                        snapshot.replace(self.path.with_suffix(f'.before-v{version}-to-v{SCHEMA_VERSION}.sqlite3'))
+                    finally:
+                        snapshot.unlink(missing_ok=True)
+            statement = ''
+            for line in SCHEMA.splitlines(keepends=True):
+                statement += line
+                if sqlite3.complete_statement(statement):
+                    c.execute(statement)
+                    statement = ''
+
             if demo is not None:
                 marker = c.execute("SELECT value FROM meta WHERE key='demo_mode'").fetchone()
                 legacy_demo = c.execute("SELECT 1 FROM meta WHERE key='demo_seeded'").fetchone()
@@ -144,10 +165,8 @@ class Database:
                 c.execute("INSERT INTO meta VALUES('schema_version', ?)", (str(SCHEMA_VERSION),))
                 if DEFAULT_EXCLUSIONS:
                     c.executemany('INSERT INTO exclusions(start, end, reason) VALUES(?,?,?)', DEFAULT_EXCLUSIONS)
-            elif int(row['value']) > SCHEMA_VERSION:
-                raise RuntimeError('Database was created by a newer version of this app')
-            else:
-                migrate(c, int(row['value']))
+            elif version < SCHEMA_VERSION:
+                migrate(c, version)
             c.execute('INSERT OR IGNORE INTO settings VALUES(1, ?, ?)', (encode(Settings().model_dump()), stamp()))
         os.chmod(self.path, 0o600)
 

@@ -127,6 +127,7 @@ acme = "kwattson_acme:AcmeInverter"
 - Leave unknown values as `None` — never guess zeros.
 - Raise `PluginError("short owner-friendly message")` for expected failures. Messages are shown in
   the UI and logs, so **never include tokens, passwords or full URLs** in them.
+- A system connection test can return a `hardware` object beside `reading`. The wizard reads optional numeric `ac_kw` (inverter AC rating) and `reserve_pct` (on-grid battery reserve). Return only device-reported values. Missing values stay editable.
 - `read()` must not change device settings. It may be called every 1–5 minutes; respect vendor rate
   limits (see `foxess.py` for a shared lock + minimum interval).
 - Use `self.context.remember/recall` for small non-secret state (e.g. a discovered serial).

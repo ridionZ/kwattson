@@ -30,8 +30,8 @@ With this command each new container starts with a fresh sample house.
 ## Set up your own home
 
 1. Follow the Docker deployment guide to create a separate data volume and HTTPS address. [Installation guide](deploy/UNRAID.md)
-2. Run `docker exec kwattson kwattson setup-token`. Open your installation, paste the token and create your admin account.
-3. On **Overview**, choose **Set location** for weather and **Set prices** for your electricity plan.
+2. On Unraid, enter **First admin password** during installation, then sign in as **admin**. Docker also accepts `INITIAL_ADMIN_PASSWORD_FILE` pointing to a mounted secret. If you leave both options blank, run `docker exec kwattson kwattson setup-token` to claim the installation.
+3. On **Overview**, choose **Set location** to search an address or suburb, confirm the time zone and test the hourly forecast. Under **Set prices**, edit the example flat rate or add a dated plan.
    Enter flat rates in cents from your bill, or import a tariff file. Activate the plan from the date your retailer confirmed.
 4. Choose **Add a system**. Select how to read your inverter, enter its ratings, test the connection and review it before saving.
    You can add an EV under **Settings → Vehicles** and enable two-step sign-in under **My account**.
@@ -86,7 +86,8 @@ The history records readings and planning decisions so you can compare forecasts
 - One-tap buttons for "going away", "storm coming" (keep the battery full) and "charge the car now".
 - Alerts by phone app, email or chat (ntfy, Telegram, Pushover, Discord, Home Assistant or email),
   and you choose which ones you get.
-- Step-by-step setup for your solar system, battery and car.
+- Connect your inverter first. FoxESS can fill in its AC rating and grid-connected reserve. Review those values and enter any remaining hardware limits.
+- Overview shows local weather and estimated solar energy for the next hour and the rest of today. In **History → Forecast accuracy**, choose a saved run to compare predicted and measured generation, electricity use and battery level. Comparisons start with the first completed half-hours.
 - Several people in the house can have their own login, with different levels of access.
 - Works with Home Assistant, including an optional automation that pre-cools or pre-heats the
   house when power is cheap.

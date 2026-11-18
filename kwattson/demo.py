@@ -92,4 +92,17 @@ def seed(db: Database, security, days: int = 21):
                       [(r[0], 'main', 'simulator', r[1], r[4], r[8], r[9], None, r[6], r[7], r[5], None, 'simulated', 0, 1, '{}', r[16]) for r in rows])
         c.executemany('INSERT OR REPLACE INTO weather_hours VALUES(?,?,?,?,?,?,?)', weather)
         rebuild_intervals(c, start, end)
+    # Show both a completed forecast and a partial one when someone first opens the demo.
+    from . import forecast, optimizer
+    for age in (30, 3):
+        at = end - timedelta(hours=age)
+        run, points, model = forecast.build(db, settings, now=at)
+        reading = db.one('SELECT stored_kwh FROM site_readings WHERE ts<=? ORDER BY ts DESC LIMIT 1', (stamp(at),))
+        if reading:
+            optimizer.plan(db, settings, run, points, model, now=at, initial={system.id: reading['stored_kwh']})
+    forecast.evaluate(db, end)
+    from .notifications import Notifications
+    Notifications(db, security).emit('integration_restored', {
+        'system': system.name, 'reason': 'Simulated meter readings are available in Live power.',
+    }, key='demo-first-reading', now=end)
     db.set_meta('demo_seeded', stamp())

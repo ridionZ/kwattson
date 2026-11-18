@@ -101,7 +101,7 @@ export function Setup({ onDone }: { onDone: () => void }) {
         <Box component="p" sx={{ m: 0, mb: 3 }}><Wordmark size={26} /><Box component="span" sx={{ position: 'absolute', width: '1px', height: '1px', overflow: 'hidden', clipPath: 'inset(50%)' }}>kWattson</Box></Box>
         <Typography variant="h1" sx={{ fontSize: '1.5rem', mb: 0.5 }}>Welcome to kWattson</Typography>
         <Typography variant="body2" color="text.secondary" sx={{ mb: 3 }}>
-          Create the first account. It can manage everything, including adding other people later.
+          Create the first admin account. On Unraid you can also set First admin password in the container settings, then sign in as admin.
         </Typography>
         <Box component="form" onSubmit={submit} sx={{ display: 'grid', gap: 2 }}>
           <TextField label="Setup token" name="token" required value={token} autoFocus autoComplete="off"

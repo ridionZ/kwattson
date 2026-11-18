@@ -33,11 +33,12 @@ from statistics import median
 import numpy as np
 
 from .config import Settings, stamp, utcnow
+from .weather import freshness_hours
 from .db import Database, decode, encode
 from .ingest import select_intervals
 
-LOAD_VERSION = 'profile-temperature-v1'
-SOLAR_VERSION = 'hourly-ratio-v1'
+LOAD_VERSION = 'profile-temperature-v2'
+SOLAR_VERSION = 'hourly-ratio-v2'
 VERSION = f'{LOAD_VERSION}+{SOLAR_VERSION}'
 COLD_START_SHAPE = [.45, .35, .3, .3, .3, .35, .75, 1.15, .85, .65, .55, .6, .65, .65, .65, .7, .9, 1.25, 1.6, 1.5, 1.1, .85, .65, .5]
 
@@ -280,9 +281,9 @@ def build(db: Database, settings: Settings, now: datetime | None = None) -> tupl
     load_params = fit_load(db, settings, now)
     solar_params = fit_solar(db, settings, now)
     weather = _weather(db, now, horizon)
-    newest = db.one('SELECT MAX(fetched_at) AS at FROM weather_hours')
-    weather_age = (now - datetime.fromisoformat(newest['at'])).total_seconds() / 3600 if newest and newest['at'] else None
-    weather_ok = weather_age is not None and weather_age <= 6
+    weather_age = freshness_hours(db, now)
+    use_weather = settings.site.weather_enabled or db.meta('demo_mode', False)
+    weather_ok = use_weather and weather_age is not None and 0 <= weather_age <= 6
     holidays = db.rows('SELECT * FROM holidays WHERE end>? AND start<?', (stamp(now), stamp(horizon)))
     overrides = [{**o, 'data': decode(o['data'])} for o in
                  db.rows('SELECT * FROM overrides WHERE cancelled_at IS NULL AND expires>? AND starts<=?', (stamp(now), stamp(now)))]
@@ -363,6 +364,57 @@ def build(db: Database, settings: Settings, now: datetime | None = None) -> tupl
     return forecast_id, points, model
 
 
+def _elapsed_slots(db: Database, forecast_id: int, now: datetime):
+    """Pair each completed, aligned half-hour with its best available observation."""
+    points = db.rows('SELECT * FROM forecast_points WHERE forecast_id=? AND lead_minutes<1440 ORDER BY ts', (forecast_id,))
+    if points:
+        end = min(now, datetime.fromisoformat(points[-1]['ts']) + timedelta(hours=points[-1]['hours']))
+        actual = {r['ts']: r for r in select_intervals(db, points[0]['ts'], stamp(end))}
+    else:
+        actual = {}
+    for p in points:
+        start = datetime.fromisoformat(p['ts'])
+        end = start + timedelta(hours=p['hours'])
+        if end <= now and p['hours'] == 0.5:
+            observation = actual.get(p['ts'])
+            yield p, end, observation if observation and observation['coverage_s'] >= 1500 else None
+
+
+def comparison(db: Database, forecast_id: int, now: datetime) -> dict:
+    decision = db.one('SELECT id, mode, summary FROM decisions WHERE forecast_id=? ORDER BY id LIMIT 1', (forecast_id,))
+    planned = {}
+    if decision and decode(decision['summary']).get('initial_soc_pct') is not None:
+        planned = {r['ts']: r['soc_pct'] for r in db.rows(
+            'SELECT ts, soc_pct FROM decision_intervals WHERE decision_id=?', (decision['id'],))}
+    points = []
+    for p, end, actual in _elapsed_slots(db, forecast_id, now):
+        points.append(dict(end=stamp(end), forecast_solar=p['solar_kwh'], actual_solar=actual['solar_kwh'] if actual else None,
+                           forecast_load=p['house_kwh'] + p['ev_kwh'], actual_load=actual['load_kwh'] if actual else None,
+                           planned_soc=planned.get(p['ts']), actual_soc=actual['soc_end'] if actual else None))
+    return dict(forecast_id=forecast_id, mode=decision['mode'] if decision else None, points=points)
+
+
+def score_run(db: Database, forecast_id: int, now: datetime) -> dict:
+    house, solar = [], []
+    for p, _, a in _elapsed_slots(db, forecast_id, now):
+        if not a:
+            continue
+        house.append(((a['load_kwh'] - a['ev_kwh']), p['house_kwh'], p['house_p10'], p['house_p90']))
+        if a['limited_s'] < 60:
+            solar.append((a['solar_kwh'], p['solar_kwh']))
+    metrics = dict(samples=len(house), solar_samples=len(solar))
+    if house:
+        err = np.array([a - f for a, f, _, _ in house])
+        metrics.update(house_mae_kwh=float(np.abs(err).mean()), house_bias_kwh=float(err.mean()),
+                       house_actual_kwh=float(sum(a for a, *_ in house)), house_forecast_kwh=float(sum(f for _, f, *_ in house)),
+                       band_coverage=float(np.mean([lo <= a <= hi for a, _, lo, hi in house])))
+    if solar:
+        err = np.array([a - f for a, f in solar])
+        metrics.update(solar_mae_kwh=float(np.abs(err).mean()), solar_bias_kwh=float(err.mean()),
+                       solar_actual_kwh=float(sum(a for a, _ in solar)), solar_forecast_kwh=float(sum(f for _, f in solar)))
+    return metrics
+
+
 def evaluate(db: Database, now: datetime | None = None) -> int:
     """Score forecasts whose first 24 hours have passed against observed intervals."""
     now = now or utcnow()
@@ -370,26 +422,28 @@ def evaluate(db: Database, now: datetime | None = None) -> int:
                       'WHERE e.forecast_id IS NULL AND f.created_at<? ORDER BY f.id LIMIT 50', (stamp(now - timedelta(hours=25)),))
     done = 0
     for f in pending:
-        points = db.rows('SELECT * FROM forecast_points WHERE forecast_id=? AND lead_minutes<1440', (f['id'],))
-        actual = {r['ts']: r for r in select_intervals(db, points[0]['ts'], stamp(now))} if points else {}
-        house, solar = [], []
-        for p in points:
-            a = actual.get(p['ts'])
-            if not a or a['coverage_s'] < 1500 or p['hours'] < 0.49:
-                continue
-            house.append(((a['load_kwh'] - a['ev_kwh']), p['house_kwh'], p['house_p10'], p['house_p90']))
-            if a['limited_s'] < 60:
-                solar.append((a['solar_kwh'], p['solar_kwh']))
-        metrics = dict(samples=len(house), solar_samples=len(solar))
-        if house:
-            err = np.array([a - f for a, f, _, _ in house])
-            metrics.update(house_mae_kwh=float(np.abs(err).mean()), house_bias_kwh=float(err.mean()),
-                           house_actual_kwh=float(sum(a for a, *_ in house)), house_forecast_kwh=float(sum(f for _, f, *_ in house)),
-                           band_coverage=float(np.mean([lo <= a <= hi for a, _, lo, hi in house])))
-        if solar:
-            err = np.array([a - f for a, f in solar])
-            metrics.update(solar_mae_kwh=float(np.abs(err).mean()), solar_bias_kwh=float(err.mean()),
-                           solar_actual_kwh=float(sum(a for a, _ in solar)), solar_forecast_kwh=float(sum(f for _, f in solar)))
+        metrics = score_run(db, f['id'], now)
         db.execute('INSERT OR REPLACE INTO evaluations VALUES(?,?,?)', (f['id'], stamp(now), encode(metrics)))
         done += 1
     return done
+
+
+def solar_snapshot(db: Database, settings: Settings, now: datetime) -> dict:
+    run = db.one('SELECT id, created_at FROM forecasts ORDER BY id DESC LIMIT 1')
+    if not run or run['created_at'] < db.meta('location_changed_at', ''):
+        return {}
+    if datetime.fromisoformat(run['created_at']) < now - timedelta(hours=1):
+        return {}
+    points = db.rows('SELECT ts, hours, solar_kwh FROM forecast_points WHERE forecast_id=? ORDER BY ts', (run['id'],))
+    midnight = (now.astimezone(settings.zone) + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    def estimate(until):
+        seconds = energy = 0.0
+        for point in points:
+            start = datetime.fromisoformat(point['ts'])
+            duration = timedelta(hours=point['hours'])
+            overlap = (min(start + duration, until) - max(start, now)).total_seconds()
+            if overlap > 0:
+                energy += point['solar_kwh'] * overlap / duration.total_seconds()
+                seconds += overlap
+        return round(energy, 2) if abs(seconds - (until - now).total_seconds()) < 1 else None
+    return dict(created_at=run['created_at'], next_hour=estimate(now + timedelta(hours=1)), rest_today=estimate(midnight))

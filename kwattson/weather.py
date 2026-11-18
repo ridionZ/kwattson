@@ -50,6 +50,9 @@ async def refresh(db: Database, settings: Settings) -> int:
         return 0  # no location set yet: forecasts fall back to a cautious clear-sky shape
     data = await _get(FORECAST_URL, {'latitude': settings.site.latitude, 'longitude': settings.site.longitude,
                                      'hourly': HOURLY, 'forecast_days': 4, 'past_days': 2, 'timezone': 'UTC'})
+    current = db.settings().site
+    if (current.latitude, current.longitude) != (settings.site.latitude, settings.site.longitude):
+        return 0
     return store_hourly(db, data)
 
 
@@ -62,8 +65,35 @@ async def backfill(db: Database, settings: Settings, start_day: str, end_day: st
     return store_hourly(db, data, fetched=utcnow())
 
 
-def freshness_hours(db: Database) -> float | None:
-    row = db.one('SELECT MAX(fetched_at) AS at FROM weather_hours')
-    if not row or not row['at']:
+def current_hour(db: Database, now: datetime):
+    return db.one('SELECT ts, temperature, cloud_cover, fetched_at FROM weather_hours WHERE ts=?',
+                  (stamp(now.replace(minute=0, second=0, microsecond=0)),))
+
+
+def freshness_hours(db: Database, now: datetime | None = None) -> float | None:
+    now = now or utcnow()
+    row = current_hour(db, now)
+    if not row:
         return None
-    return (utcnow() - datetime.fromisoformat(row['at'])).total_seconds() / 3600
+    return (now - datetime.fromisoformat(row['fetched_at'])).total_seconds() / 3600
+
+
+async def addresses(query: str) -> list[dict]:
+    data = await _get('https://photon.komoot.io/api/', {'q': query, 'limit': 5})
+    matches = []
+    for feature in data['features']:
+        props = feature['properties']
+        lon, lat = feature['geometry']['coordinates']
+        street = ' '.join(filter(None, (props.get('housenumber'), props.get('street'))))
+        labels = dict.fromkeys(filter(None, (props.get('name'), street, props.get('city'), props.get('state'),
+                                             props.get('postcode'), props.get('country'))))
+        if labels and -90 <= lat <= 90 and -180 <= lon <= 180:
+            matches.append(dict(label=', '.join(labels), latitude=lat, longitude=lon))
+    return matches
+
+
+async def timezone_at(latitude: float, longitude: float) -> str:
+    from zoneinfo import ZoneInfo
+    data = await _get(FORECAST_URL, {'latitude': latitude, 'longitude': longitude, 'timezone': 'auto',
+                                     'forecast_days': 1, 'daily': 'temperature_2m_max'})
+    return ZoneInfo(data['timezone']).key

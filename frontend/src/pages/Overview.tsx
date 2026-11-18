@@ -77,6 +77,19 @@ export default function Overview() {
           {setupNeeded && (can('admin') || !hasSystems) && <GetStarted st={st} hasSystems={hasSystems} />}
           {hasSystems && <RightNow st={st} now={now} />}
           {hasSystems && <LivePower st={st} now={now} />}
+          {hasSystems && <Section title="Weather & solar outlook">
+            <Facts rows={[
+              ['This hour’s temperature', st.weather?.temperature != null ? f.n(st.weather.temperature, 1) + ' °C' : 'Unavailable'],
+              ['Cloud cover', f.pct(st.weather?.cloud_cover)],
+              ['Estimated solar · next hour', f.kwh(st.solar_estimate?.next_hour)],
+              ['Estimated solar · until midnight', f.kwh(st.solar_estimate?.rest_today)],
+            ]} />
+            <Typography component="p" variant="caption" color="text.secondary" sx={{ mt: 1 }}>
+              {st.weather && (st.demo ? 'Simulated weather' : 'Weather by Open-Meteo') + ' · updated ' + f.relative(st.weather.fetched_at) + '. '}
+              {st.solar_estimate?.created_at && 'Solar forecast made ' + f.relative(st.solar_estimate.created_at) + '.'}
+            </Typography>
+            {can('admin') && !st.weather && <Button href="#/settings/home/location">Configure weather</Button>}
+          </Section>}
           {hasSystems && <Today st={st} />}
           {hasSystems && <Advice st={st} />}
         </Grid>
@@ -98,7 +111,7 @@ export default function Overview() {
         </Grid>
       </Grid>
       <Typography variant="caption" color="text.secondary" component="p" sx={{ mt: 3 }}>
-        Updated {f.time(st.server_time)} ({f.getZone().replace('_', ' ')} time). Refreshes every minute.
+        Updated {f.time(st.server_time)} ({f.getZone().replace('_', ' ')} time). Checks for new readings every 30 seconds.
       </Typography>
     </Box>
   );

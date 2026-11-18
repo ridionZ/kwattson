@@ -16,7 +16,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from .. import __version__, exports, outcomes
+from .. import __version__, exports, forecast, outcomes, weather
 from ..devices import DEMO_PLUGINS, check_demo_plugin
 from ..config import EnergySystem, Vehicle, Settings, stamp, utcnow
 from ..control import commissioning_hash
@@ -333,6 +333,8 @@ async def status(request: Request):
         'battery_kwh': settings.battery_kwh(), 'battery_reserve_pct': _reserve_pct(settings),
         'using_example_tariff': plan_at(settings.tariffs, now) == default_tariffs()[0],
         'weather_enabled': settings.site.weather_enabled,
+        'weather': weather.current_hour(db, now) if settings.site.weather_enabled or runtime.demo else None,
+        'solar_estimate': forecast.solar_snapshot(db, settings, now) if systems else {},
         'site_located': settings.site.latitude is not None and settings.site.longitude is not None,
         'tariff_today': _tariff_today(settings, now)}
 
@@ -451,9 +453,38 @@ async def accuracy(request: Request, limit: int = 200):
                    'ORDER BY e.forecast_id DESC LIMIT ?', (max(1, min(limit, 2000)),))
     params = {r['name']: dict(version=r['version'], fitted_at=r['fitted_at'], data=decode(r['data'])) for r in db.rows('SELECT * FROM model_params')}
     load = params.get('load', {}).get('data', {})
-    return {'evaluations': [dict(forecast_id=r['forecast_id'], created_at=r['created_at'], **decode(r['metrics'])) for r in rows][::-1],
+    now = utcnow()
+    recent = db.one('SELECT id, created_at FROM forecasts WHERE created_at>=? AND created_at<=? ORDER BY id LIMIT 1',
+                    (stamp(now - timedelta(days=1)), stamp(now - timedelta(minutes=30))))
+    provisional = None
+    if recent:
+        metrics = forecast.score_run(db, recent['id'], now)
+        if metrics['samples']:
+            provisional = dict(created_at=recent['created_at'], **metrics)
+    return {'provisional': provisional, 'evaluations': [dict(forecast_id=r['forecast_id'], created_at=r['created_at'], **decode(r['metrics'])) for r in rows][::-1],
             'load_model': {k: v for k, v in load.items() if k not in ('counts', 'bands')},
             'solar_model': params.get('solar', {}).get('data')}
+
+
+@router.get('/forecast/comparison')
+def forecast_comparison(request: Request, run_id: int | None = None):
+    db, *_ = ctx(request)
+    now = utcnow()
+    available = ('SELECT id, created_at FROM forecasts f WHERE EXISTS '
+                 '(SELECT 1 FROM forecast_points p WHERE p.forecast_id=f.id)')
+    runs = db.rows(available + ' ORDER BY id DESC LIMIT 200')
+    if not runs:
+        return {'runs': [], 'points': [], 'forecast_id': None}
+    if run_id is None:
+        # Prefer a run with most of its first day elapsed, including on a new installation.
+        first_day = stamp(now - timedelta(hours=24))
+        run_id = next((r['id'] for r in reversed(runs) if r['created_at'] >= first_day), runs[0]['id'])
+    elif all(r['id'] != run_id for r in runs):
+        selected = db.one(available + ' AND id=?', (run_id,))
+        if not selected:
+            raise HTTPException(404, 'Forecast run no longer available')
+        runs.append(selected)
+    return {'runs': runs, **forecast.comparison(db, run_id, now)}
 
 
 # -------------------------------------------------------------- settings
@@ -494,8 +525,59 @@ async def put_settings(request: Request):
         raise HTTPException(409, 'Stop automatic control before changing controllable systems')
     changed = db.save_settings(new, actor(request))
     db.audit('settings_changed', {'sections': changed}, actor(request))
+    if (old.site.latitude, old.site.longitude) != (new.site.latitude, new.site.longitude):
+        db.execute('DELETE FROM weather_hours WHERE ts>=?', (stamp(utcnow().replace(minute=0, second=0, microsecond=0)),))
+        db.set_meta('location_changed_at', stamp())
+        engine.next['weather'] = 0
+    if old.site.weather_enabled != new.site.weather_enabled:
+        engine.next['weather'] = 0
+    if old.site.poll_seconds != new.site.poll_seconds:
+        engine.next['poll'] = 0
     engine.request_plan()
     return {'saved': True, 'changed': changed}
+
+
+class AddressQuery(Body):
+    query: str = Field(min_length=3, max_length=200)
+
+
+class Coordinates(Body):
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+
+
+@router.post('/location/search')
+async def address_lookup(body: AddressQuery):
+    try:
+        return await weather.addresses(body.query)
+    except Exception:
+        raise HTTPException(424, 'Address search is unavailable. Try again or enter coordinates below.') from None
+
+
+@router.post('/location/timezone')
+async def lookup_zone(body: Coordinates):
+    try:
+        return {'timezone': await weather.timezone_at(body.latitude, body.longitude)}
+    except Exception:
+        raise HTTPException(424, 'Time zone lookup is unavailable. Check the time zone manually.') from None
+
+
+@router.post('/weather/refresh')
+async def refresh_weather(request: Request):
+    db, _, engine, runtime = ctx(request)
+    settings = db.settings()
+    if not runtime.demo:
+        if not weather.located(settings) or not settings.site.weather_enabled:
+            raise HTTPException(409, 'Save a home location and enable weather in Planning first.')
+        try:
+            await weather.refresh(db, settings)
+        except Exception:
+            raise HTTPException(424, 'Open-Meteo could not supply a forecast. Check outbound HTTPS and retry.') from None
+    age = weather.freshness_hours(db)
+    if age is None or age > 6:
+        raise HTTPException(424, 'No recent forecast covers the current hour.')
+    engine.request_plan()
+    return {'weather': weather.current_hour(db, utcnow()), 'simulated': runtime.demo}
 
 
 @router.get('/settings/history')
@@ -541,7 +623,7 @@ async def test_device(kind: str, item_id: str, request: Request):
     except Exception as error:
         from ..devices import _message
         db.audit('device_test_failed', {'target': f'{kind}:{item_id}', 'error': type(error).__name__}, actor(request))
-        raise HTTPException(502, f'Test failed: {_message(error)}') from None
+        raise HTTPException(424, f'Test failed: {_message(error)}') from None
     db.audit('device_test', {'target': f'{kind}:{item_id}'}, actor(request))
     db.set_meta(f'last_test:{kind}:{item_id}', stamp())
     return json.loads(json.dumps(result, default=str))
@@ -611,7 +693,11 @@ async def test_draft(kind: str, body: DraftTest, request: Request):
     db, security, *_ = ctx(request)
     if kind not in ('system', 'vehicle'):
         raise HTTPException(404, 'Unknown kind')
-    spec = (EnergySystem if kind == 'system' else Vehicle).model_validate(body.spec)
+    # Read-only probes construct a plugin before hardware ratings are entered.
+    # These constructor defaults are never saved or reported as discoveries.
+    defaults = {'ac_kw': 1} if kind == 'system' else {'capacity_kwh': 60}
+    values = {**defaults, **body.spec}
+    spec = (EnergySystem if kind == 'system' else Vehicle).model_validate(values)
     cls = registry.get(spec.plugin, kind)
     unknown = set(body.secrets) - {f.name for f in cls.secrets}
     if unknown:
@@ -623,7 +709,7 @@ async def test_draft(kind: str, body: DraftTest, request: Request):
         plugin = draft_instance(db, security, kind, spec, db.settings().site.timezone, body.secrets)
         result = await plugin.test()
     except Exception as error:
-        raise HTTPException(502, f'Test failed: {_message(error)}') from None
+        raise HTTPException(424, f'Test failed: {_message(error)}') from None
     finally:
         if plugin is not None:
             try:
@@ -635,6 +721,34 @@ async def test_draft(kind: str, body: DraftTest, request: Request):
 
 
 # --------------------------------------------------------------- tariffs
+class FlatRates(Body):
+    original: TariffPlan
+    name: str = Field(min_length=1, max_length=80)
+    buy: float
+    sell: float
+    daily: float
+
+
+@router.post('/tariffs/{tariff_id}/rates')
+async def edit_rates(tariff_id: str, body: FlatRates, request: Request):
+    db, _, engine, _ = ctx(request)
+    with db.connect() as c:
+        c.execute('BEGIN IMMEDIATE')
+        settings = Settings.model_validate_json(c.execute('SELECT data FROM settings WHERE id=1').fetchone()['data'])
+        plan = next((t for t in settings.tariffs if t.id == tariff_id), None)
+        if plan != body.original:
+            raise HTTPException(409, 'This tariff changed. Reopen the editor.')
+        if len(plan.periods) != 1:
+            raise HTTPException(422, 'Select a flat-rate plan.')
+        if plan == default_tariffs()[0]:
+            plan.notes = ''
+        plan.name, plan.supply_daily = body.name, body.daily
+        plan.periods[0].import_rate, plan.periods[0].export_rate = body.buy, body.sell
+        db.save_settings_in(c, Settings.model_validate(settings.model_dump()), actor(request))
+    engine.request_plan()
+    return {'saved': True}
+
+
 @router.post('/tariffs/import')
 async def import_tariff(request: Request):
     db, *_ = ctx(request)

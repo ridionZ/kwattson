@@ -7,9 +7,11 @@ no GPS, journeys or VIN are stored.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import time
 from datetime import datetime, timezone
+from typing import Literal
 
 from pydantic import Field
 
@@ -17,8 +19,9 @@ from .base import PluginConfig, PluginError, SecretField, VehiclePlugin, Vehicle
 
 
 class MGConfig(PluginConfig):
-    region: str = Field('au', pattern='^(au|eu)$')
-    phone_country_code: str = Field('61', pattern=r'^\d{1,4}$')
+    region: Literal['au', 'eu'] = 'au'
+    phone_country_code: str = Field('61', pattern=r'^\d{0,4}$', title='Country calling code (phone sign-in only)',
+                                    description='Used only for phone sign-in. Enter the calling code for your phone number.')
 
 
 class MGiSmart(VehiclePlugin):
@@ -32,6 +35,8 @@ class MGiSmart(VehiclePlugin):
 
     def __init__(self, *args):
         super().__init__(*args)
+        self.lock = asyncio.Lock()
+        self.last_failure = ''
         self.api = None
         self.signature = None
         self.vin = None
@@ -40,30 +45,45 @@ class MGiSmart(VehiclePlugin):
         self.last: VehicleReading | None = None
 
     async def read(self) -> VehicleReading | None:
-        if time.time() < self.next_poll:
-            return self.last
-        if time.time() < self.retry_after:
-            raise PluginError('iSMART is cooling down after an error')
+        async with self.lock:
+            return await self._read()
+
+    async def _read(self) -> VehicleReading | None:
         username, password = self.context.secret('username'), self.context.secret('password')
         if not username or not password:
             raise PluginError('MG iSMART credentials are not configured')
+        vin = self.context.secret('vin')
+        identity = (username, password, self.config.region, self.config.phone_country_code, vin or '')
+        signature = hashlib.sha256('\0'.join(identity).encode()).hexdigest()
+        if self.signature != signature:
+            await self.close()
+            self.signature = signature
+            self.next_poll = self.retry_after = 0
+            self.last = None
+        if time.time() < self.retry_after:
+            raise PluginError(self.last_failure + ' Automatic retry after the 15-minute cooldown.')
+        if time.time() < self.next_poll:
+            return self.last
         try:
             from saic_ismart_client_ng import SaicApi
             from saic_ismart_client_ng.model import SaicApiConfiguration
         except ImportError:
             raise PluginError('saic-ismart-client-ng is not installed') from None
-        signature = hashlib.sha256(f'{username}\0{password}\0{self.config.region}'.encode()).hexdigest()
+        email = '@' in username
+        if not email and not self.config.phone_country_code:
+            raise PluginError('Phone sign-in needs a country calling code. Email sign-in only needs the email and password.')
+        stage = 'sign-in'
         try:
-            if self.api is None or self.signature != signature:
-                await self.close()
+            if self.api is None:
                 factory = SaicApiConfiguration.mg_au if self.config.region == 'au' else SaicApiConfiguration.mg_eu
-                self.api = SaicApi(factory(username, password, username_is_email='@' in username,
-                                           phone_country_code=self.config.phone_country_code))
-                await self.api.login()
-                self.signature = signature
-                vin = self.context.secret('vin')
+                self.api = SaicApi(factory(username, password, username_is_email=email,
+                                           phone_country_code=None if email else self.config.phone_country_code))
+                await asyncio.wait_for(self.api.login(), timeout=15)
                 if not vin:
-                    vehicles = await self.api.vehicle_list()
+                    stage = 'vehicle discovery'
+                    vehicles = await asyncio.wait_for(self.api.vehicle_list(), timeout=15)
+                    if not vehicles.vinList:
+                        raise PluginError('MG vehicle discovery returned no cars. Check the region and linked vehicles in iSMART.')
                     if len(vehicles.vinList) != 1:
                         raise PluginError('Several vehicles on this account: enter the VIN')
                     info = vehicles.vinList[0]
@@ -71,26 +91,31 @@ class MGiSmart(VehiclePlugin):
                 if not vin:
                     raise PluginError('iSMART did not return a vehicle')
                 self.vin = vin
-            status = await self.api.get_vehicle_status_cached(self.vin)
-            charge = await self.api.get_vehicle_charging_management_data(self.vin)
+            stage = 'battery read'
+            charge = await asyncio.wait_for(self.api.get_vehicle_charging_management_data(self.vin), timeout=20)
             management = charge.chrgMgmtData
             raw_soc = getattr(management, 'bmsPackSOCDsp', None)
-            if raw_soc is None:
-                raw_soc = getattr(charge.rvsChargeStatus, 'bmsPackSOCDsp', None)
             if raw_soc is None or not 0 <= raw_soc <= 1000:
                 raise PluginError('iSMART battery level missing or invalid')
-            charging = bool(getattr(management, 'is_bms_charging', False))
-            when = status.statusTime
-            ts = datetime.fromtimestamp(when, timezone.utc) if isinstance(when, (int, float)) else datetime.now(timezone.utc)
-            reading = VehicleReading(ts=ts, time_verified=isinstance(when, (int, float)), soc=raw_soc / 10, charging=charging)
+            charging = management.is_bms_charging if management.bmsChrgSts is not None else None
+            # The management reply has no device timestamp. Preserve receipt time as unverified.
+            ts = datetime.now(timezone.utc)
+            reading = VehicleReading(ts=ts, time_verified=False, soc=raw_soc / 10, charging=charging)
             self.context.record_raw({'soc': reading.soc, 'charging': charging, 'ts': ts.isoformat()})
             self.last = reading
             self.next_poll = time.time() + (600 if charging else 1800)
             return reading
-        except Exception:
+        except Exception as error:
             self.retry_after = time.time() + 900
             await self.close()
-            raise
+            if isinstance(error, PluginError):
+                self.last_failure = str(error)
+            else:
+                code = getattr(error, 'return_code', None)
+                reason = 'timed out' if isinstance(error, TimeoutError) else 'failed'
+                detail = f' (service code {int(code)})' if isinstance(code, int) else ''
+                self.last_failure = f'MG {stage} {reason}{detail}. Check the region and iSMART app before retrying.'
+            raise PluginError(self.last_failure) from None
 
     async def close(self) -> None:
         if self.api is not None:

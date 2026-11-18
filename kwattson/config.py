@@ -139,7 +139,7 @@ class SiteSettings(Strict):
     export_limit_confirmed: bool = False
     grid_import_kw: float = Field(13.0, gt=0, le=200, description='Safe import limit for the connection')
     ac_kw: float = Field(2.5, gt=0, le=30, description='Typical air-conditioner electrical draw')
-    poll_seconds: int = Field(300, ge=60, le=3600)
+    poll_seconds: int = Field(120, ge=60, le=3600)
     weather_enabled: bool = True
 
 

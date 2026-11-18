@@ -4,7 +4,7 @@ Everything here is deliberately simple and explainable. Each component has a ver
 stored with its output so results can be compared across changes.
 
 ## 1. Data pipeline
-- Each enabled system is polled every `site.poll_seconds` (default 5 min). Readings are stored
+- Each enabled system is polled every `site.poll_seconds` (default 2 min on new installs). Readings are stored
   per system (`system_readings`) and combined into a site reading (`site_readings`): PV and battery
   powers summed; grid import/export and load from the site-meter system; load derived from the AC
   energy balance if the meter doesn't report it.
@@ -16,7 +16,9 @@ stored with its output so results can be compared across changes.
 - EV charging power is taken from the vehicle plugin, or estimated (charger kW) when the car reports
   charging at home (`ev_estimated=1`). It is subtracted from load to learn *house* load.
 
-## 2. Forecast (`forecast.py`, version `profile-temperature-v1+hourly-ratio-v1`)
+## 2. Forecast (`forecast.py`, version `profile-temperature-v2+hourly-ratio-v2`)
+Weather-enabled forecasts require a weather record for the current hour fetched within six hours. Importing historical weather no longer makes an old forecast appear fresh. Early accuracy uses the same error calculation as the final daily evaluation, counting only finished half-hours with at least 25 minutes of measurements. The comparison charts use those same complete slots and show delivered solar even when output was limited. Electricity use includes the EV. Battery percentage pairs the original plan’s end-of-slot projection with the recorded site battery level, including in monitoring mode.
+
 **House load**, per half-hour slot:
 `profile[day type, slot] + b_cool·(CDD − CDD_ref) + b_heat·(HDD − HDD_ref)`
 - Profile: recency-weighted (half-life 28 days), 10–90% winsorised mean of observed house load over

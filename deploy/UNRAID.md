@@ -22,6 +22,7 @@ through DockerMan, use **Docker → kwattson → Edit** to manage that container
 | Installer field | What to enter |
 |---|---|
 | Dashboard HTTPS address | Your full browser address, for example `https://energy.example.com`. Include a nonstandard HTTPS port if you use one. |
+| First admin password | On a new installation, enter a passphrase of 14–256 characters, then sign in as `admin`. Clear the variable in DockerMan after signing in. |
 | Application data | Defaults to `/mnt/user/appdata/kwattson`, mounted at `/data`. If reusing an existing folder, ensure UID 99 and GID 100 can write to it. |
 | Trusted reverse proxy IP | The address the container sees as its immediate proxy. For nginx on the host with Docker bridge networking, this is commonly the bridge gateway. Check with `docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}'`. For a proxy on a shared Docker network, use that proxy's IP. |
 | Allowed local services (advanced) | Leave blank unless you connect a local service such as Home Assistant. Enter the hostname used in its URL. |
@@ -36,13 +37,20 @@ open the dashboard, set **WebUI** in Advanced View to the same address.
 
 ## First sign-in
 
-1. In the Unraid terminal run `docker exec kwattson kwattson setup-token`. Paste the token
+1. If you set **First admin password**, sign in as **admin**. Otherwise, in the Unraid terminal run `docker exec kwattson kwattson setup-token`. Paste the token
    into the dashboard, create your admin account and enable two-step sign-in in **Settings → My account**.
 2. Follow the Overview checklist for location, electricity prices and your first system. Enter device
    credentials in the device wizard. For supported systems you can import historical readings with
    `docker exec kwattson kwattson backfill --days 60`.
 3. Back up the appdata folder, including the database and `master.key`. The key is needed to
    decrypt credentials when restoring a backup.
+
+## Check a connection
+
+- **Weather.** In **Settings → Home & tariff**, search for an address, suburb or postcode, select a result and save. **Test weather** fetches the current hourly forecast. The weather switch is in **Settings → Planning**. Overview shows the forecast time and the solar estimates.
+- **MG iSMART.** In **Settings → Vehicles**, choose the region used by the iSMART app. Email sign-in uses the account email and password. For phone sign-in, use the national number and its calling code in the separate fields. **Test** identifies whether sign-in, vehicle discovery or the battery read failed. If the vendor returns a service code, include the stage and code when reporting the issue. The plugin pauses polling for 15 minutes after a failed request.
+- **Power updates.** The overview checks the local readings every 30 seconds. Set **Power polling interval** in **Home & tariff** to choose how often to ask the inverter. Existing installations keep their saved interval. The device timestamp shows when the vendor actually measured the power.
+- **Export limits.** Enter the approved limit at the grid meter. The planner accounts for forecast house use, EV charging and battery charging before calculating how much power can reach the grid. The separate inverter rating caps the AC power the equipment can supply.
 
 ## Build locally or use Compose
 
@@ -63,7 +71,12 @@ from the project directory. Use one installation method per data directory.
 
 For the registry image use **Docker → Check for Updates** and apply the kWattson update. For a
 local build, pull the source and rebuild the image, then recreate the container using the saved
-template or Compose. The app migrates its database on startup.
+template or Compose. Keep the same host directory mounted at `/data`. Before updating,
+stop the container, copy the entire appdata directory (including `master.key`), and start
+the update. Settings, logins, device credentials and measurements live in that directory.
+When a schema upgrade is needed, kWattson saves a consistent pre-migration SQLite copy
+beside the database and upgrades it in a transaction. To roll back, stop the container,
+restore your full pre-update appdata copy and select the previous image tag.
 
 ## Public catalog submission (maintainer)
 

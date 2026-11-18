@@ -122,6 +122,9 @@ def test_v1_database_migrates(tmp_path):
     c.close()
     db = Database(path)
     assert db.one("SELECT value FROM meta WHERE key='schema_version'")['value'] == '2'
+    with sqlite3.connect(path.with_suffix('.before-v1-to-v2.sqlite3')) as snapshot:
+        assert snapshot.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone() == ('1',)
+        assert snapshot.execute('SELECT username FROM users').fetchone() == ('owner',)
     assert db.one('SELECT username, role FROM users') == {'username': 'owner', 'role': 'admin'}
     db.execute("INSERT INTO users(username, password_hash, role, created_at) VALUES('second', 'h', 'viewer', 'now')")  # CHECK(id=1) gone
 

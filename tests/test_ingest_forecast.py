@@ -101,3 +101,39 @@ def test_forecast_learns_weekday_profile_and_respects_exclusions_and_holidays(db
     assert monday['house_kwh'] == pytest.approx(0.5, rel=0.05)   # excluded 50 kW day ignored
     assert holiday['house_kwh'] == pytest.approx(settings.forecast.holiday_base_load_kw / 2, rel=0.01)
     assert db.one('SELECT COUNT(*) AS n FROM forecast_points WHERE forecast_id=?', (fid,))['n'] == len(points)
+
+
+def test_early_accuracy_and_partial_solar_windows(db, settings):
+    run, _, _ = forecast.build(db, settings, now=T0)
+    ingest_all(db, settings, range(0, 121, 5))
+    assert forecast.score_run(db, run, T0 + timedelta(minutes=29))['samples'] == 0
+    assert forecast.score_run(db, run, T0 + timedelta(minutes=91))['samples'] == 3
+    assert db.one('SELECT 1 FROM evaluations') is None
+    db.execute('UPDATE forecast_points SET solar_kwh=hours*2 WHERE forecast_id=?', (run,))
+    now = T0 + timedelta(minutes=17)
+    est = forecast.solar_snapshot(db, settings, now)
+    midnight = (now.astimezone(settings.zone) + timedelta(days=1)).replace(hour=0, minute=0)
+    assert est['next_hour'] == 2
+    assert est['rest_today'] == pytest.approx((midnight-now).total_seconds()/1800, abs=0.01)
+    assert forecast.solar_snapshot(db, settings, now + timedelta(hours=2)) == {}
+    assert forecast.evaluate(db, T0 + timedelta(hours=26)) == 1
+
+
+def test_comparison_matches_saved_plan_and_elapsed_meter_intervals(db, settings):
+    from kwattson import optimizer
+
+    at = T0 + timedelta(minutes=7)
+    original, points, model = forecast.build(db, settings, now=at)
+    plan = optimizer.plan(db, settings, original, points, model, now=at, initial={'main': 4.0})
+    next_run, _, _ = forecast.build(db, settings, now=at + timedelta(minutes=15))
+    ingest_all(db, settings, range(30, 65, 5))
+    db.execute('UPDATE forecast_points SET house_kwh=1, ev_kwh=0.5 WHERE forecast_id=?', (original,))
+    now = T0 + timedelta(hours=1, minutes=45)
+    measured, gap = forecast.comparison(db, original, now)['points']
+    assert measured['end'] == stamp(T0 + timedelta(hours=1))
+    assert measured['actual_solar'] == 0 and measured['actual_load'] == pytest.approx(1)
+    assert measured['forecast_load'] == 1.5 and measured['actual_soc'] == 50
+    assert measured['planned_soc'] == pytest.approx(plan['intervals'][1]['soc_pct'])
+    assert gap['actual_load'] is None and gap['actual_solar'] is None and gap['actual_soc'] is None
+    assert gap['planned_soc'] is not None
+    assert all(p['planned_soc'] is None for p in forecast.comparison(db, next_run, now)['points'])

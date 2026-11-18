@@ -8,8 +8,7 @@ privacy and forms, plus OWASP basics.
 ## Authentication
 - Argon2id password hashes; 14–256 character passphrases.
 - Optional TOTP two-step sign-in (strongly recommended); each code is accepted once.
-- First-run setup needs a one-time token from the server console (`kwattson setup-token`), so a
-  freshly exposed instance cannot be claimed by a stranger.
+- First boot can create `admin` from `INITIAL_ADMIN_PASSWORD_FILE` or `INITIAL_ADMIN_PASSWORD`. The password is used only when there are no users. Docker administrators can read container variables, so clear the installer variable after sign-in. Without either setting, the generated console token proves ownership before the first account can be created.
 - Sessions: random 384-bit token in a `__Host-` cookie (`Secure`, `HttpOnly`, `SameSite=Strict`,
   `Path=/`), stored hashed; 12 h absolute / 60 min idle lifetime.
 - Login: 5 failures per client IP in 15 min locks that IP for 15 min, plus a global brake.
@@ -37,6 +36,9 @@ privacy and forms, plus OWASP basics.
 - The CSRF token lives in memory only; nothing sensitive in `localStorage`.
 
 ## Secrets and privacy
+
+Address search is optional. Submitting a query sends it to Photon. Selecting a result sends its approximate coordinates to Open-Meteo to look up the time zone. kWattson stores the coordinates and time zone when you save. You can also enter them manually.
+
 - Device and notification credentials are encrypted with Fernet using `DATA_DIR/master.key`
   (created 0600). Back it up with the database; don't commit it.
 - Credentials are write-only in the UI/API; responses show only whether a field is set.

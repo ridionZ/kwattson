@@ -133,7 +133,7 @@ function Shell({ session, onSignedOut, onRefresh }: { session: Session; onSigned
   }, []);
   useEffect(() => {
     void reloadStatus();
-    const t = setInterval(() => document.visibilityState === 'visible' && reloadStatus(), 60000);
+    const t = setInterval(() => document.visibilityState === 'visible' && reloadStatus(), 30000);
     return () => clearInterval(t);
   }, [reloadStatus]);
 

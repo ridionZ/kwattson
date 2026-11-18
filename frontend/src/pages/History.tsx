@@ -1,4 +1,4 @@
-import { useMemo, useState, type FormEvent } from 'react';
+import { useEffect, useMemo, useState, type FormEvent } from 'react';
 import Box from '@mui/material/Box';
 import Tabs from '@mui/material/Tabs';
 import Tab from '@mui/material/Tab';
@@ -145,8 +145,87 @@ function Trends() {
   );
 }
 
+interface ComparisonPoint {
+  end: string;
+  forecast_solar: number;
+  actual_solar: number | null;
+  forecast_load: number;
+  actual_load: number | null;
+  planned_soc: number | null;
+  actual_soc: number | null;
+}
+
+interface ComparisonData {
+  runs: { id: number; created_at: string }[];
+  forecast_id: number | null;
+  mode?: string;
+  points: ComparisonPoint[];
+}
+
+function ForecastCharts() {
+  const [selected, setSelected] = useState<number | null>(null);
+  const comparison = useLoad<ComparisonData>(() => get('/api/forecast/comparison' + (selected === null ? '' : '?run_id=' + selected)), [selected]);
+  const { t } = useTokens();
+  const compact = useMediaQuery((th: Theme) => th.breakpoints.down('sm'));
+  useEffect(() => {
+    const timer = setInterval(() => { if (!document.hidden) void comparison.reload(); }, 60000);
+    return () => clearInterval(timer);
+  }, [comparison.reload]);
+  const data = comparison.data;
+  const charts = [
+    { title: 'Solar generation', forecast: 'forecast_solar', measured: 'actual_solar', color: t.solar, unit: 'kWh' },
+    { title: 'Electricity use', forecast: 'forecast_load', measured: 'actual_load', color: t.home, unit: 'kWh' },
+    { title: 'Battery level', forecast: 'planned_soc', measured: 'actual_soc', color: t.battery, unit: '%' },
+  ] as const;
+  return <Section title="Predicted and actual">
+    {comparison.error ? <ErrorState message={comparison.error} onRetry={comparison.reload} /> : !data ? <LoadingBlock /> :
+      !data.runs.length ? <Empty>The first comparison will appear when the planner saves a forecast.</Empty> : <Stack spacing={2}>
+        <TextField select label="Forecast made" value={selected ?? data.forecast_id ?? ''}
+          onChange={e => setSelected(Number(e.target.value))} sx={{ width: { xs: '100%', sm: 340 } }}
+          slotProps={{ select: { native: true } }}>
+          {data.runs.map(run => <option key={run.id} value={run.id}>{f.dateTime(run.created_at)} · #{run.id}</option>)}
+        </TextField>
+        {(selected !== null && data.forecast_id !== selected) ? <LoadingBlock /> : !data.points.length ?
+          <Empty>Waiting for the first full half-hour of this forecast to finish.</Empty> : <>
+          <Typography variant="body2" color="text.secondary">Each point marks the end of a half-hour in the forecast’s first day. Electricity use includes EV charging. Gaps indicate insufficient readings.</Typography>
+          {charts.map(chart => {
+            const battery = chart.unit === '%';
+            const predicted = data.points.map(p => p[chart.forecast]);
+            const measured = data.points.map(p => p[chart.measured]);
+            const available = predicted.some(v => v != null) || measured.some(v => v != null);
+            const format = (v: number | null) => battery ? f.pct(v) : f.kwh(v, 2);
+            return <Box key={chart.title} sx={{ minWidth: 0 }}>
+              <Typography component="h3" variant="subtitle1" sx={{ fontWeight: 700 }}>{chart.title} ({chart.unit})</Typography>
+              {battery && <Typography variant="caption" color="text.secondary">{predicted.some(v => v !== null)
+                ? 'Planned level assumes the battery followed the saved schedule.' + (data.mode === 'monitor' ? ' Monitoring mode was active for this plan.' : '')
+                : 'This run has no saved battery projection.'}</Typography>}
+              {available ? <LineChart height={compact ? 190 : 205} skipAnimation title={chart.title + ' comparison'}
+                margin={{ top: 8, right: 16, left: 4, bottom: 0 }}
+                xAxis={[{ scaleType: 'time', data: data.points.map(p => new Date(p.end)), tickNumber: compact ? 4 : 8,
+                  ...(data.points.length === 1 ? { min: new Date(Date.parse(data.points[0].end) - 900000), max: new Date(Date.parse(data.points[0].end) + 900000) } : {}),
+                  valueFormatter: (v: Date, context) => context.location === 'tick' ? f.time(v) : f.dateTime(v), height: 28 }]}
+                yAxis={[{ min: 0, ...(battery ? { max: 100 } : {}), width: 38 }]}
+                series={[
+                  { id: 'prediction', label: battery ? 'Planned' : 'Predicted', color: t.baseline, data: predicted, valueFormatter: format, curve: 'linear', showMark: data.points.length === 1 },
+                  { id: 'actual', label: 'Actual', color: chart.color, data: measured, valueFormatter: format, curve: 'linear', shape: 'circle',
+                    showMark: ({ index }) => measured.length <= 8 || (measured[index - 1] == null && measured[index + 1] == null) },
+                ]}
+                grid={{ horizontal: true }} slotProps={{ legend: { position: { vertical: 'top', horizontal: 'start' } } }}
+                sx={{ '& .MuiLineChart-line[data-series="prediction"]': { strokeDasharray: '6 4' } }} />
+                : <Empty>No battery readings for these half-hours.</Empty>}
+            </Box>;
+          })}
+        </>}
+      </Stack>}
+  </Section>;
+}
+
 function Accuracy() {
   const acc = useLoad<any>(() => get('/api/forecast/accuracy'));
+  useEffect(() => {
+    const timer = setInterval(() => { if (!document.hidden) void acc.reload(); }, 60000);
+    return () => clearInterval(timer);
+  }, [acc.reload]);
   if (acc.error) return <ErrorState message={acc.error} onRetry={acc.reload} />;
   if (!acc.data) return <LoadingBlock height={200} />;
   const ev = acc.data.evaluations as any[];
@@ -154,9 +233,17 @@ function Accuracy() {
   const learning = (lm.days ?? 0) < 14;
   return (
     <Stack spacing={2.5}>
+      <ForecastCharts />
       <Section title="Model">
         {learning && <Alert severity="info" sx={{ mb: 1.5 }}>Still learning: {f.n(lm.days ?? 0, 0)} days of data so far. Forecasts settle after about two weeks.</Alert>}
         <Facts rows={[['Load history', `${f.n(lm.days ?? 0, 0)} days`], ['Hot / cold samples', `${lm.hot_samples ?? '–'} / ${lm.cold_samples ?? '–'}`]]} />
+      </Section>
+      <Section title="Early accuracy">
+        {acc.data.provisional ? <><Typography variant="body2">Forecast made {f.dateTime(acc.data.provisional.created_at)}. Preliminary average error across completed, measured half-hours.</Typography>
+          <Facts rows={[
+            ['House error', f.kwh(acc.data.provisional.house_mae_kwh, 2) + ' · ' + acc.data.provisional.samples + ' half-hours'],
+            ['Solar error', f.kwh(acc.data.provisional.solar_mae_kwh, 2) + ' · ' + acc.data.provisional.solar_samples + ' half-hours'],
+          ]} /></> : <Typography variant="body2">Waiting for the first complete forecast half-hour with at least 25 minutes of readings.</Typography>}
       </Section>
       <Section title="Forecast error by run">
         <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>Each error is the average difference in kWh per measured half-hour during the forecast’s first day. Smaller is better.</Typography>

@@ -26,7 +26,7 @@ from pydantic import Field
 from .base import BatteryCommand, CommandResult, PluginConfig, PluginError, SecretField, SystemPlugin, SystemReading
 
 HOSTS = {'global': 'https://www.foxesscloud.com'}
-READ = {'/op/v0/device/list', '/op/v1/device/real/query', '/op/v0/device/history/query', '/op/v1/device/detail',
+READ = {'/op/v0/device/list', '/op/v1/device/real/query', '/op/v0/device/history/query', '/op/v1/device/detail', '/op/v0/device/battery/soc/get',
         '/op/v2/device/scheduler/get', '/op/v1/device/scheduler/get/flag'}
 WRITE = {'/op/v2/device/scheduler/enable', '/op/v1/device/scheduler/set/flag'}
 VARIABLES = ['pvPower', 'loadsPower', 'feedinPower', 'gridConsumptionPower', 'batChargePower', 'batDischargePower',
@@ -79,6 +79,11 @@ class FoxESSCloud(SystemPlugin):
     _lock = asyncio.Lock()   # FoxESS allows ~1 request/second per key
     _last = 0.0
 
+    def __init__(self, *args):
+        super().__init__(*args)
+        self._serial_key = None
+        self._serial = None
+
     async def _request(self, path, payload=None, write=False):
         if path not in (WRITE if write else READ):
             raise PluginError('FoxESS endpoint not allowed')
@@ -93,8 +98,13 @@ class FoxESSCloud(SystemPlugin):
             signature = hashlib.md5((path + r'\r\n' + key + r'\r\n' + timestamp).encode()).hexdigest()
             headers = {'token': key, 'signature': signature, 'timestamp': timestamp, 'lang': 'en',
                        'User-Agent': 'kWattson', 'Content-Type': 'application/json'}
-            async with httpx.AsyncClient(timeout=30, follow_redirects=False, trust_env=False) as client:
-                response = await client.post(HOSTS[self.config.region] + path, json=payload or {}, headers=headers)
+            metadata = path in ('/op/v1/device/detail', '/op/v0/device/battery/soc/get')
+            async with httpx.AsyncClient(timeout=8 if metadata else 30, follow_redirects=False, trust_env=False) as client:
+                url = HOSTS[self.config.region] + path
+                if metadata:
+                    response = await client.get(url, params=payload, headers=headers)
+                else:
+                    response = await client.post(url, json=payload or {}, headers=headers)
             response.raise_for_status()
             data = response.json()
         if data.get('errno') != 0:
@@ -104,15 +114,17 @@ class FoxESSCloud(SystemPlugin):
     async def serial(self) -> str:
         if self.config.serial:
             return self.config.serial
-        known = self.context.recall('serial')
-        if known:
-            return known
+        key = self.context.secret('api_key')
+        if self._serial and self._serial_key == key:
+            return self._serial
         data = await self._request('/op/v0/device/list', {'currentPage': 1, 'pageSize': 25})
         devices = data['result']['data']
+        if not devices:
+            raise PluginError('FoxESS returned no inverters for this account')
         if len(devices) != 1:
             raise PluginError('Several inverters on this account: enter the serial in the system settings')
-        self.context.remember('serial', devices[0]['deviceSN'])
-        return devices[0]['deviceSN']
+        self._serial_key, self._serial = key, devices[0]['deviceSN']
+        return self._serial
 
     def _parse(self, fields: list[dict], measured) -> SystemReading:
         values = {f.get('variable'): f.get('value') for f in fields}
@@ -129,7 +141,11 @@ class FoxESSCloud(SystemPlugin):
             export_kw=_number(values.get('feedinPower')), load_kw=_number(values.get('loadsPower')),
             battery_temp=_number(values.get('batTemperature')), running_state=state,
             fault=state in FAULT_STATES if state else None)
-        if reading.soc is None or not 0 <= reading.soc <= 100:
+        if reading.soc is None and self.system.battery is not None:
+            raise PluginError('FoxESS did not report a battery state of charge')
+        if reading.soc is None and all(value is None for value in (reading.pv_kw, reading.ac_output_kw, reading.load_kw)):
+            raise PluginError('FoxESS did not return power or battery readings')
+        if reading.soc is not None and not 0 <= reading.soc <= 100:
             raise PluginError('FoxESS returned an invalid battery state of charge')
         return reading
 
@@ -155,12 +171,19 @@ class FoxESSCloud(SystemPlugin):
     async def test(self) -> dict:
         reading = await self.read()
         sn = await self.serial()
-        groups = await self._request('/op/v2/device/scheduler/get', {'deviceSN': sn})
-        flag = await self._request('/op/v1/device/scheduler/get/flag', {'deviceSN': sn})
-        return {'reading': reading.as_dict(), 'scheduler_supported': flag.get('result', {}).get('support'),
-                'scheduler_enabled': flag.get('result', {}).get('enable'),
-                'scheduler_groups': len((groups.get('result') or {}).get('groups') or []),
-                'note': 'Read-only test. No settings were changed.'}
+        hardware = {}
+        for path, source, target, minimum, maximum in (
+            ('/op/v1/device/detail', 'capacity', 'ac_kw', 0.001, 100),
+            ('/op/v0/device/battery/soc/get', 'minSocOnGrid', 'reserve_pct', 0, 90),
+        ):
+            try:
+                detail = await self._request(path, {'sn': sn})
+                value = _number((detail.get('result') or {}).get(source))
+                if value is not None and minimum <= value <= maximum:
+                    hardware[target] = value
+            except (httpx.HTTPError, PluginError, TypeError, ValueError, AttributeError):
+                continue  # Optional on older inverters.
+        return {'reading': reading.as_dict(), 'hardware': hardware}
 
     def _group(self, command: BatteryCommand) -> dict:
         zone = ZoneInfo(self.context.timezone)

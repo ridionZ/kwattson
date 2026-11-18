@@ -47,12 +47,21 @@ const HOURS = Array.from({ length: 24 }, (_, h) => [h, `${h % 12 === 0 ? 12 : h 
 
 export default function Vehicles({ sub }: { sub?: string }) {
   const { doc, save } = useSettings();
-  const { status } = useApp();
+  const { status, reloadStatus } = useApp();
+  const [testing, setTesting] = useState<string | null>(null);
   const toast = useToast();
   const [wizard, setWizard] = useState<{ edit?: string } | null>(sub === 'add' ? {} : null);
   const [remove, setRemove] = useState<any>(null);
   const [busy, setBusy] = useState(false);
   const vehicles = doc.settings.vehicles as any[];
+  async function testVehicle(id: string) {
+    setTesting(id);
+    try {
+      const result = await post('/api/test/vehicle/' + id);
+      toast(result.reading?.soc != null ? 'Battery reading available: ' + f.pct(result.reading.soc) : 'Connection responded.');
+      await reloadStatus();
+    } catch (e) { toast(errorText(e), 'error'); } finally { setTesting(null); }
+  }
   async function doRemove() {
     setBusy(true);
     try {
@@ -88,6 +97,7 @@ export default function Vehicles({ sub }: { sub?: string }) {
                     {!v.enabled && <Chip size="small" label="Off" variant="outlined" sx={{ height: 22 }} />}
                   </Stack>
                   <Typography variant="body2" color="text.secondary">{plugin?.title ?? v.plugin}</Typography>
+                  {live?.poll?.error && !live.poll.ok && <Alert severity="warning" sx={{ mt: 1 }}>{live.poll.error}</Alert>}
                   {soc != null && (
                     <Stack direction="row" spacing={1.5} sx={{ alignItems: 'center', mt: 1.5, maxWidth: 360 }}>
                       <Typography variant="body2" sx={{ fontWeight: 700, minWidth: 40 }}>{f.pct(soc)}</Typography>
@@ -103,6 +113,7 @@ export default function Vehicles({ sub }: { sub?: string }) {
                   </Box>
                 </Box>
                 <Stack direction="row" spacing={1} sx={{ flexShrink: 0 }}>
+                  {v.plugin !== 'manual' && <Button size="small" disabled={!!testing} onClick={() => testVehicle(v.id)}>{testing === v.id ? 'Testing…' : 'Test'}</Button>}
                   <Button size="small" variant="outlined" startIcon={<EditRounded />} onClick={() => setWizard({ edit: v.id })}>Edit</Button>
                   <Button size="small" color="error" onClick={() => setRemove(v)}>Remove</Button>
                 </Stack>
@@ -134,7 +145,7 @@ function Spec({ label, value }: { label: string; value: string }) {
   );
 }
 
-const STEPS = ['Choose a source', 'Car details', 'Connection', 'Review & save'];
+const STEPS = ['Choose a source', 'Connection', 'Car details', 'Review & save'];
 const str = (v: any) => (v == null ? '' : String(v));
 
 function VehicleWizard({ editId, onClose }: { editId?: string; onClose: () => void }) {
@@ -164,7 +175,7 @@ function VehicleWizard({ editId, onClose }: { editId?: string; onClose: () => vo
     setError(null);
   }
   function set(patch: any) {
-    resetTest();
+    if (step < 2) resetTest();
     setV((previous: any) => ({ ...previous, ...patch }));
   }
 
@@ -176,7 +187,7 @@ function VehicleWizard({ editId, onClose }: { editId?: string; onClose: () => vo
   }
   function stepError(i: number, requireTest = true): string | null {
     if (i === 0) return v.plugin ? null : 'Choose how kWattson gets this car’s data.';
-    if (i === 2) {
+    if (i === 1) {
       if (!v.name.trim()) return 'Give the car a name.';
       if (!editId && taken.has(v.id)) return 'A vehicle with this name already exists. Choose another name.';
       const missingField = plugin?.config_schema?.required?.find((key: string) => v.plugin_config[key] == null || v.plugin_config[key] === '');
@@ -185,7 +196,7 @@ function VehicleWizard({ editId, onClose }: { editId?: string; onClose: () => vo
       if (missing.length) return `Enter ${missing.map((m: any) => m.label).join(', ')}.`;
       if (requireTest && needsTest && !tested) return 'Test the connection, or choose “Skip test” to carry on without it.';
     }
-    if (i === 1) {
+    if (i === 2) {
       const n = Number;
       if (!(n(v._cap) > 5 && n(v._cap) <= 250)) return 'Battery size must be between 5 and 250 kWh.';
       if (!(n(v._target) >= 20 && n(v._target) <= 100)) return 'Target must be between 20 and 100%.';
@@ -197,13 +208,14 @@ function VehicleWizard({ editId, onClose }: { editId?: string; onClose: () => vo
     return null;
   }
   async function runTest() {
-    const connectionError = stepError(2, false);
+    const connectionError = stepError(1, false);
     if (connectionError) { setError(connectionError); return; }
     setBusy(true);
     resetTest();
     try {
       const values = Object.fromEntries(Object.entries(secrets).filter(([, x]) => x.trim() !== ''));
-      const r = await post('/api/test-draft/vehicle', { spec: spec(), secrets: values });
+      const connection = { id: v.id, name: v.name.trim(), plugin: v.plugin, plugin_config: v.plugin_config };
+      const r = await post('/api/test-draft/vehicle', { spec: connection, secrets: values });
       const reading = r?.reading;
       if (r && 'reading' in r && !reading) throw new Error('No reading yet. Check the source or skip the test and try again later.');
       setTested('ok');
@@ -266,12 +278,13 @@ function VehicleWizard({ editId, onClose }: { editId?: string; onClose: () => vo
         })}
       </Box>
     ),
-    2: plugin && (
+    1: plugin && (
       <Box sx={{ display: 'grid', gap: 2 }}>
         <TextField label="Name" value={v.name} required autoFocus={!editId} placeholder="e.g. MG4"
           onChange={(e) => set({ name: e.target.value, ...(editId ? {} : { id: slug(e.target.value, 'car') }) })}
           helperText={!editId && v.id ? `ID: ${v.id}` : ' '} slotProps={{ htmlInput: { maxLength: 60 } }} />
-        {Object.entries<any>(plugin.config_schema?.properties ?? {}).map(([key, sch]) => (
+        {Object.entries<any>(plugin.config_schema?.properties ?? {}).filter(([key]) =>
+          key !== 'phone_country_code' || v.plugin !== 'mg_ismart' || (secrets.username ? !secrets.username.includes('@') : !!editId)).map(([key, sch]) => (
           <SchemaField key={key} required={plugin.config_schema?.required?.includes(key)} name={key} schema={sch} value={v.plugin_config[key]} onChange={(x) => set({ plugin_config: { ...v.plugin_config, [key]: x } })} />
         ))}
         {(plugin.secrets ?? []).map((s: any) => (
@@ -294,7 +307,7 @@ function VehicleWizard({ editId, onClose }: { editId?: string; onClose: () => vo
           : <Alert severity="info" variant="outlined">No connection needed. kWattson estimates the battery from your driving, and you can type in a level any time.</Alert>}
       </Box>
     ),
-    1: (
+    2: (
       <Box sx={{ display: 'grid', gap: 2, gridTemplateColumns: { xs: '1fr', sm: '1fr 1fr' } }}>
         <Num label="Battery size" unit="kWh" value={v._cap} onChange={(x) => set({ _cap: x })} required help="Usable capacity from the car’s specs." />
         <Num label="Charge to" unit="%" value={v._target} onChange={(x) => set({ _target: x })} help="The level you usually charge to. Many cars recommend 80% for daily use." />
@@ -338,8 +351,8 @@ function VehicleWizard({ editId, onClose }: { editId?: string; onClose: () => vo
       <Box sx={{ px: 3, pb: 2 }}>
         {editId ? (
           <Tabs value={step} onChange={(_, x) => { if (busy) return; setError(null); setStep(x); }} aria-label="Edit sections">
-            <Tab value={1} label="Car details" id="vtab-1" aria-controls="vpanel" />
-            <Tab value={2} label="Connection" id="vtab-2" aria-controls="vpanel" />
+            <Tab value={1} label="Connection" id="vtab-1" aria-controls="vpanel" />
+            <Tab value={2} label="Car details" id="vtab-2" aria-controls="vpanel" />
             <Tab value={3} label="Review" id="vtab-3" aria-controls="vpanel" />
           </Tabs>
         ) : (

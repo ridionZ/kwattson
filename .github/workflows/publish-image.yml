@@ -30,6 +30,10 @@ jobs:
             http://127.0.0.1:8085/healthz
           curl --fail --silent -H 'Host: energy.example.com' http://127.0.0.1:8085/api/auth/status |
             jq -e '.setup_required and (.demo == false)'
+      - name: Verify upgrade from the public image
+        run: |
+          docker pull "$IMAGE:latest"
+          tools/check-image-upgrade.sh "$IMAGE:latest" "$IMAGE:$GITHUB_SHA"
       - name: Publish tested image
         env:
           REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}

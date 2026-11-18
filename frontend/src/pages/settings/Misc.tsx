@@ -110,6 +110,60 @@ function PasswordConfirm({ password, setPassword, otp, setOtp }: { password: str
 }
 
 /* ------------------------------------------------------------ home & tariff */
+function LocationSearch({ choose }: { choose: (patch: any) => void }) {
+  const [query, setQuery] = useState('');
+  const [matches, setMatches] = useState<any[]>([]);
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState('');
+  async function search(e: FormEvent) {
+    e.preventDefault();
+    setBusy(true); setMessage(''); setMatches([]);
+    try {
+      const rows = await post('/api/location/search', { query: query.trim() });
+      setMatches(rows);
+      if (!rows.length) setMessage('No matches. Try a suburb or postcode, or enter coordinates below.');
+    } catch (e) { setMessage(errorText(e)); } finally { setBusy(false); }
+  }
+  async function select(match: any) {
+    setBusy(true); setMatches([]); setQuery(''); setMessage('');
+    const coords = { latitude: Number(match.latitude.toFixed(3)), longitude: Number(match.longitude.toFixed(3)) };
+    try {
+      const result = await post('/api/location/timezone', coords);
+      choose({ ...coords, timezone: result.timezone });
+      setMessage('Location and time zone filled in. Review them and save below.');
+    } catch (e) { choose(coords); setMessage(errorText(e)); } finally { setBusy(false); }
+  }
+  return <Box sx={{ mb: 3 }}>
+    <Box component="form" onSubmit={search} sx={{ display: 'flex', gap: 1, alignItems: 'flex-start' }}>
+      <TextField fullWidth label="Address, suburb or postcode" value={query} disabled={busy} onChange={e => { setQuery(e.target.value); setMatches([]); }}
+        helperText={<>Search sends your text to Photon. Only the selected coordinates and time zone are saved. Map data © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">OpenStreetMap contributors</a>.</>} />
+      <Button type="submit" disabled={busy || query.trim().length < 3}>{busy ? 'Looking up…' : 'Search'}</Button>
+    </Box>
+    {matches.map((m, i) => <Button key={i} fullWidth sx={{ justifyContent: 'flex-start', textAlign: 'left' }} onClick={() => select(m)}>{m.label}</Button>)}
+    {message && <Typography role="status" variant="body2">{message}</Typography>}
+  </Box>;
+}
+
+function WeatherCheck({ dirty }: { dirty: boolean }) {
+  const { status, reloadStatus } = useApp();
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState('');
+  async function check() {
+    setBusy(true); setMessage('');
+    try {
+      const r = await post('/api/weather/refresh');
+      setMessage((r.simulated ? 'Demo forecast available' : 'Open-Meteo forecast received') + ' for ' + f.dateTime(r.weather.ts) + '.');
+      await reloadStatus();
+    } catch (e) { setMessage(errorText(e)); } finally { setBusy(false); }
+  }
+  return <Section title="Weather forecast">
+    <Typography variant="body2">{status?.weather ? 'Forecast last updated ' + f.dateTime(status.weather.fetched_at) + '.' : 'No forecast available for the current hour.'} {dirty ? 'Save the home settings before checking.' : 'Checks the forecast for your saved location.'}</Typography>
+    <Button disabled={busy || dirty} onClick={check}>{busy ? 'Checking…' : 'Test weather'}</Button>
+    <Button href="#/settings/planning">Planning settings</Button>
+    {message && <Typography variant="body2" role="status">{message}</Typography>}
+  </Section>;
+}
+
 function Home({ locationOnly }: { locationOnly: boolean }) {
   const site = useSaveForm((s) => s.site, (s, v) => { s.site = v; }, 'Home settings saved. The plan is updating.');
   const v = site.value;
@@ -117,6 +171,7 @@ function Home({ locationOnly }: { locationOnly: boolean }) {
   return (
     <Stack spacing={2.5}>
       <Section title="Home">
+        <LocationSearch choose={set} />
         <Box component="form" onSubmit={site.submit}>
           <Box sx={{ display: 'grid', gap: 2, gridTemplateColumns: { xs: '1fr', sm: '1fr 1fr' } }}>
             <TextField label="Site name" value={v.name} onChange={(e) => set({ name: e.target.value })} required />
@@ -125,6 +180,8 @@ function Home({ locationOnly }: { locationOnly: boolean }) {
             <NumField label="Latitude" value={v.latitude} onChange={(x) => set({ latitude: x })} min={-90} max={90} help="Used for the weather and solar forecast. Two decimals (about 1 km) is plenty." />
             <NumField label="Longitude" value={v.longitude} onChange={(x) => set({ longitude: x })} min={-180} max={180} />
             <NumField label="Export limit" unit="kW" value={v.export_kw} onChange={(x) => set({ export_kw: x })} help="The most your network lets you send to the grid. Check your connection agreement." />
+            <NumField label="Power polling interval" unit="seconds" value={v.poll_seconds} onChange={(x) => set({ poll_seconds: x })} min={60} max={3600}
+              help="How often kWattson asks for inverter readings. Some clouds publish more slowly or limit daily requests across devices." />
             <NumField label="Import limit" unit="kW" value={v.grid_import_kw} onChange={(x) => set({ grid_import_kw: x })} help="The most the house can draw from the grid at once." />
             <Box sx={{ gridColumn: '1 / -1', display: 'flex', alignItems: 'center' }}>
               <FormControlLabel control={<Switch checked={!!v.export_limit_confirmed} onChange={(e) => set({ export_limit_confirmed: e.target.checked })} />}
@@ -135,6 +192,7 @@ function Home({ locationOnly }: { locationOnly: boolean }) {
           <FormFoot {...site} />
         </Box>
       </Section>
+      <WeatherCheck dirty={site.dirty} />
       {!locationOnly && <Tariffs />}
     </Stack>
   );
@@ -149,11 +207,15 @@ function Tariffs() {
   const toast = useToast();
   const [rates, setRates] = useState<string | null>(null);
   const [flatOpen, setFlatOpen] = useState(false);
+  const [editing, setEditing] = useState<any>(null);
+  const { status } = useApp();
+  const [showEarlier, setShowEarlier] = useState(false);
   const [importing, setImporting] = useState(false);
   const [activate, setActivate] = useState<any>(null);
   const [retire, setRetire] = useState<any>(null);
   const [busy, setBusy] = useState(false);
   const tariffs = [...(doc.settings.tariffs as any[])].sort((a, b) => ['active', 'pending', 'retired'].indexOf(a.status) - ['active', 'pending', 'retired'].indexOf(b.status));
+  const earlier = (t: any) => t.status === 'active' && t.id !== status?.tariff?.plan_id && status?.tariff?.plan_id && (!t.active_from || Date.parse(t.active_from) <= Date.now());
   async function doRetire() {
     setBusy(true);
     try { await post(`/api/tariffs/${retire.id}/retire`); toast(`${retire.name} retired.`); setRetire(null); await reload(); }
@@ -164,13 +226,14 @@ function Tariffs() {
       action={<Button size="small" variant="outlined" startIcon={<AddRounded />} onClick={() => setImporting(true)}>Import tariff</Button>}>
       <Button variant="contained" sx={{ mb: 2 }} onClick={() => setFlatOpen(true)}>Enter flat rates</Button>
       <Stack spacing={1.5}>
-        {tariffs.map((t) => (
+        {tariffs.some(earlier) && <Button onClick={() => setShowEarlier(!showEarlier)}>{showEarlier ? 'Hide earlier tariffs' : 'Show earlier tariffs'}</Button>}
+        {tariffs.filter(t => showEarlier || !earlier(t)).map((t) => (
           <Card key={t.id} sx={{ p: 2, borderColor: t.status === 'pending' ? 'warning.main' : 'divider', opacity: t.status === 'retired' ? 0.75 : 1 }}>
             <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} sx={{ alignItems: { sm: 'center' } }}>
               <Box sx={{ flex: 1, minWidth: 0 }}>
                 <Stack direction="row" spacing={1} sx={{ alignItems: 'center', flexWrap: 'wrap' }}>
                   <Typography variant="subtitle2" component="h3" sx={{ fontSize: '0.9375rem' }}>{t.name}</Typography>
-                  <Chip size="small" label={t.status[0].toUpperCase() + t.status.slice(1)} color={STATUS_COLOR[t.status]} sx={{ height: 20 }} />
+                  <Chip size="small" label={earlier(t) ? 'Earlier rates' : t.status[0].toUpperCase() + t.status.slice(1)} color={STATUS_COLOR[t.status]} sx={{ height: 20 }} />
                 </Stack>
                 <Typography variant="caption" color="text.secondary">
                   {t.retailer || 'Retailer not set'}{t.active_from ? ` · from ${f.dateTime(t.active_from)}` : ''} · supply {f.money(t.supply_daily)}/day
@@ -180,6 +243,7 @@ function Tariffs() {
                 <Button size="small" onClick={() => setRates(rates === t.id ? null : t.id)} aria-expanded={rates === t.id} aria-controls={`rates-${t.id}`}>
                   {rates === t.id ? 'Hide rates' : 'View rates'}
                 </Button>
+                {t.periods.length === 1 && t.status !== 'retired' && <Button size="small" onClick={() => setEditing(t)}>Edit rates</Button>}
                 {t.status === 'pending' && <Button size="small" variant="contained" onClick={() => setActivate(t)}>Activate</Button>}
                 {t.status !== 'retired' && (t.active_from || t.status === 'pending') && <Button size="small" color="error" onClick={() => setRetire(t)}>Retire</Button>}
               </Stack>
@@ -204,6 +268,7 @@ function Tariffs() {
           </Card>
         ))}
       </Stack>
+      {editing && <FlatTariffDialog existing={editing} onClose={() => setEditing(null)} onDone={async () => { setEditing(null); await reload(); toast('Rates updated.'); }} />}
       {flatOpen && <FlatTariffDialog onClose={() => setFlatOpen(false)} onDone={async (plan) => { setFlatOpen(false); await reload(); setActivate(plan); }} />}
       {importing && <ImportDialog onClose={() => setImporting(false)} onDone={async () => { setImporting(false); await reload(); }} />}
       {activate && <ActivateDialog tariff={activate} onClose={() => setActivate(null)} onDone={async () => { setActivate(null); await reload(); }} />}
@@ -214,11 +279,12 @@ function Tariffs() {
   );
 }
 
-function FlatTariffDialog({ onClose, onDone }: { onClose: () => void; onDone: (plan: any) => void }) {
-  const [name, setName] = useState('');
-  const [buy, setBuy] = useState('');
-  const [sell, setSell] = useState('');
-  const [daily, setDaily] = useState('');
+function FlatTariffDialog({ existing, onClose, onDone }: { existing?: any; onClose: () => void; onDone: (plan: any) => void }) {
+  const cents = (value?: number) => value == null ? '' : String(Number((100 * value).toFixed(6)));
+  const [name, setName] = useState<string>(existing?.name ?? '');
+  const [buy, setBuy] = useState(cents(existing?.periods[0].import_rate));
+  const [sell, setSell] = useState(cents(existing?.periods[0].export_rate));
+  const [daily, setDaily] = useState(cents(existing?.supply_daily));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   async function submit(e: FormEvent) {
@@ -226,6 +292,11 @@ function FlatTariffDialog({ onClose, onDone }: { onClose: () => void; onDone: (p
     setBusy(true);
     setError('');
     try {
+      if (existing) {
+        await post('/api/tariffs/' + existing.id + '/rates', { original: existing, name: name.trim(), buy: Number(buy) / 100, sell: Number(sell) / 100, daily: Number(daily) / 100 });
+        await onDone(existing);
+        return;
+      }
       const r = await post('/api/tariffs/import', {
         id: slug(name, 'my-plan'), name: name.trim(), supply_daily: Number(daily) / 100,
         periods: [{ name: 'anytime', label: 'Any time', start: '00:00', end: '24:00', import_rate: Number(buy) / 100, export_rate: Number(sell) / 100 }],
@@ -234,9 +305,9 @@ function FlatTariffDialog({ onClose, onDone }: { onClose: () => void; onDone: (p
     } catch (err) { setError(errorText(err)); setBusy(false); }
   }
   return <Dialog open maxWidth="xs" fullWidth aria-labelledby="flat-title" onClose={busy ? undefined : onClose} slotProps={{ paper: { component: 'form', onSubmit: submit } as object }}>
-    <DialogTitle id="flat-title">Enter flat rates</DialogTitle>
+    <DialogTitle id="flat-title">{existing ? 'Edit flat rates' : 'Enter flat rates'}</DialogTitle>
     <DialogContent sx={{ display: 'grid', gap: 2, pt: '4px !important' }}>
-      <Typography variant="body2">Use the cents shown on your electricity bill. You’ll choose the start date after saving.</Typography>
+      <Typography variant="body2">Use the cents shown on your electricity bill. {existing ? 'Edits apply to the dates this plan covers. Add a new tariff for a price change on a specific date.' : 'You’ll choose the start date after saving.'}</Typography>
       <TextField required label="Plan name" value={name} onChange={e => setName(e.target.value)} slotProps={{ htmlInput: { maxLength: 80 } }} />
       <TextField required type="number" label="Electricity you buy (¢/kWh)" value={buy} onChange={e => setBuy(e.target.value)} slotProps={{ htmlInput: { step: 'any', min: -200, max: 500 } }} />
       <TextField required type="number" label="Solar you sell (¢/kWh)" value={sell} onChange={e => setSell(e.target.value)} slotProps={{ htmlInput: { step: 'any', min: -200, max: 500 } }} />
