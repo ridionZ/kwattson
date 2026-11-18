@@ -160,7 +160,7 @@ function Shell({ session, onSignedOut, onRefresh }: { session: Session; onSigned
     setStopBusy(true);
     try {
       const r = await post('/api/control/stop');
-      toast(r.problems?.length ? `Stopped, with problems: ${r.problems.join('; ')}` : 'Automatic control stopped. kWattson is monitoring only.', r.problems?.length ? 'warning' : 'success');
+      if (r.problems?.length) toast(`Automatic control is off. Release still needs confirmation: ${r.problems.join(', ')}`, 'warning');
       await reloadStatus();
     } catch (e) {
       toast(errorText(e), 'error');

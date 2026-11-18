@@ -175,12 +175,7 @@ function ControlCard({ onEnable }: { onEnable: () => void }) {
     try {
       const result = await post(auto ? '/api/control/stop' : '/api/control/enable');
       await reloadStatus();
-      if (auto) {
-        toast(result.problems?.length ? 'Automatic control is off. Release still needs confirmation.' : 'Automatic control is off.',
-          result.problems?.length ? 'warning' : 'success');
-      } else {
-        toast(result.initial_control?.reasons?.length ? 'Automatic control is on and waiting to resume.' : 'Automatic control is on.');
-      }
+      if (auto && result.problems?.length) toast('Automatic control is off. Release still needs confirmation.', 'warning');
     } catch (error) {
       toast(errorText(error), 'error');
     } finally {
