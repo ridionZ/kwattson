@@ -103,7 +103,7 @@ def test_schedule_forecast_places_only_the_saved_window(db, settings):
     identity, data = save_schedule(db, settings)
     session = dict(id=identity, kind='ev_charge_now', starts=stamp(NOW), expires=stamp(DEPART), data=data)
     slots = [(MIDNIGHT + timedelta(minutes=30*i), .5) for i in range(-1, 3)]
-    energy, _ = forecast.ev_plan(db, settings, NOW, slots, [], [session])
+    energy, _, _ = forecast.ev_plan(db, settings, NOW, slots, [], [session])
     assert energy == pytest.approx([0, 2.56, 2.56, 0])
 
 
@@ -144,3 +144,44 @@ def test_percentage_session_never_stops_at_monitoring_expiry(db, settings):
     devices = SimpleNamespace(vehicle=Mock())
     asyncio.run(ev_charging.monitor(db, settings, devices, SimpleNamespace(emit=Mock()), MIDNIGHT))
     devices.vehicle.assert_not_called()
+
+
+def test_future_charges_enter_forecast_only_at_saved_times_and_can_be_cancelled(db, settings):
+    settings.vehicles = [CAR]
+    friday = NOW + timedelta(days=1, hours=2, minutes=15)
+    sunday = NOW + timedelta(days=3, hours=2)
+    ids = []
+    for start in (friday, sunday):
+        ids.append(db.execute('INSERT INTO overrides(created_at, starts, expires, kind, data) VALUES(?,?,?,?,?)',
+                   (stamp(NOW), stamp(start), stamp(start + timedelta(hours=2)), 'ev_charge_planned',
+                    encode({'vehicle_id': CAR.id}))))
+    _, points, model = forecast.build(db, settings, NOW)
+    assert model['vehicles'][CAR.id]['planned_charges'] == [ids[0]]
+    expected = [r for r in points if r['ev_kwh'] > 0]
+    assert expected[0]['ts'] == stamp(friday - timedelta(minutes=15))
+    assert [r['ev_kwh'] for r in expected] == pytest.approx([1.6, 3.2, 3.2, 3.2, 1.6])
+    assert sum(r['planned_ev_kwh'] for r in points) == pytest.approx(12.8)
+    assert not ev_charging.sessions(db, friday)
+    db.execute('UPDATE overrides SET cancelled_at=? WHERE id=?', (stamp(NOW), ids[0]))
+    _, points, _ = forecast.build(db, settings, NOW)
+    assert sum(r['ev_kwh'] for r in points) == 0
+
+
+def test_pinned_ev_charge_replaces_regular_load_same_evening_and_lifts_weekly_projection(db, settings):
+    from kwattson.advice import ev_advice
+
+    car = CAR.model_copy(update={'manual_soc': 42, 'weekday_km': [0]*7})
+    car.schedule.days = [4]
+    car.schedule.start_hour = 20
+    settings.vehicles = [car]
+    start = NOW + timedelta(days=1, hours=2)
+    end = start + timedelta(hours=2)
+    row = dict(id=1, kind='ev_charge_planned', starts=stamp(start), expires=stamp(end), data={'vehicle_id': car.id})
+    slots = [(start - timedelta(hours=2) + timedelta(minutes=30*i), .5) for i in range(10)]
+    energy, planned, _ = forecast.ev_plan(db, settings, NOW, slots, [], [row])
+    assert energy == pytest.approx(planned)
+    assert energy[:4] == [0] * 4
+    assert sum(energy) == pytest.approx(12.8)
+    outlook = ev_advice(db, settings, [], car, NOW, [], [row])
+    assert outlook['projection'][1]['soc_pct'] == pytest.approx(61.2)
+    assert outlook['projection'][1]['planned_charge_pct'] == pytest.approx(19.2)

@@ -26,10 +26,12 @@ import * as f from '../lib/fmt';
 import { ErrorState, Empty, Facts, LoadingBlock, PageHeader, Section, useToast } from '../components/common';
 import { ChartBlock, LineTimeChart, MARGIN, useTimeAxis, type LegendItem } from '../components/TimeCharts';
 import { useTokens } from './Overview';
+import EvPlan, { type VehicleOutlook } from '../components/EvPlan';
+import type { Override } from '../components/Scheduled';
 
 interface Interval {
   ts: string; hours: number; action: string; load_kwh: number; solar_kwh: number; import_kwh: number; export_kwh: number;
-  curtailed_kwh: number; soc_pct: number; buy_rate: number; sell_rate: number; cost: number; baseline_soc_pct: number; baseline_cost: number;
+  curtailed_kwh: number; ev_kwh?: number | null; soc_pct: number; buy_rate: number; sell_rate: number; cost: number; baseline_soc_pct: number; baseline_cost: number;
   baseline_curtailed_kwh: number; solar_p10: number | null; solar_p90: number | null; reason: string;
 }
 
@@ -40,7 +42,7 @@ interface MeasuredInterval {
 
 export default function Plan() {
   const { status, reloadStatus, can } = useApp();
-  const plan = useLoad<{ decision: any; intervals: Interval[]; history: MeasuredInterval[]; as_of: string }>(
+  const plan = useLoad<{ decision: any; intervals: Interval[]; history: MeasuredInterval[]; as_of: string; ev_charges?: Override[] }>(
     () => get('/api/plan'), [status?.decision?.id]);
   useEffect(() => {
     const timer = setInterval(() => { if (!document.hidden) void plan.reload(); }, 60000);
@@ -63,18 +65,28 @@ export default function Plan() {
     }
   }
   const d = plan.data?.decision;
+  const vehicles = (status?.vehicles ?? []).filter((v: { enabled: boolean }) => v.enabled);
+  const last = plan.data?.intervals.at(-1);
+  const horizonEnd = last ? Date.parse(last.ts) + last.hours * HOUR : undefined;
+  const ev = vehicles.length > 0 && <EvPlan vehicles={vehicles} outlook={(status?.advice?.vehicles ?? []) as VehicleOutlook[]}
+    charges={plan.data?.ev_charges ?? []} canEdit={can('member')} now={now} horizonEnd={horizonEnd}
+    onChanged={() => { void plan.reload(); void reloadStatus(); }} />;
   return (
     <Box>
       <PageHeader title="Plan" sub={d ? `Plan made ${f.relative(d.created_at, now)}` : undefined}
         actions={can('member') && <Button variant="contained" startIcon={<RefreshRounded />} onClick={replan} disabled={busy}>{busy ? 'Planning…' : 'Re-plan'}</Button>} />
-      {plan.error ? <ErrorState message={plan.error} onRetry={plan.reload} /> : !plan.data ? <LoadingBlock height={480} /> :
-        !d ? <Empty>No plan has been made yet. The planner runs every few minutes once readings arrive.</Empty> : (
-          <Stack spacing={2.5}>
-            <Summary d={d} rows={plan.data.intervals} batteryKwh={status?.battery_kwh ?? 0} />
-            <Charts rows={plan.data.intervals} history={plan.data.history ?? []} now={Date.parse(plan.data.as_of) || now} initialSoc={d.summary.initial_soc_pct ?? null} />
+      {plan.error ? <ErrorState message={plan.error} onRetry={plan.reload} /> : !plan.data ? <LoadingBlock height={480} /> : (
+        <Stack spacing={2.5}>
+          {d ? <Summary d={d} rows={plan.data.intervals} batteryKwh={status?.battery_kwh ?? 0} />
+            : <Empty>No plan has been made yet. The planner runs every few minutes once readings arrive.</Empty>}
+          {ev}
+          {d && <>
+            <Charts rows={plan.data.intervals} history={plan.data.history ?? []} now={Date.parse(plan.data.as_of) || now}
+              initialSoc={d.summary.initial_soc_pct ?? null} showEv={vehicles.length > 0} />
             <Schedule blocks={status?.advice?.schedule ?? []} now={now} plugins={(status?.systems ?? []).map((s: any) => s.plugin)} />
-          </Stack>
-        )}
+          </>}
+        </Stack>
+      )}
     </Box>
   );
 }
@@ -156,7 +168,7 @@ function Summary({ d, rows, batteryKwh }: { d: any; rows: Interval[]; batteryKwh
 type ChartPoint = {
   time: number; kind: 'actual' | 'forecast'; buy: number; sell: number; action?: string;
   solar: number | null; home: number | null; p10: number | null; p90: number | null;
-  imp: number | null; exp: number | null;
+  imp: number | null; exp: number | null; ev: number | null;
 };
 
 const HOUR = 3600000;
@@ -168,7 +180,7 @@ function chartPoints(history: MeasuredInterval[], rows: Interval[], now: number,
     const exported = power(r.export_kwh, duration);
     return { time: Date.parse(r.ts), kind: 'actual', solar: power(r.solar_kwh, duration), home: power(r.load_kwh, duration),
       buy: r.buy_rate * 100, sell: r.sell_rate * 100, imp: power(r.import_kwh, duration), exp: exported === null ? null : -exported,
-      p10: null, p90: null };
+      p10: null, p90: null, ev: null };
   });
   const lastActual = past[past.length - 1];
   if (lastActual) {
@@ -180,7 +192,7 @@ function chartPoints(history: MeasuredInterval[], rows: Interval[], now: number,
     const stop = start + Math.round(r.hours * HOUR);
     if (stop <= now || start >= end) return [];
     const point: ChartPoint = { time: Math.max(now, start), kind: 'forecast', action: r.action,
-      solar: power(r.solar_kwh, r.hours), home: power(r.load_kwh, r.hours),
+      solar: power(r.solar_kwh, r.hours), home: power(r.load_kwh, r.hours), ev: power(r.ev_kwh, r.hours),
       p10: power(r.solar_p10, r.hours), p90: power(r.solar_p90, r.hours),
       buy: r.buy_rate * 100, sell: r.sell_rate * 100, imp: power(r.import_kwh, r.hours), exp: -r.export_kwh / r.hours };
     return r === rows[rows.length - 1] || stop >= end ? [point, { ...point, time: Math.min(stop, end) }] : [point];
@@ -188,7 +200,7 @@ function chartPoints(history: MeasuredInterval[], rows: Interval[], now: number,
   return [...past, ...future];
 }
 
-function Charts({ rows, history, now, initialSoc }: { rows: Interval[]; history: MeasuredInterval[]; now: number; initialSoc: number | null }) {
+function Charts({ rows, history, now, initialSoc, showEv }: { rows: Interval[]; history: MeasuredInterval[]; now: number; initialSoc: number | null; showEv: boolean }) {
   const { t, actions } = useTokens();
   const compact = useMediaQuery((th: Theme) => th.breakpoints.down('sm'));
   const [hi, setHi] = useState<number | null>(null);
@@ -255,6 +267,7 @@ function Charts({ rows, history, now, initialSoc }: { rows: Interval[]; history:
     legend('Actual use', t.home, 'line', byKind('home', 'actual')),
     legend('Forecast use', t.home, 'dashed', byKind('home', 'forecast')),
   ];
+  const legendEv = [legend('Forecast charging', t.ev, 'dashed', i => f.kw(points[i]?.ev))];
   const legendGrid = [
     legend('Import', t.gridIn, 'line', i => f.kw(points[i]?.imp)),
     legend('Export', t.gridOut, 'line', i => f.kw(points[i]?.exp == null ? null : Math.abs(points[i].exp!))),
@@ -279,7 +292,7 @@ function Charts({ rows, history, now, initialSoc }: { rows: Interval[]; history:
             sx={{ bgcolor: (actions as Record<string, string>)[cur?.action ?? ''] + '33', '& .MuiChip-icon': { color: 'text.primary' } }} />
             : cur?.kind === 'actual' && <Chip size="small" label="Measured" />}
           <Typography variant="caption" color="text.secondary">
-            {compact ? 'Swipe any chart to scroll them together.' : 'Point at a chart to read all four at the same time.'}
+            {compact ? 'Swipe any chart to scroll them together.' : 'Point at a chart to compare the same time across timelines.'}
           </Typography>
         </Stack>
 
@@ -297,6 +310,13 @@ function Charts({ rows, history, now, initialSoc }: { rows: Interval[]; history:
             sx={{ ...seriesStyle, '& .MuiLineChart-area[data-series="range"]': { fillOpacity: 0.18 },
               '& .MuiLineChart-line[data-series="range"]': { strokeWidth: 0 } }} />)}
         </ChartBlock>
+
+        {showEv && <ChartBlock id="c-ev" title="EV charging forecast" unit="kW" legend={legendEv} index={idx}
+          table={{ columns: ['Time', 'Forecast charging'], rows: tableRows(legendEv) }}>
+          {plot('EV charging forecast', <LineTimeChart {...common} height={compact ? 130 : 154} yFormat={v => f.n(v)} yMin={0}
+            desc="Expected home EV charging power averaged over forecast intervals, including saved future charges."
+            series={[series('forecast-ev', 'ev', t.ev, 'forecast')]} sx={seriesStyle} />)}
+        </ChartBlock>}
 
         <ChartBlock id="c-grid" title="Grid" unit="kW, imports up, exports down" legend={legendGrid} index={idx}
           table={{ columns: ['Time', 'Import', 'Export'], rows: tableRows(legendGrid) }}>

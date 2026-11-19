@@ -27,7 +27,7 @@ export interface Override {
   estimate?: ChargeEstimate;
 }
 
-interface Item { key: string; path: string; Icon: typeof LuggageRounded; title: string; detail: string; active: boolean; noun: string; battery: boolean; charging?: boolean; automatic?: boolean }
+interface Item { key: string; path: string; Icon: typeof LuggageRounded; title: string; detail: string; active: boolean; noun: string; battery: boolean; charging?: boolean; automatic?: boolean; cancelDetail?: string }
 
 export function describe(holidays: Holiday[], overrides: Override[], vehicles: { id: string; name: string }[], now = Date.now()): Item[] {
   const car = (id?: string) => vehicles.find((v) => v.id === id)?.name ?? 'Car';
@@ -70,6 +70,11 @@ export function describe(holidays: Holiday[], overrides: Override[], vehicles: {
           title: `${car(o.data?.vehicle_id)} charge plan`, detail: details.join(' · '), noun: 'the charge plan', battery: true, charging: true, automatic: o.data?.auto_schedule });
         break;
       }
+      case 'ev_charge_planned':
+        items.push({ ...base, Icon: EvStationRounded, title: `${car(o.data?.vehicle_id)} planned charge`,
+          detail: `${f.dateTime(o.starts)} to ${f.dateTime(o.expires)}`, active: false,
+          noun: 'the planned charge', battery: true, cancelDetail: 'This charge will be removed from the home energy forecast.' });
+        break;
       case 'ev_away':
         items.push({ ...base, Icon: DirectionsCarRounded, title: `${car(o.data?.vehicle_id)} away`, detail: until, noun: 'car away', battery: false });
         break;
@@ -126,7 +131,7 @@ export default function Scheduled({ items, canEdit, onChanged }: { items: Item[]
       </List>
       <ConfirmDialog open={!!confirm} title={`Cancel ${confirm?.noun ?? 'this'}?`} confirm="Cancel it" danger busy={busy} error={error}
         onConfirm={cancel} onClose={() => setConfirm(null)}>
-        <Typography variant="body2">{confirm?.automatic ? 'Cancelling ends the schedule and requests a stop if the car is charging.' : confirm?.charging ? 'Cancelling ends this plan and any automatic stop monitoring. Use the car or charger to stop charging.' : `${confirm?.title}, ${confirm?.detail}. The plan goes back to normal straight away.`}</Typography>
+        <Typography variant="body2">{confirm?.cancelDetail ?? (confirm?.automatic ? 'Cancelling ends the schedule and requests a stop if the car is charging.' : confirm?.charging ? 'Cancelling ends this plan and any automatic stop monitoring. Use the car or charger to stop charging.' : `${confirm?.title}, ${confirm?.detail}. The plan goes back to normal straight away.`)}</Typography>
       </ConfirmDialog>
     </>
   );

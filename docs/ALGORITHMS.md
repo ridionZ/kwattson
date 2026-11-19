@@ -23,7 +23,7 @@ power-based estimate for that metric. Gaps over 15 minutes remain uncovered.
 - EV charging power is taken from the vehicle plugin, or estimated (charger kW) when the car reports
   charging at home (`ev_estimated=1`). It is subtracted from load to learn *house* load.
 
-## 2. Forecast (`forecast.py`, version `profile-temperature-v3+hourly-ratio-v3+ev-session-v2`)
+## 2. Forecast (`forecast.py`, version `profile-temperature-v3+hourly-ratio-v3+ev-session-v3`)
 Weather-enabled plans use forecasts fetched within 24 hours. Within that limit, records older than six hours get a conservative blend of higher load and lower solar. Missing or older hourly records use the fallback. Early accuracy uses the same error calculation as the final daily evaluation, counting only finished half-hours with at least 25 minutes of measurements. The comparison charts use those same complete slots and show delivered solar even when output was limited. Electricity use includes the EV. Battery percentage pairs the original plan’s end-of-slot projection with the recorded site battery level, including in monitoring mode.
 
 **House load**, per half-hour slot:
@@ -62,7 +62,13 @@ The paid-grid estimate uses the latest plan's forecast imports, curtailed and ex
 tiers and remaining daily allowance. A plan covering the full session is required. The estimate can
 change as the household plan adapts to the extra load. Connected MG iSMART cars can be opted in to a
 single stop request with follow-up confirmation from vehicle readings. Manual cars use the plan and
-time-limit reminder. Percentage sessions end on the reported target without a time cutoff.
+time-limit reminder. A future charge adds demand at its saved time using the estimated wall
+charging rate. Its energy is capped at a full charge from empty, since the battery level on the
+future date may differ from today's reading. Longer-dated entries are used when they reach the home
+forecast horizon. An overnight future charge increases the export floor alongside household load
+and its overnight buffer. The weekly vehicle outlook includes planned gains where driving and
+availability allow, and flags upper bounds when driving is uncertain. The future charge only
+affects the forecast. Percentage sessions end on the reported target without a time cutoff.
 Clock-time sessions use the site's timezone. The vehicle or charger timer is useful for a firm
 deadline during app or network outages.
 

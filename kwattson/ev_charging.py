@@ -94,6 +94,14 @@ def session_soc(db: Database, vehicle: Vehicle, now: datetime, data: dict, start
     return min(100, initial + elapsed * rate * vehicle.charger_efficiency / vehicle.capacity_kwh * 100)
 
 
+def planned_window(vehicle: Vehicle, rate: float, row: dict) -> tuple[datetime, datetime]:
+    """Expected charging interval, capped at the energy for a full charge from empty."""
+    start = datetime.fromisoformat(row['starts'])
+    full_hours = vehicle.capacity_kwh / vehicle.charger_efficiency / rate
+    duration = datetime.fromisoformat(row['expires']) - start
+    return start, start + min(duration, timedelta(hours=full_hours))
+
+
 def sessions(db: Database, now: datetime) -> list[dict]:
     rows = db.rows("SELECT * FROM overrides WHERE kind='ev_charge_now' AND cancelled_at IS NULL "
                    "AND starts<=? AND (expires>? OR (expires>? AND json_extract(data,'$.state')='stopping')) "

@@ -85,7 +85,8 @@ class ChargeOptions(Body):
 
 
 class OverrideIn(ChargeOptions):
-    kind: str = Field(pattern='^(hold|no_battery_export|reserve|ev_charge_now|ev_away)$')
+    kind: str = Field(pattern='^(hold|no_battery_export|reserve|ev_charge_now|ev_charge_planned|ev_away)$')
+    start_at: str | None = Field(None, max_length=48)
     pct: float | None = Field(None, ge=0, le=100)
 
 class AnnotationIn(Body):
@@ -406,8 +407,11 @@ async def latest_plan(request: Request):
             actual = {key: r[key] for key in ('solar_kwh', 'load_kwh', 'import_kwh', 'export_kwh', 'soc_end', 'coverage_s')}
         history.append(dict(ts=ts, buy_rate=p['buy'], sell_rate=p['sell'], **actual))
     decision = engine.latest_decision()
+    charges = db.rows("SELECT * FROM overrides WHERE kind='ev_charge_planned' AND cancelled_at IS NULL AND expires>? ORDER BY starts",
+                      (stamp(now),))
     return {'decision': {k: decision[k] for k in ('id', 'created_at', 'summary', 'version', 'forecast_id', 'tariff_id')} if decision else None,
-            'intervals': _intervals(db, decision['id']) if decision else [], 'history': history, 'as_of': stamp(now)}
+            'intervals': _intervals(db, decision['id']) if decision else [], 'history': history, 'as_of': stamp(now),
+            'ev_charges': [{**r, 'data': decode(r['data'])} for r in charges]}
 
 
 def _intervals(db, decision_id):
@@ -962,13 +966,27 @@ async def add_override(body: OverrideIn, request: Request):
     if body.kind == 'reserve' and body.pct is None:
         raise HTTPException(422, 'Give the reserve percentage to hold')
     data = {k: v for k, v in (('pct', body.pct), ('vehicle_id', body.vehicle_id)) if v is not None}
+    if (body.kind == 'ev_charge_planned') != (body.start_at is not None):
+        raise HTTPException(422, 'Enter a start time for a future charge.')
     if body.kind != 'ev_charge_now' and (body.target_pct is not None or body.starting_soc is not None or body.stop_at_limit
                                          or body.charge_mode is not None or body.end_at is not None or
                                          body.auto_schedule or body.grid_rates is not None):
         raise HTTPException(422, 'Charging targets apply to a charging session.')
     async with engine.ev_lock:
         now = utcnow().replace(microsecond=0)
+        start = now
         until = now + timedelta(minutes=body.minutes)
+        if body.kind == 'ev_charge_planned':
+            settings = db.settings()
+            v = charging_vehicle(settings, body.vehicle_id)
+            data = {'vehicle_id': v.id}
+            try:
+                start = datetime.fromisoformat(local_time(body.start_at, settings))
+                until = start + timedelta(minutes=body.minutes)
+            except (ValueError, OverflowError):
+                raise HTTPException(422, 'Choose a valid date and time.') from None
+            if start <= now:
+                raise HTTPException(422, 'Choose a charging start time in the future.')
         if body.kind == 'ev_charge_now':
             settings = db.settings()
             v = charging_vehicle(settings, body.vehicle_id)
@@ -986,12 +1004,18 @@ async def add_override(body: OverrideIn, request: Request):
                     charge_windows=estimate['windows'], schedule_kw=estimate['kw'],
                     scheduled_end_soc=estimate['end_soc'], dispatch_policy=dispatch_policy(settings))
         with db.connect() as c:
+            if body.kind == 'ev_charge_planned':
+                conflict = c.execute("SELECT 1 FROM overrides WHERE kind='ev_charge_planned' AND cancelled_at IS NULL "
+                                     "AND starts<? AND expires>? AND json_extract(data,'$.vehicle_id')=?",
+                                     (stamp(until), stamp(start), data['vehicle_id'])).fetchone()
+                if conflict:
+                    raise HTTPException(409, 'This car already has a planned charge during that time.')
             if body.kind == 'ev_charge_now':
                 c.execute("UPDATE overrides SET cancelled_at=? WHERE kind='ev_charge_now' AND cancelled_at IS NULL "
                           "AND expires>? AND json_extract(data,'$.vehicle_id')=?",
                           (stamp(now), stamp(now - 2 * ev_charging.END_GRACE), data['vehicle_id']))
             override_id = c.execute('INSERT INTO overrides(created_at, starts, expires, kind, data) VALUES(?,?,?,?,?)',
-                                    (stamp(now), stamp(now), stamp(until), body.kind, encode(data))).lastrowid
+                                    (stamp(now), stamp(start), stamp(until), body.kind, encode(data))).lastrowid
     db.audit('override_added', {'id': override_id, 'kind': body.kind}, actor(request))
     engine.request_plan()
     return {'id': override_id}

@@ -1,5 +1,6 @@
 """Tariff boundaries and overnight energy to retain before selling battery power."""
 from datetime import datetime, timedelta
+from typing import NamedTuple
 
 from .config import Settings, UTC, stamp
 from .tariffs import plan_at
@@ -51,6 +52,7 @@ def split_points(settings: Settings, points: list[dict]) -> list[dict]:
             h = (b - a).total_seconds() / 3600
             fraction = h / p['hours']
             point = {**p, **{key: p[key] * fraction for key in energy_keys},
+                     'planned_ev_kwh': p.get('planned_ev_kwh', 0) * fraction,
                      'ts': stamp(a), 'hours': h, 'lead_minutes': int((a - start).total_seconds() // 60),
                      'solar_by_system': {k: v * fraction for k, v in p['solar_by_system'].items()},
                      'charge_allowed': not any(lo <= a < hi for lo, hi in charge_blocks),
@@ -59,8 +61,14 @@ def split_points(settings: Settings, points: list[dict]) -> list[dict]:
     return result
 
 
-def overnight_need(points: list[dict], settings: Settings) -> list[tuple[float, float] | None]:
-    """Remaining net house demand and uncertainty through the next local 06:00."""
+class OvernightNeed(NamedTuple):
+    energy_kwh: float
+    uncertainty_kwh: float
+    planned_ev_kwh: float
+
+
+def overnight_need(points: list[dict], settings: Settings) -> list[OvernightNeed | None]:
+    """Remaining net home and planned EV demand and uncertainty through the next local 06:00."""
     need = [None] * len(points)
     ac_limits = {s.id: s.ac_kw for s in settings.active_systems()}
     future = None
@@ -71,14 +79,16 @@ def overnight_need(points: list[dict], settings: Settings) -> list[tuple[float, 
         end = start + timedelta(hours=p['hours'])
         local = end.astimezone(settings.zone)
         if (local.hour, local.minute, local.second, local.microsecond) == (6, 0, 0, 0):
-            future = (0.0, 0.0)
+            future = OvernightNeed(0.0, 0.0, 0.0)
         elif end != next_start:
             future = None
         need[i] = future
         if future is not None:
             solar = sum(min(kwh, ac_limits[sid] * p['hours']) for sid, kwh in p['solar_by_system'].items() if sid in ac_limits)
-            central = max(0.0, p['house_kwh'] - solar)
-            upper = max(0.0, p['house_p90'] - solar)
-            future = (future[0] + central, future[1] + 0.5 * max(0.0, upper - central))
+            ev = p.get('planned_ev_kwh', 0)
+            central = max(0.0, p['house_kwh'] + ev - solar)
+            upper = max(0.0, p['house_p90'] + ev - solar)
+            future = OvernightNeed(future.energy_kwh + central, future.uncertainty_kwh + 0.5 * max(0.0, upper - central),
+                                   future.planned_ev_kwh + ev)
         next_start = start
     return need

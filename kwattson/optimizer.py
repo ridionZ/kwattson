@@ -47,7 +47,7 @@ from .dispatch import overnight_need, split_points
 from .ingest import select_intervals
 from .tariffs import plan_at
 
-VERSION = 'milp-dc-coupled-v1.4'
+VERSION = 'milp-dc-coupled-v1.5'
 EPS = 1e-6
 
 
@@ -321,7 +321,7 @@ def plan(db: Database, settings: Settings, forecast_id: int, points: list[dict],
                 with_export = {sv['dis']: 1, y_import: -max_discharge}
                 if sale is not None:
                     with_export[sale] = -max_discharge
-                    expected, uncertainty = night
+                    expected, uncertainty, _ = night
                     # Share the net household load by battery capacity and convert it to stored energy.
                     extra = expected / (capacity * eta)
                     extra += min(settings.forecast.overnight_buffer_pct / 100, uncertainty / (capacity * eta))
@@ -365,7 +365,7 @@ def plan(db: Database, settings: Settings, forecast_id: int, points: list[dict],
     intervals = []
     if x is not None:
         x = np.maximum(x, 0)
-        for i, (p, price, v, base) in enumerate(zip(points, prices, idx, baseline)):
+        for p, price, v, base, night in zip(points, prices, idx, baseline, overnight):
             imp = float(sum(x[j] for j in v['imp']))
             exp = float(sum(x[j] for j in v['exp']))
             cost = float(sum(x[j] * m.cost[j] for j in v['imp'] + v['exp']))
@@ -376,7 +376,8 @@ def plan(db: Database, settings: Settings, forecast_id: int, points: list[dict],
                 per[s.id] = dict(pv_ac=g('pv_ac'), pv_bat=g('pv_bat'), grid_bat=g('grid_bat'), dis=g('dis'), curt=g('curt'),
                                  soc_kwh=g('soc'), soc_pct=g('soc') / s.battery.capacity_kwh * 100 if s.battery else None,
                                  export_floor_pct=sv.get('export_floor_pct'))
-            intervals.append(dict(p=p, price=price, imp=imp, exp=exp, cost=cost, systems=per, base=base))
+            intervals.append(dict(p=p, price=price, imp=imp, exp=exp, cost=cost, systems=per, base=base,
+                                  overnight_ev_kwh=night.planned_ev_kwh if night else 0.0))
         solver = 'HiGHS MILP'
     else:
         for p, price, base in zip(points, prices, baseline):
@@ -518,8 +519,9 @@ def explain(settings: Settings, intervals: list[dict], i: int, action: str) -> s
         floors = [d['export_floor_pct'] for sid, d in r['systems'].items()
                   if r['commands'].get(sid, {}).get('mode') == 'force_discharge']
         reserve = ' / '.join(f'{floor:.1f}%' for floor in floors)
+        demand = 'household use and planned EV charging' if r.get('overnight_ev_kwh', 0) > EPS else 'household use'
         return (f"Export battery energy at {_cents(price['sell'])}. Keep at least {reserve} for the minimum "
-                f"reserve and forecast household use through 6 am. Cheapest refill ahead is {_cents(refill)}.")
+                f"reserve and forecast {demand} through 6 am. Cheapest refill ahead is {_cents(refill)}.")
     if action == 'export_priority':
         clip = sum(x['base']['curtailed'] for x in later[:16])
         if clip > 0.2:
@@ -532,6 +534,8 @@ def explain(settings: Settings, intervals: list[dict], i: int, action: str) -> s
             return (f"Keep the battery for {expensive['price']['label'].lower()} imports at {_cents(expensive['price']['buy'])}; "
                     f"grid power now costs {_cents(price['buy'])}.")
         return 'Keep stored energy for later; using it now is worth less than the battery wear.'
+    if r['p'].get('planned_ev_kwh', 0) > EPS:
+        return 'Normal self-use includes the EV charge you have planned for this time.'
     if r['exp'] > 0.05 and sum(d['curt'] for d in r['systems'].values()) > 0.05:
         return 'Battery full and inverter at its AC limit: some solar is unavoidably curtailed.'
     return 'Normal self-use: solar to the home first, then the battery, then the grid.'

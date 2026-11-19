@@ -27,10 +27,10 @@ def test_forecast_clips_at_battery_target_and_partial_time_limit(db, settings):
     slots = [(NOW + timedelta(minutes=30 * i), 0.5) for i in range(4)]
     session = dict(id=1, kind='ev_charge_now', starts=stamp(NOW), expires=stamp(expires),
                    data={'vehicle_id': CAR.id, 'starting_soc': 47, 'target_pct': 50})
-    energy, _ = forecast.ev_plan(db, settings, NOW, slots, [], [session])
+    energy, _, _ = forecast.ev_plan(db, settings, NOW, slots, [], [session])
     assert energy == pytest.approx([2, 0, 0, 0])
     session['data']['target_pct'] = 80
-    energy, _ = forecast.ev_plan(db, settings, NOW, slots, [], [session])
+    energy, _, _ = forecast.ev_plan(db, settings, NOW, slots, [], [session])
     assert energy == pytest.approx([3, 1.5, 0, 0])
 
 

@@ -133,3 +133,10 @@ def test_three_week_roster_improves_held_out_predictions(settings):
     for point in points[1:]:
         day = datetime.fromisoformat(point['day']).date()
         assert point['drain_pct'] == daily[day - timedelta(weeks=3)]
+
+
+def test_charging_day_suggestion_can_extend_beyond_the_home_plan(db, settings):
+    car = CAR.model_copy(update={'manual_soc': 85, 'weekday_km': [100] * 7})
+    info = ev_advice(db, settings, [], car, NOW, [])
+    assert info['suggested_day'] == '2026-11-21'
+    assert info['recommendation'] is None

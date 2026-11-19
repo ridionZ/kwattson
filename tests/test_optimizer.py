@@ -192,3 +192,24 @@ def test_export_reserve_includes_demand_and_adapts_to_overnight_spread(db, setti
         assert d['soc_pct'] >= d['export_floor_pct'] - 1e-5
         assert row['commands']['main']['target_soc'] >= d['export_floor_pct']
     assert noisy['intervals'][-1]['soc_pct'] < expected_floor
+
+
+def test_planned_ev_charge_increases_overnight_export_reserve(db, settings):
+    s = solarmax(settings)
+    s.forecast.terminal_value_factor = 0
+    start = START.replace(hour=18)
+    points = sunny_points(start, hours=12, peak_kw=0)
+    for p in points:
+        p.update(house_kwh=0.15, house_p90=0.15, load_kwh=0.15)
+    plain = run(db, s, points, soc_pct=95)
+    for p in points:
+        if datetime.fromisoformat(p['ts']).astimezone(ZONE).hour == 22:
+            p.update(planned_ev_kwh=3, ev_kwh=3, load_kwh=3.15)
+    planned = run(db, s, points, soc_pct=95)
+    base = next(r for r in plain['intervals'] if r['action'] == 'force_discharge')
+    same = next(r for r in planned['intervals'] if r['ts'] == base['ts'])
+    eta = s.systems[0].battery.round_trip_efficiency ** 0.5
+    extra = same['systems']['main']['export_floor_pct'] - base['systems']['main']['export_floor_pct']
+    assert extra == pytest.approx(6 / eta / BATTERY_KWH * 100)
+    assert sum(r['export_kwh'] for r in planned['intervals']) < sum(r['export_kwh'] for r in plain['intervals'])
+    assert any('planned EV charging' in r['reason'] for r in planned['intervals'] if r['action'] == 'force_discharge')

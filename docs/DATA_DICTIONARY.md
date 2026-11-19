@@ -35,12 +35,13 @@ export/house/charge/discharge kWh. No intraday detail.
 **exclusions** (`start`, `end`, `reason`): never train on these periods (empty by default; add
 fault weeks or other unrepresentative periods). **holidays** (`name`, `start`, `end`, `load_factor` NULL = use base load,
 `ev_away`). **annotations** (`kind`: note/guests/appliance/outage/maintenance/exclude, `text`).
-**overrides** (`kind`: hold, no_battery_export, reserve, ev_charge_now, ev_away; `data` JSON e.g.
+**overrides** (`kind`: hold, no_battery_export, reserve, ev_charge_now, ev_charge_planned, ev_away; `data` JSON e.g.
 `{"pct": 60}`; `starts`, `expires`, `cancelled_at`). EV charging overrides can store a
 `vehicle_id`, `target_pct`, `starting_soc`, `stop_at_limit`, and the observed stop state and
 request timestamp. Ready-by plans also record the `charge_mode`, permitted `grid_rates`, estimated
 final charge and cost, planned window boundaries, and the tariff policy and command state used by
-automatic scheduling.
+automatic scheduling. Forecast-only future charges store the car ID and use the override
+start and expiry as their planned time range.
 **settings** (current JSON) and **settings_history** (`changed` sections, full `data` snapshot each change).
 
 ## Weather

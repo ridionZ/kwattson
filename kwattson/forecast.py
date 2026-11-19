@@ -33,14 +33,14 @@ from statistics import median
 import numpy as np
 
 from .config import Settings, stamp, utcnow
-from .ev_charging import charge_rate, session_estimate, session_soc
+from .ev_charging import charge_rate, planned_window, session_estimate, session_soc
 from .weather import freshness_hours
 from .db import Database, decode, encode
 from .ingest import select_intervals
 
 LOAD_VERSION = 'profile-temperature-v3'
 SOLAR_VERSION = 'hourly-ratio-v3'
-VERSION = f'{LOAD_VERSION}+{SOLAR_VERSION}+ev-session-v2'
+VERSION = f'{LOAD_VERSION}+{SOLAR_VERSION}+ev-session-v3'
 WEATHER_PREFERRED_HOURS = 6
 WEATHER_MAX_HOURS = 24
 COLD_START_SHAPE = [.45, .35, .3, .3, .3, .35, .75, 1.15, .85, .65, .55, .6, .65, .65, .65, .7, .9, 1.25, 1.6, 1.5, 1.1, .85, .65, .5]
@@ -235,14 +235,16 @@ def clear_sky_shape(local: datetime) -> float:
 
 # ---------------------------------------------------------------------------- EV
 def ev_plan(db: Database, settings: Settings, now: datetime, slots: list[tuple[datetime, float]],
-            holidays: list[dict], overrides: list[dict]) -> tuple[list[float], dict]:
+            holidays: list[dict], overrides: list[dict]) -> tuple[list[float], list[float], dict]:
     """Expected EV charging energy (kWh at the wall) per slot, summed over vehicles."""
     zone = settings.zone
     total = [0.0] * len(slots)
+    planned = [0.0] * len(slots)
     info = {}
     for vehicle in settings.active_vehicles():
         latest = db.latest_vehicle(vehicle.id)
-        fresh = latest and (now - datetime.fromisoformat(latest['ts'])) < timedelta(hours=6)
+        fresh = (latest and latest['plugin'] == vehicle.plugin
+                 and timedelta(0) <= now - datetime.fromisoformat(latest['ts']) < timedelta(hours=6))
         soc = latest['soc'] if fresh and latest['soc'] is not None else vehicle.manual_soc
         charging = bool(fresh and latest['charging'])
         away_now = bool(fresh and latest['at_home'] == 0)
@@ -250,12 +252,19 @@ def ev_plan(db: Database, settings: Settings, now: datetime, slots: list[tuple[d
         session = max((o for o in mine if o['kind'] == 'ev_charge_now'), key=lambda o: o.get('id', 0), default=None)
         force = bool(session and session['data'].get('state') not in ('finished', 'confirmed'))
         rate = charge_rate(db, vehicle, now)[0]
+        saved = [o for o in mine if o['kind'] == 'ev_charge_planned']
+        booked = [planned_window(vehicle, rate, o) for o in saved]
+        booked_days = set()
+        for start, end in booked:
+            first = start.astimezone(zone).date()
+            last = (end - timedelta(microseconds=1)).astimezone(zone).date()
+            booked_days.update(first + timedelta(days=i) for i in range((last - first).days + 1))
         away_until = max((o['expires'] for o in mine if o['kind'] == 'ev_away'), default=None)
         need = lambda: max(0.0, (vehicle.target_pct - soc) / 100 * vehicle.capacity_kwh / vehicle.charger_efficiency) if soc is not None else None
         per_session = vehicle.km_per_week * vehicle.kwh_per_100km / 100 / vehicle.charger_efficiency / max(1, len(vehicle.schedule.days))
         remaining = (need() or per_session) if charging else 0.0
         first_session = True
-        started = set()
+        started = set(booked_days)
         windows = None
         if session:
             start = datetime.fromisoformat(session['starts'])
@@ -273,8 +282,9 @@ def ev_plan(db: Database, settings: Settings, now: datetime, slots: list[tuple[d
         for i, (at, hours) in enumerate(slots):
             local = at.astimezone(zone)
             iso = stamp(at)
-            away = (away_now and i < 4) or (away_until and iso < away_until) or any(
+            marked_away = (away_until and iso < away_until) or any(
                 h['ev_away'] and h['start'] <= iso < h['end'] for h in holidays)
+            away = marked_away or (away_now and i < 4)
             day = local.date()
             session_slot = bool(session and at < until)
             if session_slot:
@@ -288,21 +298,28 @@ def ev_plan(db: Database, settings: Settings, now: datetime, slots: list[tuple[d
                 gap = need() if first_session else None
                 remaining = gap if gap is not None else per_session
                 first_session = False
+            if marked_away:
+                continue
+            stop = at + timedelta(hours=hours)
+            booked_hours = sum(max(0, (min(stop, end) - max(at, start)).total_seconds())
+                               for start, end in booked) / 3600
+            planned[i] += booked_hours * rate
+            if away:
+                total[i] += booked_hours * rate
+                continue
             if session_slot and windows is not None:
-                if not away:
-                    end = at + timedelta(hours=hours)
-                    overlap = sum(max(0, (min(end, stop) - max(at, start)).total_seconds()) for start, stop in windows)
-                    total[i] += overlap * session['data']['schedule_kw'] / 3600
-                continue
-            if away or remaining <= 0:
-                continue
-            duration = min(hours, (until - at).total_seconds() / 3600) if session_slot else hours
-            energy = min(rate * duration, remaining)
-            total[i] += energy
-            remaining -= energy
+                overlap = sum(max(0, (min(stop, end) - max(at, start)).total_seconds()) for start, end in windows)
+                energy = overlap * session['data']['schedule_kw'] / 3600
+            else:
+                duration = min(hours, (until - at).total_seconds() / 3600) if session_slot else hours
+                energy = min(rate * duration, remaining)
+                remaining -= energy
+            # Two plans for the same car describe the same load if their intervals overlap.
+            total[i] += max(energy, booked_hours * rate)
         info[vehicle.id] = dict(soc=soc, soc_source='live' if fresh and latest['soc'] is not None else 'manual' if soc is not None else 'unknown',
-                                charging=charging, forced=bool(session), per_session_kwh=round(per_session, 2))
-    return total, info
+                                charging=charging, forced=bool(session), per_session_kwh=round(per_session, 2),
+                                planned_charges=[o['id'] for o in saved])
+    return total, planned, info
 
 
 # ----------------------------------------------------------------------- forecast
@@ -318,7 +335,9 @@ def build(db: Database, settings: Settings, now: datetime | None = None) -> tupl
     weather_ok = use_weather and weather_age is not None and 0 <= weather_age <= WEATHER_MAX_HOURS
     holidays = db.rows('SELECT * FROM holidays WHERE end>? AND start<?', (stamp(now), stamp(horizon)))
     overrides = [{**o, 'data': decode(o['data'])} for o in
-                 db.rows('SELECT * FROM overrides WHERE cancelled_at IS NULL AND expires>? AND starts<=?', (stamp(now), stamp(now)))]
+                 db.rows("SELECT * FROM overrides WHERE cancelled_at IS NULL AND expires>? "
+                         "AND starts<? AND (starts<=? OR kind='ev_charge_planned')",
+                         (stamp(now), stamp(horizon), stamp(now)))]
 
     slots = []
     cursor = now
@@ -327,7 +346,7 @@ def build(db: Database, settings: Settings, now: datetime | None = None) -> tupl
         stop = min(boundary, horizon)
         slots.append((cursor, (stop - cursor).total_seconds() / 3600))
         cursor = stop
-    ev, ev_info = ev_plan(db, settings, now, slots, holidays, overrides)
+    ev, planned_ev, ev_info = ev_plan(db, settings, now, slots, holidays, overrides)
 
     risk = settings.forecast.risk
     points = []
@@ -379,7 +398,7 @@ def build(db: Database, settings: Settings, now: datetime | None = None) -> tupl
             solar_basis.append(f'weather fetched {age:.0f} h ago; cautious planning')
         points.append(dict(
             ts=stamp(at), hours=hours, lead_minutes=int((at - now).total_seconds() // 60),
-            house_kwh=centre * hours, house_p10=low * hours, house_p90=high * hours, ev_kwh=ev[i],
+            house_kwh=centre * hours, house_p10=low * hours, house_p90=high * hours, ev_kwh=ev[i], planned_ev_kwh=planned_ev[i],
             load_kwh=planned_house * hours + ev[i],
             solar_kwh=solar, solar_p10=solar_low, solar_p90=solar_high,
             solar_by_system={k: v * scale for k, v in by_system.items()},

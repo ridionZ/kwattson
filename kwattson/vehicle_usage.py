@@ -87,10 +87,11 @@ def fit_cycle(daily):
     return weekly, best_period, best_values
 
 
-def project(soc, now, zone, vehicle, daily):
+def project(soc, now, zone, vehicle, daily, charge_by_day=None):
     """End-of-day SoC for seven local dates, starting with the remaining part of today."""
     today = now.astimezone(zone).date()
     weekly, period, roster = fit_cycle(daily)
+    charge_by_day = charge_by_day or {}
     points = []
     gap = False
     for offset in range(7):
@@ -107,9 +108,10 @@ def project(soc, now, zone, vehicle, daily):
         if drain is not None and offset == 0:
             drain *= (end - now) / (end - start)
         gap |= drain is None
-        if soc is not None and drain is not None:
-            soc = max(0, soc - drain)
+        charge = charge_by_day.get(day, 0.0)
+        if soc is not None:
+            soc = min(100, max(0, soc - (drain or 0)) + charge)
         points.append(dict(day=day.isoformat(), soc_pct=None if gap else soc,
-                           soc_upper_pct=soc if gap and drain is not None else None,
-                           drain_pct=drain, source=source))
+                           soc_upper_pct=soc if gap and (drain is not None or charge) else None,
+                           drain_pct=drain, source=source, planned_charge_pct=round(charge, 1)))
     return points
