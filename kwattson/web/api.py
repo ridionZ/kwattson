@@ -10,19 +10,21 @@ from __future__ import annotations
 import json
 import secrets as pysecrets
 from datetime import datetime, timedelta
+from typing import Literal
 
 import pyotp
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from .. import __version__, advice, ev_charging, exports, forecast, outcomes, weather
+from .. import __version__, advice, ev_charging, ev_schedule, exports, forecast, outcomes, weather
 from ..devices import DEMO_PLUGINS, check_demo_plugin
 from ..config import EnergySystem, Vehicle, Settings, stamp, utcnow
 from ..control import commissioning_hash
 from ..db import decode, encode
 from ..ingest import select_intervals
 from ..notifications import EVENTS, check_template
+from ..optimizer import dispatch_policy
 from ..notifications.channels import CHANNELS, describe as describe_channels
 from ..plugins import registry
 from ..plugins.push import system_reading, vehicle_reading
@@ -70,15 +72,21 @@ class HolidayIn(Body):
     ev_away: bool = True
 
 
-class OverrideIn(Body):
-    kind: str = Field(pattern='^(hold|no_battery_export|reserve|ev_charge_now|ev_away)$')
+class ChargeOptions(Body):
     minutes: int = Field(120, ge=5, le=60 * 24 * 14)
-    pct: float | None = Field(None, ge=0, le=100)
     vehicle_id: str | None = Field(None, max_length=40)
     target_pct: float | None = Field(None, gt=0, le=100)
     starting_soc: float | None = Field(None, ge=0, le=100)
     stop_at_limit: bool = False
+    charge_mode: Literal['time', 'percentage', 'ready_by'] | None = None
+    end_at: str | None = Field(None, max_length=48)
+    grid_rates: list[float] | None = Field(None, max_length=100)
+    auto_schedule: bool = False
 
+
+class OverrideIn(ChargeOptions):
+    kind: str = Field(pattern='^(hold|no_battery_export|reserve|ev_charge_now|ev_away)$')
+    pct: float | None = Field(None, ge=0, le=100)
 
 class AnnotationIn(Body):
     start: str
@@ -322,7 +330,8 @@ async def status(request: Request):
         systems.append(dict(id=s.id, name=s.name, plugin=s.plugin, enabled=s.enabled, controllable=s.controllable,
                             reading=latest, poll=engine.devices.status.get(f'system:{s.id}')))
     vehicles = [dict(id=v.id, name=v.name, plugin=v.plugin, enabled=v.enabled, reading=db.latest_vehicle(v.id), manual_soc=v.manual_soc,
-                     target_pct=v.target_pct, can_stop_charging=ev_charging.can_stop(v), poll=engine.devices.status.get(f'vehicle:{v.id}')) for v in settings.vehicles]
+                     target_pct=v.target_pct, can_stop_charging=ev_charging.can_stop(v),
+                     can_schedule_charging=ev_charging.can_schedule(v), poll=engine.devices.status.get(f'vehicle:{v.id}')) for v in settings.vehicles]
     try:
         today = outcomes.today_so_far(db, settings, now)
     except Exception:
@@ -866,21 +875,62 @@ def charging_vehicle(settings: Settings, vehicle_id: str | None) -> Vehicle:
     return vehicle
 
 
+def charge_options(settings, vehicle, now, body):
+    mode = body.charge_mode
+    if (mode in ('percentage', 'ready_by') and body.target_pct is None
+            or mode == 'time' and body.target_pct is not None
+            or mode == 'percentage' and body.end_at is not None
+            or mode == 'ready_by' and (body.end_at is None or body.stop_at_limit)
+            or mode != 'ready_by' and (body.grid_rates is not None or body.auto_schedule)
+            or body.end_at is not None and mode not in ('time', 'ready_by')):
+        raise HTTPException(422, 'Choose a valid charge goal.')
+    if body.grid_rates is not None and any(not -2 <= rate <= 5 for rate in body.grid_rates):
+        raise HTTPException(422, 'Choose valid grid rates.')
+    if body.auto_schedule and not ev_charging.can_schedule(vehicle):
+        raise HTTPException(422, 'Enable automatic scheduling on a compatible vehicle connection.')
+    if body.end_at:
+        try:
+            until = datetime.fromisoformat(local_time(body.end_at, settings))
+        except ValueError:
+            raise HTTPException(422, 'Choose a valid date and time.') from None
+        if not timedelta(minutes=1) <= until - now <= timedelta(hours=48):
+            raise HTTPException(422, 'Choose a time between one minute and 48 hours from now.')
+    else:
+        # Percentage monitoring has a retention limit, but it does not use a time cutoff.
+        until = now + timedelta(days=14) if mode == 'percentage' else now + timedelta(minutes=body.minutes)
+    if body.stop_at_limit and (not ev_charging.can_stop(vehicle) or
+                               (mode != 'percentage' and until - now > timedelta(hours=24))):
+        raise HTTPException(422, 'Automatic stopping needs a compatible connection and a time limit of 24 hours or less.')
+    data = {key: val for key, val in (('charge_mode', mode), ('target_pct', body.target_pct), ('starting_soc', body.starting_soc),
+            ('grid_rates', body.grid_rates)) if val is not None}
+    data.update(vehicle_id=vehicle.id, stop_at_limit=body.stop_at_limit, auto_schedule=body.auto_schedule)
+    return until, data
+
+
+def charge_estimate(db, settings, vehicle, now, until, data, starts, decision):
+    if data.get('charge_mode') == 'ready_by':
+        rows = advice.plan_intervals(db, decision['id']) if decision else []
+        return ev_schedule.preview(db, settings, vehicle, now, until, data, decision, rows)
+    return advice.charging_preview(db, settings, vehicle, now, until, data, starts, decision)
+
+
 @router.get('/overrides/charge-preview')
-def preview_charge(request: Request, vehicle_id: str, minutes: int, target_pct: float | None = None,
-                   starting_soc: float | None = None):
+def preview_charge(request: Request, vehicle_id: str, minutes: int = 120, target_pct: float | None = None,
+                   starting_soc: float | None = None, charge_mode: Literal['time', 'percentage', 'ready_by'] | None = None,
+                   end_at: str | None = None, restrict_grid: bool = False, grid_rates: list[float] = Query(default=[]),
+                   auto_schedule: bool = False, stop_at_limit: bool = False):
     db, _, engine, _ = ctx(request)
-    if (not 5 <= minutes <= 60 * 24 * 14 or (target_pct is not None and not 0 < target_pct <= 100)
-            or (starting_soc is not None and not 0 <= starting_soc <= 100)):
-        raise HTTPException(422, 'Enter a valid duration and battery percentage.')
+    try:
+        body = ChargeOptions(vehicle_id=vehicle_id, minutes=minutes, target_pct=target_pct, starting_soc=starting_soc,
+                             charge_mode=charge_mode, end_at=end_at, auto_schedule=auto_schedule, stop_at_limit=stop_at_limit,
+                             grid_rates=grid_rates if restrict_grid else None)
+    except ValueError:
+        raise HTTPException(422, 'Enter a valid duration and battery percentage.') from None
     settings = db.settings()
     vehicle = charging_vehicle(settings, vehicle_id)
     now = utcnow().replace(microsecond=0)
-    data = {'target_pct': target_pct}
-    if starting_soc is not None:
-        data['starting_soc'] = starting_soc
-    return advice.charging_preview(db, settings, vehicle, now, now + timedelta(minutes=minutes), data,
-                                   stamp(now), engine.latest_decision())
+    until, data = charge_options(settings, vehicle, now, body)
+    return charge_estimate(db, settings, vehicle, now, until, data, stamp(now), engine.latest_decision())
 
 
 @router.get('/overrides')
@@ -897,9 +947,12 @@ def overrides(request: Request):
         r['data'] = decode(r['data'])
         v = vehicles.get(r['data'].get('vehicle_id'))
         if r['kind'] == 'ev_charge_now' and v and not r['data'].get('state') and r['starts'] <= stamp(now):
-            decision = decision or engine.latest_decision()
-            r['estimate'] = advice.charging_preview(db, settings, v, now, datetime.fromisoformat(r['expires']),
-                                                    r['data'], r['starts'], decision)
+            if r['data'].get('charge_mode') == 'ready_by':
+                r['estimate'] = r['data']['charge_estimate']
+            else:
+                decision = decision or engine.latest_decision()
+                r['estimate'] = advice.charging_preview(db, settings, v, now, datetime.fromisoformat(r['expires']),
+                                                        r['data'], r['starts'], decision)
     return rows
 
 
@@ -909,24 +962,36 @@ async def add_override(body: OverrideIn, request: Request):
     if body.kind == 'reserve' and body.pct is None:
         raise HTTPException(422, 'Give the reserve percentage to hold')
     data = {k: v for k, v in (('pct', body.pct), ('vehicle_id', body.vehicle_id)) if v is not None}
-    if body.kind != 'ev_charge_now' and (body.target_pct is not None or body.starting_soc is not None or body.stop_at_limit):
+    if body.kind != 'ev_charge_now' and (body.target_pct is not None or body.starting_soc is not None or body.stop_at_limit
+                                         or body.charge_mode is not None or body.end_at is not None or
+                                         body.auto_schedule or body.grid_rates is not None):
         raise HTTPException(422, 'Charging targets apply to a charging session.')
     async with engine.ev_lock:
-        now = utcnow()
+        now = utcnow().replace(microsecond=0)
+        until = now + timedelta(minutes=body.minutes)
         if body.kind == 'ev_charge_now':
-            v = charging_vehicle(db.settings(), body.vehicle_id)
-            data['vehicle_id'] = v.id
-            if body.stop_at_limit and (not ev_charging.can_stop(v) or body.minutes > 24 * 60):
-                raise HTTPException(422, 'Automatic stopping needs a compatible connection and a session of 24 hours or less.')
-            data.update({k: val for k, val in (('target_pct', body.target_pct), ('starting_soc', body.starting_soc)) if val is not None})
-            data['stop_at_limit'] = body.stop_at_limit
+            settings = db.settings()
+            v = charging_vehicle(settings, body.vehicle_id)
+            until, data = charge_options(settings, v, now, body)
+            existing = next((r for r in ev_charging.sessions(db, now) if r['data'].get('vehicle_id') == v.id), None)
+            if existing and existing['data'].get('auto_schedule') and not existing['data'].get('state'):
+                raise HTTPException(409, 'Cancel the current automatic charging schedule before replacing it.')
+            if data.get('charge_mode') == 'ready_by':
+                estimate = charge_estimate(db, settings, v, now, until, data, stamp(now), engine.latest_decision())
+                if estimate['soc'] is None:
+                    raise HTTPException(422, 'Enter the current battery percentage to schedule charging.')
+                data.update(charge_estimate={key: estimate[key] for key in (
+                    'finish', 'energy_kwh', 'end_soc', 'kw', 'rate_basis', 'paid_grid_kwh', 'paid_grid_aud',
+                    'target_reachable', 'windows')},
+                    charge_windows=estimate['windows'], schedule_kw=estimate['kw'],
+                    scheduled_end_soc=estimate['end_soc'], dispatch_policy=dispatch_policy(settings))
         with db.connect() as c:
             if body.kind == 'ev_charge_now':
                 c.execute("UPDATE overrides SET cancelled_at=? WHERE kind='ev_charge_now' AND cancelled_at IS NULL "
                           "AND expires>? AND json_extract(data,'$.vehicle_id')=?",
                           (stamp(now), stamp(now - 2 * ev_charging.END_GRACE), data['vehicle_id']))
             override_id = c.execute('INSERT INTO overrides(created_at, starts, expires, kind, data) VALUES(?,?,?,?,?)',
-                                    (stamp(now), stamp(now), stamp(now + timedelta(minutes=body.minutes)), body.kind, encode(data))).lastrowid
+                                    (stamp(now), stamp(now), stamp(until), body.kind, encode(data))).lastrowid
     db.audit('override_added', {'id': override_id, 'kind': body.kind}, actor(request))
     engine.request_plan()
     return {'id': override_id}
@@ -936,7 +1001,13 @@ async def add_override(body: OverrideIn, request: Request):
 async def cancel_override(override_id: int, request: Request):
     db, _, engine, _ = ctx(request)
     async with engine.ev_lock:
-        db.execute('UPDATE overrides SET cancelled_at=? WHERE id=?', (stamp(), override_id))
+        row = db.one('SELECT kind, data, expires FROM overrides WHERE id=? AND cancelled_at IS NULL', (override_id,))
+        data = decode(row['data']) if row and row['kind'] == 'ev_charge_now' else {}
+        if data.get('auto_schedule') and not data.get('state') and row['expires'] > stamp(utcnow() - ev_charging.END_GRACE):
+            data['cancel_requested'] = True
+            db.execute('UPDATE overrides SET data=? WHERE id=?', (encode(data), override_id))
+        else:
+            db.execute('UPDATE overrides SET cancelled_at=? WHERE id=?', (stamp(), override_id))
     engine.request_plan()
     return {'cancelled': True}
 

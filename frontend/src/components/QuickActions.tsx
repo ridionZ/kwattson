@@ -1,4 +1,4 @@
-import { useEffect, useId, useState, type FormEvent, type ReactNode } from 'react';
+import { useId, useState, type FormEvent, type ReactNode } from 'react';
 import Box from '@mui/material/Box';
 import Button from '@mui/material/Button';
 import Dialog from '@mui/material/Dialog';
@@ -9,7 +9,6 @@ import TextField from '@mui/material/TextField';
 import InputAdornment from '@mui/material/InputAdornment';
 import FormControlLabel from '@mui/material/FormControlLabel';
 import Switch from '@mui/material/Switch';
-import Checkbox from '@mui/material/Checkbox';
 import Alert from '@mui/material/Alert';
 import Typography from '@mui/material/Typography';
 import Chip from '@mui/material/Chip';
@@ -22,34 +21,18 @@ import PauseCircleRounded from '@mui/icons-material/PauseCircleRounded';
 import BlockRounded from '@mui/icons-material/BlockRounded';
 import EvStationRounded from '@mui/icons-material/EvStationRounded';
 import DirectionsCarRounded from '@mui/icons-material/DirectionsCarRounded';
-import { get, post, errorText } from '../lib/api';
+import { post, errorText } from '../lib/api';
 import * as f from '../lib/fmt';
 import { useToast } from './common';
+import ChargeDialog, { type ChargingVehicle } from './ChargeDialog';
 
 type Kind = 'away' | 'reserve' | 'hold' | 'no_battery_export' | 'ev_charge_now' | 'ev_away';
-interface Vehicle {
-  id: string;
-  name: string;
-  can_stop_charging?: boolean;
-  manual_soc?: number | null;
-  reading?: { soc?: number | null; ts?: string };
-}
+type Open = { kind: Kind; vehicle?: ChargingVehicle } | null;
+type OtherAction = { kind: Exclude<Kind, 'ev_charge_now'>; vehicle?: ChargingVehicle };
 
-export interface ChargeEstimate {
-  finish: string;
-  energy_kwh: number;
-  end_soc: number | null;
-  target_reachable: boolean | null;
-  kw: number;
-  rate_basis: 'measured' | 'learned' | 'configured';
-  paid_grid_kwh: number | null;
-  paid_grid_aud: number | null;
-}
-type Open = { kind: Kind; vehicle?: Vehicle } | null;
-
-export default function QuickActions({ vehicles, onDone }: { vehicles: Vehicle[]; onDone: () => void }) {
+export default function QuickActions({ vehicles, onDone }: { vehicles: ChargingVehicle[]; onDone: () => void }) {
   const [open, setOpen] = useState<Open>(null);
-  const items: { kind: Kind; label: string; Icon: typeof LuggageRounded; vehicle?: Vehicle; tone: string }[] = [
+  const items: { kind: Kind; label: string; Icon: typeof LuggageRounded; vehicle?: ChargingVehicle; tone: string }[] = [
     { kind: 'away', label: 'Going away', Icon: LuggageRounded, tone: 'primary' },
     { kind: 'reserve', label: 'Storm coming', Icon: ThunderstormRounded, tone: 'battery' },
     { kind: 'hold', label: 'Pause battery', Icon: PauseCircleRounded, tone: 'battery' },
@@ -74,7 +57,10 @@ export default function QuickActions({ vehicles, onDone }: { vehicles: Vehicle[]
           </Button>
         ))}
       </Box>
-      {open && <ActionDialog open={open} onClose={() => setOpen(null)} onDone={() => { setOpen(null); onDone(); }} vehicles={vehicles} />}
+      {open?.kind === 'ev_charge_now' && open.vehicle && <ChargeDialog vehicle={open.vehicle}
+        onClose={() => setOpen(null)} onDone={() => { setOpen(null); onDone(); }} />}
+      {open && open.kind !== 'ev_charge_now' &&
+        <ActionDialog open={{ ...open, kind: open.kind }} onClose={() => setOpen(null)} onDone={() => { setOpen(null); onDone(); }} vehicles={vehicles} />}
     </>
   );
 }
@@ -100,12 +86,12 @@ function HoursField({ value, onChange, label = 'For how long', max = 336 }: { va
   );
 }
 
-function ActionDialog({ open, onClose, onDone, vehicles }: { open: NonNullable<Open>; onClose: () => void; onDone: () => void; vehicles: Vehicle[] }) {
+function ActionDialog({ open, onClose, onDone, vehicles }: { open: OtherAction; onClose: () => void; onDone: () => void; vehicles: ChargingVehicle[] }) {
   const titleId = useId();
   const toast = useToast();
   const fullScreen = useMediaQuery((t: Theme) => t.breakpoints.down('sm'));
   const now = Date.now();
-  const [hours, setHours] = useState(open.kind === 'reserve' ? '12' : open.kind === 'ev_away' ? '24' : open.kind === 'ev_charge_now' ? '4' : '3');
+  const [hours, setHours] = useState(open.kind === 'reserve' ? '12' : open.kind === 'ev_away' ? '24' : '3');
   const [pct, setPct] = useState('80');
   const [name, setName] = useState('');
   const [from, setFrom] = useState(f.localInput(now));
@@ -114,46 +100,13 @@ function ActionDialog({ open, onClose, onDone, vehicles }: { open: NonNullable<O
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const v = open.vehicle;
-  const vehicleId = open.kind === 'ev_charge_now' ? v?.id : undefined;
-  const [target, setTarget] = useState('Time only');
-  const [customTarget, setCustomTarget] = useState('75');
-  const [startingSoc, setStartingSoc] = useState(v?.manual_soc == null ? '' : String(v.manual_soc));
-  const [stopAtLimit, setStopAtLimit] = useState(false);
-  const [preview, setPreview] = useState<ChargeEstimate | null>(null);
-  const [previewFailed, setPreviewFailed] = useState(false);
-  const hasLiveSoc = v?.reading?.soc != null && f.ageMinutes(v.reading.ts, now) <= 60;
   const minutes = Math.round(Number(hours) * 60);
-  const maxHours = stopAtLimit ? 24 : 336;
-  const targetPct = target === 'Time only' ? null : Number(target === 'Custom' ? customTarget : target);
-  const initialPct = hasLiveSoc || startingSoc === '' ? null : Number(startingSoc);
-  const valid = minutes >= 6 && minutes <= 60 * maxHours
-    && (targetPct === null || targetPct > 0 && targetPct <= 100)
-    && (initialPct === null || initialPct >= 0 && initialPct <= 100);
-  useEffect(() => {
-    setPreview(null);
-    setPreviewFailed(false);
-    if (!vehicleId || !valid) return;
-    let cancelled = false;
-    const timer = window.setTimeout(async () => {
-      const query = new URLSearchParams({ vehicle_id: vehicleId, minutes: String(minutes) });
-      if (targetPct !== null) query.set('target_pct', String(targetPct));
-      if (initialPct !== null) query.set('starting_soc', String(initialPct));
-      try {
-        const result = await get<ChargeEstimate>(`/api/overrides/charge-preview?${query}`);
-        if (!cancelled) setPreview(result);
-      } catch {
-        if (!cancelled) setPreviewFailed(true);
-      }
-    }, 250);
-    return () => { cancelled = true; window.clearTimeout(timer); };
-  }, [vehicleId, minutes, targetPct, initialPct, valid]);
 
-  const meta: Record<Kind, { title: string; intro: ReactNode; confirm: string }> = {
+  const meta: Record<OtherAction['kind'], { title: string; intro: ReactNode; confirm: string }> = {
     away: { title: 'Going away', intro: 'The plan expects a quiet house while you’re gone and won’t buy power you won’t use.', confirm: 'Save trip' },
     reserve: { title: 'Storm coming', intro: 'Keep the battery high so the house has backup power if the grid goes down.', confirm: 'Keep battery high' },
     hold: { title: 'Pause battery', intro: 'The battery won’t discharge. Solar can still charge it.', confirm: 'Pause battery' },
     no_battery_export: { title: 'Don’t export from battery', intro: 'The battery only powers the home; it won’t sell to the grid.', confirm: 'Stop battery export' },
-    ev_charge_now: { title: `Plan ${v?.name ?? 'car'} charging`, intro: 'Plug in at home and start charging before saving. Choose a time limit and an optional battery target.', confirm: 'Save charge plan' },
     ev_away: { title: `${v?.name ?? 'Car'} is away`, intro: 'The plan leaves the car out of home use until it’s back.', confirm: 'Mark as away' },
   };
   const m = meta[open.kind];
@@ -161,8 +114,8 @@ function ActionDialog({ open, onClose, onDone, vehicles }: { open: NonNullable<O
   async function submit(e: FormEvent) {
     e.preventDefault();
     setError(null);
-    if (open.kind !== 'away' && !valid) {
-      setError('Check the duration and battery percentages.');
+    if (open.kind !== 'away' && !(minutes >= 6 && minutes <= 336 * 60)) {
+      setError('Enter between 0.1 and 336 hours.');
       return;
     }
     if (open.kind === 'away' && (!from || !to || to <= from)) {
@@ -178,13 +131,8 @@ function ActionDialog({ open, onClose, onDone, vehicles }: { open: NonNullable<O
         const body: Record<string, unknown> = { kind: open.kind, minutes };
         if (open.kind === 'reserve') body.pct = Number(pct);
         if (v) body.vehicle_id = v.id;
-        if (vehicleId) {
-          body.target_pct = targetPct;
-          body.starting_soc = initialPct;
-          body.stop_at_limit = stopAtLimit;
-        }
         await post('/api/overrides', body);
-        toast(vehicleId ? 'Charging plan saved.' : `${m.title}: on for ${f.duration(minutes)}. The plan is updating.`);
+        toast(`${m.title} · ${f.duration(minutes)}. The plan is updating.`);
       }
       onDone();
     } catch (err) {
@@ -217,55 +165,12 @@ function ActionDialog({ open, onClose, onDone, vehicles }: { open: NonNullable<O
           <TextField label="Keep at least" type="number" value={pct} onChange={(e) => setPct(e.target.value)} required autoFocus
             slotProps={{ htmlInput: { min: 10, max: 100, step: 5 }, input: { endAdornment: <InputAdornment position="end">%</InputAdornment> } }} />
         )}
-        {open.kind !== 'away' && <HoursField value={hours} onChange={setHours} max={maxHours} label={vehicleId ? 'Maximum charging time' : undefined} />}
-        {vehicleId && (
-          <>
-            <Box role="group" aria-label="Charge target">
-              <Typography variant="body2" sx={{ mb: 0.75 }}>Charge target</Typography>
-              <Stack direction="row" useFlexGap sx={{ gap: 0.75, flexWrap: 'wrap' }}>
-                {['Time only', '50', '80', '100', 'Custom'].map((option) => (
-                  <Chip key={option} label={Number(option) ? `${option}%` : option}
-                    color={target === option ? 'primary' : 'default'} variant={target === option ? 'filled' : 'outlined'}
-                    onClick={() => setTarget(option)} aria-pressed={target === option} />
-                ))}
-              </Stack>
-            </Box>
-            {target === 'Custom' && <TextField label="Target battery %" type="number" value={customTarget}
-              onChange={(e) => setCustomTarget(e.target.value)} required slotProps={{ htmlInput: { min: 1, max: 100, step: 'any' } }} />}
-            {!hasLiveSoc && <TextField label="Current battery % (optional)" type="number" value={startingSoc}
-              onChange={(e) => setStartingSoc(e.target.value)} slotProps={{ htmlInput: { min: 0, max: 100, step: 'any' } }} />}
-            {v?.can_stop_charging && <FormControlLabel label="Stop charging at the first limit"
-              control={<Checkbox checked={stopAtLimit} onChange={(e) => setStopAtLimit(e.target.checked)} />} />}
-            <Typography variant="body2" color="text.secondary">
-              {stopAtLimit
-                ? 'kWattson will ask the car to stop at the first limit. iSMART updates can take 10 minutes or longer. Use the car or charger timer for a firm limit.'
-                : 'Use the car or charger timer to stop charging. This plan updates your home energy forecast.'}
-            </Typography>
-            {preview ? (
-              <Box aria-live="polite">
-                <Typography variant="body2" sx={{ fontWeight: 600 }}>
-                  {preview.energy_kwh === 0 ? 'Battery limit already reached' : `Estimated finish ${f.when(preview.finish)}`}
-                </Typography>
-                {preview.energy_kwh > 0 && <Typography variant="body2" color="text.secondary">
-                  {f.n(preview.kw)} kW ({preview.rate_basis}) · {f.kwh(preview.energy_kwh)}
-                  {preview.end_soc !== null && ` · about ${f.pct(preview.end_soc)} at finish`}
-                </Typography>}
-                {targetPct !== null && preview.target_reachable === null && <Typography variant="body2" color="text.secondary">Enter the current battery percentage for a target estimate.</Typography>}
-                {preview.target_reachable === false && <Typography variant="body2" color="text.secondary">The time limit is expected to come first.</Typography>}
-                {preview.paid_grid_kwh ? <Alert severity="warning" sx={{ mt: 1 }}>
-                  Estimated paid grid power {f.kwh(preview.paid_grid_kwh)} ({f.money(preview.paid_grid_aud)}).
-                </Alert> : <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
-                  {preview.paid_grid_aud === null ? 'A current energy plan covering the session is needed to estimate grid cost.' : 'No paid grid power expected.'}
-                </Typography>}
-              </Box>
-            ) : valid && <Typography variant="body2" color="text.secondary" role="status">{previewFailed ? 'Charging estimate unavailable.' : 'Estimating charging…'}</Typography>}
-          </>
-        )}
+        {open.kind !== 'away' && <HoursField value={hours} onChange={setHours} />}
         {error && <Alert severity="error" role="alert">{error}</Alert>}
       </DialogContent>
       <DialogActions sx={{ px: 3, pb: 2.5 }}>
         <Button onClick={onClose} disabled={busy}>Cancel</Button>
-        <Button type="submit" variant="contained" disabled={busy || (!!vehicleId && !valid)}>{busy ? 'Saving…' : m.confirm}</Button>
+        <Button type="submit" variant="contained" disabled={busy}>{busy ? 'Saving…' : m.confirm}</Button>
       </DialogActions>
     </Dialog>
   );

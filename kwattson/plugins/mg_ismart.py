@@ -21,6 +21,8 @@ from .base import PluginConfig, PluginError, SecretField, VehiclePlugin, Vehicle
 class MGConfig(PluginConfig):
     allow_charge_stop: bool = Field(False, title='Allow kWattson to stop charging',
                                     description='Allow an opted-in charging session to send one stop request at its time or battery limit.')
+    allow_charge_schedule: bool = Field(False, title='Allow kWattson to schedule charging',
+                                        description='Allow start and stop requests for an opted-in home charging schedule.')
     region: Literal['au', 'eu'] = 'au'
     phone_country_code: str = Field('61', pattern=r'^\d{0,4}$', title='Country calling code (phone sign-in only)',
                                     description='Used only for phone sign-in. Enter the calling code for your phone number.')
@@ -29,6 +31,7 @@ class MGConfig(PluginConfig):
 class MGiSmart(VehiclePlugin):
     name = 'mg_ismart'
     supports_charge_stop = True
+    supports_charge_schedule = True
     title = 'MG iSMART (unofficial)'
     description = 'Reads battery level and charging state from MG iSMART, with optional remote charge stop.'
     Config = MGConfig
@@ -101,9 +104,16 @@ class MGiSmart(VehiclePlugin):
             if raw_soc is None or not 0 <= raw_soc <= 1000:
                 raise PluginError('iSMART battery level missing or invalid')
             charging = management.is_bms_charging if management.bmsChrgSts is not None else None
+            status = management.bms_charging_status
+            plugged_in = None
+            if status and status.name == 'UNPLUGGED':
+                plugged_in = False
+            elif charging or status and status.name in (
+                    'CHARGE_DONE', 'CONNECTED_NOT_CHARGING', 'CHARGING_STOPPED', 'SCHEDULED_CHARGING'):
+                plugged_in = True
             # The management reply has no device timestamp. Preserve receipt time as unverified.
             ts = datetime.now(timezone.utc)
-            reading = VehicleReading(ts=ts, time_verified=False, soc=raw_soc / 10, charging=charging)
+            reading = VehicleReading(ts=ts, time_verified=False, soc=raw_soc / 10, charging=charging, plugged_in=plugged_in)
             self.context.record_raw({'soc': reading.soc, 'charging': charging, 'ts': ts.isoformat()})
             self.last = reading
             self.next_poll = time.time() + (600 if charging else 1800)
@@ -120,14 +130,22 @@ class MGiSmart(VehiclePlugin):
                 self.last_failure = f'MG {stage} {reason}{detail}. Check the region and iSMART app before retrying.'
             raise PluginError(self.last_failure) from None
 
+    async def start_charging(self) -> None:
+        await self._request_charge(stop=False)
+
     async def stop_charging(self) -> None:
+        await self._request_charge(stop=True)
+
+    async def _request_charge(self, *, stop: bool) -> None:
         async with self.lock:
-            if not self.config.allow_charge_stop or not self.api or not self.vin:
-                raise PluginError('MG charge stop requires opt-in and a live iSMART connection')
+            permitted = self.config.allow_charge_schedule or (stop and self.config.allow_charge_stop)
+            if not permitted or not self.api or not self.vin:
+                raise PluginError('MG charging control requires opt-in and a live iSMART connection')
             try:
-                await asyncio.wait_for(self.api.control_charging(self.vin, stop_charging=True), timeout=20)
+                await asyncio.wait_for(self.api.control_charging(self.vin, stop_charging=stop), timeout=20)
+                self.next_poll = min(self.next_poll, time.time() + 600)
             except Exception:
-                raise PluginError('MG did not confirm receipt of the charging stop request') from None
+                raise PluginError('MG did not confirm receipt of the charging request') from None
 
     async def close(self) -> None:
         if self.api is not None:

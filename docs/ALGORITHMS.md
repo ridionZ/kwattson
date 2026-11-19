@@ -23,7 +23,7 @@ power-based estimate for that metric. Gaps over 15 minutes remain uncovered.
 - EV charging power is taken from the vehicle plugin, or estimated (charger kW) when the car reports
   charging at home (`ev_estimated=1`). It is subtracted from load to learn *house* load.
 
-## 2. Forecast (`forecast.py`, version `profile-temperature-v3+hourly-ratio-v3+ev-session-v1`)
+## 2. Forecast (`forecast.py`, version `profile-temperature-v3+hourly-ratio-v3+ev-session-v2`)
 Weather-enabled plans use forecasts fetched within 24 hours. Within that limit, records older than six hours get a conservative blend of higher load and lower solar. Missing or older hourly records use the fallback. Early accuracy uses the same error calculation as the final daily evaluation, counting only finished half-hours with at least 25 minutes of measurements. The comparison charts use those same complete slots and show delivered solar even when output was limited. Electricity use includes the EV. Battery percentage pairs the original plan’s end-of-slot projection with the recorded site battery level, including in monitoring mode.
 
 **House load**, per half-hour slot:
@@ -62,8 +62,19 @@ The paid-grid estimate uses the latest plan's forecast imports, curtailed and ex
 tiers and remaining daily allowance. A plan covering the full session is required. The estimate can
 change as the household plan adapts to the extra load. Connected MG iSMART cars can be opted in to a
 single stop request with follow-up confirmation from vehicle readings. Manual cars use the plan and
-time-limit reminder. The vehicle or charger timer is useful for a firm deadline during app or
-network outages.
+time-limit reminder. Percentage sessions end on the reported target without a time cutoff.
+Clock-time sessions use the site's timezone. The vehicle or charger timer is useful for a firm
+deadline during app or network outages.
+
+Ready-by sessions initially plan at 80% of the measured, learned or configured rate. Five-minute
+slots follow the local tariff and any active tariff changes. The scheduler ranks feasible charging
+energy by marginal cost and prefers a 30-minute margin before departure when feasible. Fresh
+planned spare solar and battery energy above reserve can reduce forecast imports. A restricted
+automatic schedule only runs in tariff windows safe for import even if those supplies disappear.
+Allowance-limited rates use a conservative allowance bound based on metered usage and the site's
+import limit. A saved plan records its windows and pricing settings. Later vehicle readings can
+confirm the target or warn of a shortfall. The worker leaves the user's selected grid rates in place.
+Automatic commands require vehicle and session opt-in, and the worker checks post-command readings.
 
 **Risk setting**: `balanced` plans on the centre; `conservative` moves load halfway to p90 and solar
 halfway to p10; `optimistic` the opposite.

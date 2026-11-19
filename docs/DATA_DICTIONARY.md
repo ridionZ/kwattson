@@ -38,7 +38,9 @@ fault weeks or other unrepresentative periods). **holidays** (`name`, `start`, `
 **overrides** (`kind`: hold, no_battery_export, reserve, ev_charge_now, ev_away; `data` JSON e.g.
 `{"pct": 60}`; `starts`, `expires`, `cancelled_at`). EV charging overrides can store a
 `vehicle_id`, `target_pct`, `starting_soc`, `stop_at_limit`, and the observed stop state and
-request timestamp.
+request timestamp. Ready-by plans also record the `charge_mode`, permitted `grid_rates`, estimated
+final charge and cost, planned window boundaries, and the tariff policy and command state used by
+automatic scheduling.
 **settings** (current JSON) and **settings_history** (`changed` sections, full `data` snapshot each change).
 
 ## Weather

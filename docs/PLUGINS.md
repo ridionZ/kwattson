@@ -173,7 +173,9 @@ nothing new). Cloud vehicle APIs often lock accounts if polled too often: thrott
 (see `mg_ismart.py`). Store only energy-relevant data — no GPS tracks, VINs or trip history.
 Plugins with a remote stop can expose `supports_charge_stop` and implement `stop_charging()`.
 Report command errors as `PluginError` without credentials. A successful call means the request
-was accepted. Subsequent `VehicleReading.charging` confirms whether the car stopped.
+was accepted. Subsequent `VehicleReading.charging` confirms whether the car stopped. Plugins that also support scheduling can expose
+`supports_charge_schedule` and implement `start_charging()`. Return `plugged_in` for ready-by
+automation. Settings and an individual session must both opt in to start requests.
 
 ## Testing your plugin
 

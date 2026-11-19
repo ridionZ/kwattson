@@ -13,10 +13,20 @@ END_GRACE = timedelta(minutes=30)
 
 
 def can_stop(vehicle: Vehicle) -> bool:
-    if vehicle.plugin_config.get('allow_charge_stop') is not True:
+    if vehicle.plugin_config.get('allow_charge_stop') is not True and not can_schedule(vehicle):
         return False
     try:
         return registry.get(vehicle.plugin, 'vehicle').supports_charge_stop
+    except ValueError:
+        return False
+
+
+def can_schedule(vehicle: Vehicle) -> bool:
+    if vehicle.plugin_config.get('allow_charge_schedule') is not True:
+        return False
+    try:
+        plugin = registry.get(vehicle.plugin, 'vehicle')
+        return plugin.supports_charge_schedule and plugin.supports_charge_stop
     except ValueError:
         return False
 
@@ -65,7 +75,7 @@ def session_estimate(vehicle: Vehicle, rate: float, now: datetime, until: dateti
     capacity = vehicle.capacity_kwh / vehicle.charger_efficiency
     want = (max(0, (target - soc) / 100 * capacity) if target is not None and soc is not None else None)
     possible = max(0, (until - now).total_seconds()) / 3600 * rate
-    room = max(0, (100 - soc) / 100 * capacity) if soc is not None else possible
+    room = max(0, (100 - soc) / 100 * capacity) if soc is not None else capacity
     energy = min(possible, room, want if want is not None else possible)
     finish = now + timedelta(hours=energy / rate)
     reached = want is not None and energy >= want - 1e-6
@@ -93,6 +103,8 @@ def sessions(db: Database, now: datetime) -> list[dict]:
 
 async def monitor(db: Database, settings: Settings, devices, notify, now: datetime) -> bool:
     """Evaluate limits, and confirm a stop with a subsequent charging reading."""
+    from .ev_schedule import run_schedule
+
     active = sessions(db, now)
     if not active:
         return False
@@ -113,12 +125,16 @@ async def monitor(db: Database, settings: Settings, devices, notify, now: dateti
         state = data.get('state')
         if state in ('finished', 'confirmed', 'unconfirmed'):
             continue
+        away = away_all or None in away_vehicles or sid in away_vehicles
+        if data.get('charge_mode') == 'ready_by':
+            changed |= await run_schedule(db, settings, v, session, devices, notify, now, away)
+            continue
         live = recent_reading(db, v, now)
         if live and live['ts'] < session['starts']:
             live = None
         deadline = datetime.fromisoformat(session['expires'])
         target = data.get('target_pct')
-        limit = 'time limit' if now >= deadline else None
+        limit = 'time limit' if now >= deadline and data.get('charge_mode') != 'percentage' else None
         if target is not None and live and live['soc'] is not None and live['soc'] >= target:
             limit = f'{target:g}% target'
 
@@ -133,7 +149,10 @@ async def monitor(db: Database, settings: Settings, devices, notify, now: dateti
                 message = 'The car hasn’t confirmed that charging stopped. Check the car or charger.'
             else:
                 continue
-        elif away_all or None in away_vehicles or sid in away_vehicles or (live and (
+        elif data.get('charge_mode') == 'percentage' and now >= deadline and not limit:
+            data['state'] = 'unconfirmed'
+            message = 'Charge monitoring expired before the target was confirmed. Check the car or charger.'
+        elif away or (live and (
                 live['at_home'] == 0 or live['plugged_in'] == 0
                 or (data.get('observed_charge') and live['charging'] == 0 and not limit))):
             data['state'] = 'finished'

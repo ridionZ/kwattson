@@ -40,7 +40,7 @@ from .ingest import select_intervals
 
 LOAD_VERSION = 'profile-temperature-v3'
 SOLAR_VERSION = 'hourly-ratio-v3'
-VERSION = f'{LOAD_VERSION}+{SOLAR_VERSION}+ev-session-v1'
+VERSION = f'{LOAD_VERSION}+{SOLAR_VERSION}+ev-session-v2'
 WEATHER_PREFERRED_HOURS = 6
 WEATHER_MAX_HOURS = 24
 COLD_START_SHAPE = [.45, .35, .3, .3, .3, .35, .75, 1.15, .85, .65, .55, .6, .65, .65, .65, .7, .9, 1.25, 1.6, 1.5, 1.1, .85, .65, .5]
@@ -256,10 +256,15 @@ def ev_plan(db: Database, settings: Settings, now: datetime, slots: list[tuple[d
         remaining = (need() or per_session) if charging else 0.0
         first_session = True
         started = set()
+        windows = None
         if session:
             start = datetime.fromisoformat(session['starts'])
             until = datetime.fromisoformat(session['expires'])
             started.add(start.astimezone(zone).date())
+            if session['data'].get('charge_mode') == 'ready_by':
+                windows = [(datetime.fromisoformat(w['start']), datetime.fromisoformat(w['end']))
+                           for w in session['data']['charge_windows']]
+                windows = windows if force and not session['data'].get('cancel_requested') else []
             target = session['data'].get('target_pct')
             current = session_soc(db, vehicle, now, session['data'], session['starts'], rate)
             estimate = session_estimate(vehicle, rate, now, until, target, current)
@@ -283,6 +288,12 @@ def ev_plan(db: Database, settings: Settings, now: datetime, slots: list[tuple[d
                 gap = need() if first_session else None
                 remaining = gap if gap is not None else per_session
                 first_session = False
+            if session_slot and windows is not None:
+                if not away:
+                    end = at + timedelta(hours=hours)
+                    overlap = sum(max(0, (min(end, stop) - max(at, start)).total_seconds()) for start, stop in windows)
+                    total[i] += overlap * session['data']['schedule_kw'] / 3600
+                continue
             if away or remaining <= 0:
                 continue
             duration = min(hours, (until - at).total_seconds() / 3600) if session_slot else hours

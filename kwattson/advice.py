@@ -17,6 +17,7 @@ from datetime import datetime, timedelta
 from .config import Settings, Vehicle, stamp, utcnow
 from .db import Database, decode
 from .ev_charging import charge_rate, session_estimate, session_soc
+from .ev_schedule import grid_only_cost, home_battery
 from .optimizer import allowance_used, dispatch_policy, price_points
 from .vehicle_usage import daily_drain, midnight, project
 
@@ -53,19 +54,23 @@ def charging_preview(db: Database, settings: Settings, vehicle: Vehicle, now: da
     finish = estimate['finish']
     result = {**estimate, 'finish': stamp(finish), 'soc': soc, 'kw': round(rate, 2), 'rate_basis': basis,
               'paid_grid_kwh': None, 'paid_grid_aud': None}
+    if data.get('charge_mode') == 'percentage' and soc is None:
+        return {**result, 'energy_kwh': 0}
     if estimate['energy_kwh'] == 0:
         return {**result, 'paid_grid_kwh': 0, 'paid_grid_aud': 0}
-    if not decision or not timedelta(0) <= now - datetime.fromisoformat(decision['created_at']) <= timedelta(minutes=35):
-        return result
-
-    if decision['summary'].get('dispatch_policy') != dispatch_policy(settings):
-        return result
+    grid_only = not any(s.pv_kwp > 0 or s.battery for s in settings.active_systems())
+    if (not decision or not timedelta(0) <= now - datetime.fromisoformat(decision['created_at']) <= timedelta(minutes=35)
+            or decision['summary'].get('dispatch_policy') != dispatch_policy(settings)):
+        return {**result, **grid_only_cost(db, settings, now, finish, rate)} if grid_only else result
     rows = plan_intervals(db, decision['id'])
     prices = price_points(settings, rows)
     remaining = {(entry['day'], entry['plan'], entry['index']): entry['kwh']
                  for entry in decision['summary'].get('allowance_remaining', [])}
     used = allowance_used(db, settings, now) if remaining else {}
-    paid = cost = covered = 0.0
+    batteries = home_battery(db, settings, now, finish, rows)
+    stored = sum(kwh for _, kwh in batteries)
+    paid = cost = covered = solar_total = battery_total = 0.0
+    pv = any(s.pv_kwp > 0 for s in settings.active_systems())
     for r, price in zip(rows, prices):
         at = datetime.fromisoformat(r['ts'])
         end = at + timedelta(hours=r['hours'])
@@ -79,6 +84,19 @@ def charging_preview(db: Database, settings: Settings, vehicle: Vehicle, now: da
         planned_grid = min(included, r['import_kwh'] * planned_scale)
         surplus = (r['export_kwh'] + r['curtailed_kwh']) * planned_scale
         extra_grid = max(0, energy - included - surplus)
+        if pv:
+            solar_total += min(max(0, energy - included), max(0, surplus - r.get('discharge_kwh', 0) * planned_scale))
+        if stored and r.get('action') == 'self_use' and r['import_kwh'] < .01:
+            spare = 0.0
+            for system, _ in batteries:
+                flow = r['systems'].get(system.id, {})
+                if flow.get('pv_bat', 0) + flow.get('grid_bat', 0) < .001:
+                    headroom = min(system.battery.discharge_kw * r['hours'], system.ac_kw * r['hours'] - flow.get('pv_ac', 0))
+                    spare += max(0, headroom - flow.get('dis', 0)) * planned_scale * .8
+            battery = min(extra_grid, spare, stored)
+            extra_grid -= battery
+            stored -= battery
+            battery_total += battery
         ev_grid = planned_grid + extra_grid
         tiers = price['imports']
         for tier in tiers:
@@ -99,7 +117,10 @@ def charging_preview(db: Database, settings: Settings, vehicle: Vehicle, now: da
                 cost += assigned * tier['rate']
         covered += seconds
     if abs(covered - (finish - now).total_seconds()) <= 1:
-        result.update(paid_grid_kwh=round(paid, 2), paid_grid_aud=round(cost, 2))
+        result.update(paid_grid_kwh=round(paid, 2), paid_grid_aud=round(cost, 2),
+                      solar_kwh=round(solar_total, 2), battery_kwh=round(battery_total, 2))
+    elif grid_only:
+        result.update(grid_only_cost(db, settings, now, finish, rate))
     return result
 
 

@@ -15,7 +15,7 @@ import DirectionsCarRounded from '@mui/icons-material/DirectionsCarRounded';
 import { del, errorText } from '../lib/api';
 import * as f from '../lib/fmt';
 import { ConfirmDialog, Empty, useToast } from './common';
-import type { ChargeEstimate } from './QuickActions';
+import type { ChargeEstimate } from './ChargeDialog';
 
 export interface Holiday { id: number; name: string; start: string; end: string; ev_away: number }
 export interface Override {
@@ -23,11 +23,11 @@ export interface Override {
   kind: string;
   starts: string;
   expires: string;
-  data: { pct?: number; vehicle_id?: string; target_pct?: number; state?: string; stop_at_limit?: boolean };
+  data: { pct?: number; vehicle_id?: string; target_pct?: number; state?: string; stop_at_limit?: boolean; auto_schedule?: boolean; cancel_requested?: boolean; charge_mode?: string };
   estimate?: ChargeEstimate;
 }
 
-interface Item { key: string; path: string; Icon: typeof LuggageRounded; title: string; detail: string; active: boolean; noun: string; battery: boolean; charging?: boolean }
+interface Item { key: string; path: string; Icon: typeof LuggageRounded; title: string; detail: string; active: boolean; noun: string; battery: boolean; charging?: boolean; automatic?: boolean }
 
 export function describe(holidays: Holiday[], overrides: Override[], vehicles: { id: string; name: string }[], now = Date.now()): Item[] {
   const car = (id?: string) => vehicles.find((v) => v.id === id)?.name ?? 'Car';
@@ -47,19 +47,27 @@ export function describe(holidays: Holiday[], overrides: Override[], vehicles: {
         break;
       case 'ev_charge_now': {
         const estimate = o.estimate;
-        const limit = o.data?.target_pct == null ? until : `up to ${f.pct(o.data.target_pct)}, ${until} at the latest`;
+        const goal = f.pct(o.data?.target_pct);
+        const limit = o.data?.charge_mode === 'ready_by' ? `${goal} by ${f.when(o.expires, now)}`
+          : o.data?.charge_mode === 'percentage' ? `to ${goal}`
+          : o.data?.target_pct == null ? until : `up to ${goal}, ${until} at the latest`;
+        const next = estimate?.windows?.find(w => Date.parse(w.end) > now);
         const state = o.data?.state;
-        const details = state === 'stopping' ? ['Waiting for the car to confirm charging stopped']
+        const details = o.data?.cancel_requested ? ['Ending automatic schedule']
+          : state === 'stopping' ? ['Waiting for the car to confirm charging stopped']
           : state === 'confirmed' ? ['Car confirmed charging stopped']
           : state === 'finished' ? ['Charge plan ended']
           : state === 'unconfirmed' ? ['Check the car or charger to confirm charging has stopped']
+          : o.data?.charge_mode === 'ready_by' ? [limit, o.data.auto_schedule ? 'Automatic schedule' : 'Set the times on your car or charger']
           : [limit, o.data?.stop_at_limit ? 'Automatic stop enabled' : 'Set the stop on your car or charger'];
-        if (!state && estimate?.energy_kwh) {
-          details.push(`estimated finish ${f.when(estimate.finish, now)}`);
+        if (!state && !o.data?.cancel_requested && estimate && (estimate.energy_kwh > 0 || estimate.target_reachable === false)) {
+          if (estimate.target_reachable === false) details.push(`estimated ${f.pct(estimate.end_soc)}`);
+          else details.push(`estimated finish ${f.when(estimate.finish, now)}`);
+          if (next) details.push(`charging ${f.when(next.start, now)}–${f.when(next.end, now)}`);
           if (estimate.paid_grid_kwh) details.push(`about ${f.money(estimate.paid_grid_aud)} in paid grid power`);
         }
         items.push({ ...base, active: !state || state === 'stopping', Icon: EvStationRounded,
-          title: `${car(o.data?.vehicle_id)} charge plan`, detail: details.join(' · '), noun: 'the charge plan', battery: true, charging: true });
+          title: `${car(o.data?.vehicle_id)} charge plan`, detail: details.join(' · '), noun: 'the charge plan', battery: true, charging: true, automatic: o.data?.auto_schedule });
         break;
       }
       case 'ev_away':
@@ -118,7 +126,7 @@ export default function Scheduled({ items, canEdit, onChanged }: { items: Item[]
       </List>
       <ConfirmDialog open={!!confirm} title={`Cancel ${confirm?.noun ?? 'this'}?`} confirm="Cancel it" danger busy={busy} error={error}
         onConfirm={cancel} onClose={() => setConfirm(null)}>
-        <Typography variant="body2">{confirm?.charging ? 'Cancelling ends this plan and any automatic stop monitoring. Use the car or charger to stop charging.' : `${confirm?.title}, ${confirm?.detail}. The plan goes back to normal straight away.`}</Typography>
+        <Typography variant="body2">{confirm?.automatic ? 'Cancelling ends the schedule and requests a stop if the car is charging.' : confirm?.charging ? 'Cancelling ends this plan and any automatic stop monitoring. Use the car or charger to stop charging.' : `${confirm?.title}, ${confirm?.detail}. The plan goes back to normal straight away.`}</Typography>
       </ConfirmDialog>
     </>
   );
