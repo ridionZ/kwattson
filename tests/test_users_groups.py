@@ -95,7 +95,9 @@ def test_alert_groups(client):
     assert r.status_code == 200
     car = next(g for g in client.get('/api/notification-groups').json() if g['id'] == 'car')
     assert car['channels'] == [channel] and car['cooldown_minutes'] == 90
-    assert {e['event']: e['enabled'] for e in car['events']} == {'ev_charge_opportunity': True, 'ev_charge_reminder': False}
+    assert {e['event']: e['enabled'] for e in car['events']} == {
+        'ev_charge_opportunity': True, 'ev_charge_reminder': False, 'ev_charge_session': True,
+    }
     bad = client.put('/api/notification-groups/car', json={'events': {'high_price': True}}, headers=admin)
     assert bad.status_code == 422
 
