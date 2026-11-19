@@ -23,7 +23,8 @@ from .plugins.base import BatteryCommand
 from .tariffs import pending_plans
 
 COMMAND_MINUTES = 20
-RELEASE_RETRY = timedelta(minutes=2)
+RELEASE_RETRY = timedelta(seconds=30)
+CONTROL_RETRY = timedelta(minutes=1)
 
 
 def commissioning_hash(settings: Settings) -> str:
@@ -88,26 +89,36 @@ class Controller:
         record = self.db.meta('control_commissioned') or {}
         return record.get('hash') == commissioning_hash(settings)
 
-    def recovery_reasons(self, now: datetime) -> list[str]:
-        if self.db.meta('control_release_pending', {}).keys() - self.applying:
-            return ['Waiting for the inverter to confirm release to self-use']
-        recovery = self.db.meta('control_recovery') or {}
-        if recovery and now < datetime.fromisoformat(recovery['retry_at']):
-            return [recovery['reason'] + ' Automatic retry is scheduled.']
+    def recovery_status(self) -> dict | None:
+        pending = self.db.meta('control_release_pending', {})
+        releases = [p['retry_at'] for sid, p in pending.items() if sid not in self.applying]
+        if releases:
+            return dict(phase='release', retry_at=min(releases), reason='Waiting for the inverter to confirm release to self-use.')
+        recovery = self.db.meta('control_recovery')
+        if not recovery:
+            return None
+        at = datetime.fromisoformat(recovery['retry_at'])
+        if 'failures' in recovery:
+            # Shorten cooldowns already persisted by the old exponential retry policy.
+            at -= timedelta(minutes=min(30, 2 ** recovery['failures'])) - CONTROL_RETRY
+        return dict(phase='command', retry_at=stamp(at), reason=recovery['reason'])
+
+    def recovery_reasons(self, now: datetime, *, retry_now=False) -> list[str]:
+        recovery = self.recovery_status()
+        if recovery and (recovery['phase'] == 'release' or (not retry_now and stamp(now) < recovery['retry_at'])):
+            return [recovery['reason']]
         return []
 
-    async def retry_releases(self, settings: Settings, now: datetime):
+    async def retry_releases(self, settings: Settings, now: datetime, *, retry_now=False):
         pending = self.db.meta('control_release_pending', {})
         for system in settings.systems:
             retry = pending.get(system.id)
-            if retry and now >= datetime.fromisoformat(retry['retry_at']):
+            if retry and (retry_now or now >= datetime.fromisoformat(retry['retry_at'])):
                 await self.release(settings, system, retry['reason'])
 
     async def pause(self, settings: Settings, system, why: str, now: datetime):
-        recovery = self.db.meta('control_recovery') or {}
-        failures = min(5, recovery.get('failures', 0) + 1)
-        retry = now + timedelta(minutes=min(30, 2 ** failures))
-        self.db.set_meta('control_recovery', {'failures': failures, 'retry_at': stamp(retry), 'reason': why})
+        retry = now + CONTROL_RETRY
+        self.db.set_meta('control_recovery', {'retry_at': stamp(retry), 'reason': why})
         active = self.db.meta('control_active', {})
         problems = []
         for target in settings.systems:
@@ -127,10 +138,11 @@ class Controller:
             return None
         return decode(row['systems']), row
 
-    async def cycle(self, settings: Settings, now: datetime | None = None) -> dict:
-        now = now or utcnow()
-        await self.retry_releases(settings, now)
-        reasons = self.guards(settings, now) + self.recovery_reasons(now)
+    async def cycle(self, settings: Settings, now: datetime | None = None, *, retry_now=False) -> dict:
+        pinned_time = now
+        await self.retry_releases(settings, now or utcnow(), retry_now=retry_now)
+        now = pinned_time or utcnow()
+        reasons = self.guards(settings, now) + self.recovery_reasons(now, retry_now=retry_now)
         active = self.db.meta('control_active', {})
         if reasons:
             pending = self.db.meta('control_release_pending', {})
@@ -138,8 +150,10 @@ class Controller:
                 if system.id in active and system.id not in pending:
                     await self.release(settings, system, 'Control paused: ' + reasons[0])
             return {'executed': False, 'reasons': reasons}
-        await self.check_response(settings, now)
-        reasons = self.recovery_reasons(now)
+        # A fresh pause created by telemetry verification must still block this cycle.
+        if await self.check_response(settings, now):
+            return {'executed': False, 'reasons': self.recovery_reasons(now)}
+        reasons = self.recovery_reasons(now, retry_now=retry_now)
         if reasons:
             return {'executed': False, 'reasons': reasons}
         decision = self.latest_decision()
@@ -154,15 +168,17 @@ class Controller:
         results = {}
         for system in [s for s in settings.active_systems() if s.controllable and s.battery]:
             command = (systems.get(system.id) or {}).get('command') or {'mode': 'self_use', 'power_kw': 0, 'target_soc': None}
-            results[system.id] = await self.send(settings, system, command, decision['id'], now, row['reason'], step_start, step_end)
-            if self.recovery_reasons(now):
+            results[system.id] = await self.send(settings, system, command, decision['id'], now, row['reason'], step_start, step_end, retry_now=retry_now)
+            if results[system.id]['status'] in ('failed', 'unverified') or self.db.meta('control_release_pending'):
                 break
-        reasons = self.recovery_reasons(now)
-        if not reasons and any(result['status'] == 'verified' for result in results.values()):
+        failed = any(result['status'] in ('failed', 'unverified') for result in results.values())
+        reasons = self.recovery_reasons(now, retry_now=retry_now and not failed)
+        deferred = any(r['status'] in ('duplicate suppressed', 'skipped at end of plan interval') for r in results.values())
+        if not reasons and not deferred and self.db.meta('control_recovery'):
             self.db.set_meta('control_recovery', None)
-        return {'executed': not reasons, 'results': results, 'reasons': reasons}
+        return {'executed': not reasons and not deferred, 'results': results, 'reasons': reasons}
 
-    async def send(self, settings: Settings, system, command: dict, decision_id: int, now: datetime, reason: str, step_start: datetime, step_end: datetime) -> dict:
+    async def send(self, settings: Settings, system, command: dict, decision_id: int, now: datetime, reason: str, step_start: datetime, step_end: datetime, *, retry_now=False) -> dict:
         active = self.db.meta('control_active', {})
         current = active.get(system.id)
         mode = command['mode']
@@ -193,9 +209,16 @@ class Controller:
         cmd = BatteryCommand(mode=mode, start=start, end=end, power_kw=command['power_kw'],
                              target_soc=command.get('target_soc'), min_soc=min_soc, reason=reason[:200])
         key = f'{system.id}:{decision_id}:{mode}:{stamp(start)}'
+        allow_repeat = retry_now and not self.db.meta('control_release_pending')
         with self.db.connect() as c:
-            if c.execute('SELECT 1 FROM commands WHERE idempotency_key=?', (key,)).fetchone():
-                return {'status': 'duplicate suppressed'}
+            previous = c.execute(
+                'SELECT status FROM commands WHERE idempotency_key=? OR idempotency_key GLOB ? ORDER BY id DESC LIMIT 1',
+                (key, key + ':retry:*'),
+            ).fetchone()
+            if previous:
+                if not allow_repeat or previous['status'] not in ('failed', 'unverified'):
+                    return {'status': 'duplicate suppressed'}
+                key += ':retry:' + uuid4().hex
             command_id = c.execute('INSERT INTO commands(created_at, decision_id, action, payload, status, result, idempotency_key) '
                                    'VALUES(?,?,?,?,?,?,?)', (stamp(now), decision_id, mode, encode(dict(system=system.id, **cmd.__dict__)),
                                                              'sending', '{}', key)).lastrowid
@@ -222,7 +245,7 @@ class Controller:
         self.release_confirmed(system.id)
         return {'status': 'verified', 'command_id': command_id}
 
-    async def check_response(self, settings: Settings, now: datetime):
+    async def check_response(self, settings: Settings, now: datetime) -> bool:
         """Check each distinct telemetry reading. Two misses pause dispatch."""
         active = self.db.meta('control_active', {})
         changed = False
@@ -245,9 +268,10 @@ class Controller:
             if cmd['mismatches'] >= 2:
                 system = next(s for s in settings.systems if s.id == system_id)
                 await self.pause(settings, system, f'{system.name} is not following the {cmd["mode"]} command.', now)
-                return
+                return True
         if changed:
             self.db.set_meta('control_active', active)
+        return False
 
     def expect_release(self, system_id: str, reason: str, now: datetime):
         pending = self.db.meta('control_release_pending', {})

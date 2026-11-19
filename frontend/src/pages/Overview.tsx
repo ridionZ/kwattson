@@ -32,6 +32,7 @@ import { action } from '../lib/actions';
 import { tokens, ACTION_COLOR } from '../theme';
 import * as f from '../lib/fmt';
 import { ErrorState, Facts, HelpTip, LoadingBlock, Section, useToast } from '../components/common';
+import ControlRetry from '../components/ControlRetry';
 import QuickActions from '../components/QuickActions';
 import Scheduled, { describe, type Holiday, type Override } from '../components/Scheduled';
 import AlertsList, { type NotificationsDoc } from '../components/AlertsList';
@@ -152,8 +153,15 @@ function Banners({ st, now }: { st: any; now: number }) {
     if (s.enabled && s.poll && !s.poll.ok)
       out.push(<Alert key={`p${s.id}`} severity="warning">Can’t read {s.name} since {f.relative(s.poll.since, now)}{s.poll.error ? `: ${s.poll.error}` : ''}.</Alert>);
   }
-  if (st.mode === 'automatic' && (st.guards ?? []).length)
-    out.push(<Alert key="guards" severity="warning"><strong>Automatic control is paused.</strong> {st.guards.join(' · ')}</Alert>);
+  const recovery = st.control_retry;
+  if ((st.mode === 'automatic' && ((st.guards ?? []).length || recovery)) || recovery?.phase === 'release') {
+    const reasons = [...new Set<string>([...(st.mode === 'automatic' ? st.guards ?? [] : []), ...(recovery ? [recovery.reason] : [])])];
+    out.push(<Alert key="guards" severity={recovery?.phase === 'release' ? 'error' : 'warning'}>
+      <strong>{recovery?.phase === 'release' ? 'Inverter release unconfirmed.' : 'Automatic control is paused.'}</strong>
+      {' '}{reasons.join(' · ')}
+      {recovery && <ControlRetry recovery={recovery} />}
+    </Alert>);
+  }
   if (st.demo) out.push(<Alert key="demo" severity="info" variant="outlined"><strong>Demo house.</strong> The readings and three weeks of history are simulated. <Link href="#/plan">Explore the battery plan</Link> or <Link href="#/history">see what each day cost</Link>.</Alert>);
   if (!out.length) return null;
   return <Stack spacing={1.25} sx={{ mb: 2.5 }}>{out}</Stack>;

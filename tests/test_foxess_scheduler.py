@@ -54,3 +54,21 @@ def test_scheduler_waits_for_matching_enabled_group_without_rewriting(monkeypatc
             {'enabled': True, 'groups': 1, 'matched': False},
             {'enabled': True, 'groups': 1, 'matched': True},
         ]
+
+
+def test_release_checks_flag_again_after_delayed_readback(monkeypatch):
+    fox = FoxESSCloud(SimpleNamespace(timezone='Australia/Brisbane'), FoxConfig(serial='example'), None)
+    responses = iter([{'result': {'enable': True}}, {'result': {'enable': False}}])
+    writes = []
+
+    async def request(path, payload, write=False):
+        if write:
+            writes.append(payload['enable'])
+            return {'errno': 0}
+        return next(responses)
+
+    monkeypatch.setattr(fox, '_request', request)
+    result = asyncio.run(fox.release())
+    assert result.verified
+    assert result.detail['read_back_attempts'] == 2
+    assert writes == [0]

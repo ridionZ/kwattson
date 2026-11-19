@@ -208,7 +208,7 @@ function Shell({ session, onSignedOut, onRefresh }: { session: Session; onSigned
               </Box>
             </Box>
             <Box sx={{ flex: 1 }} />
-            {status && <ModeChip automatic={automatic} paused={automatic && !!status.guards?.length} />}
+            {status && <ModeChip automatic={automatic} paused={automatic && (!!status.guards?.length || !!status.control_retry)} />}
             {automatic && ctx.can('member') && (
               <Button variant="contained" color="error" size="small" startIcon={<StopCircleRounded />} onClick={() => void stop()} disabled={stopBusy}
                 sx={{ whiteSpace: 'nowrap' }}>

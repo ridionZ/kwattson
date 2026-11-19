@@ -174,7 +174,8 @@ def test_enabling_control_builds_and_applies_first_step(db, security, tmp_path, 
         assert asyncio.run(enable_control(EnableControl(), req))['mode'] == 'automatic'
 
 
-def test_unverified_release_is_retried_before_dispatch_resumes(db, security, tmp_path, monkeypatch):
+@pytest.mark.parametrize('manual', [False, True])
+def test_unverified_release_is_retried_before_dispatch_resumes(db, security, tmp_path, monkeypatch, manual):
     from types import SimpleNamespace
     from unittest.mock import AsyncMock
 
@@ -183,7 +184,7 @@ def test_unverified_release_is_retried_before_dispatch_resumes(db, security, tmp
     settings = demo_settings()
     settings.mode = 'automatic'
     db.save_settings(settings)
-    now = datetime.now(timezone.utc).replace(microsecond=0)
+    now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
     acknowledged = CommandResult(accepted=True, verified=True, detail={})
     unconfirmed = CommandResult(accepted=True, verified=False, detail={})
     device = SimpleNamespace(apply=AsyncMock(side_effect=[unconfirmed, acknowledged]),
@@ -199,10 +200,17 @@ def test_unverified_release_is_retried_before_dispatch_resumes(db, security, tmp
 
     assert not asyncio.run(controller.cycle(settings, now))['executed']
     assert db.settings().mode == 'automatic'
-    assert db.meta('control_release_pending')
-    assert not asyncio.run(controller.cycle(settings, now + timedelta(minutes=1)))['executed']
+    from kwattson.config import stamp
+    assert controller.recovery_status()['phase'] == 'release'
+    assert controller.recovery_status()['retry_at'] == stamp(now + timedelta(seconds=30))
+    assert not asyncio.run(controller.cycle(settings, now + timedelta(seconds=10)))['executed']
     assert device.apply.await_count == 1 and device.release.await_count == 1
-    assert asyncio.run(controller.cycle(settings, now + timedelta(minutes=3)))['executed']
+    if not manual:
+        assert not asyncio.run(controller.cycle(settings, now + timedelta(seconds=30)))['executed']
+        assert device.apply.await_count == 1 and device.release.await_count == 2
+        assert controller.recovery_status()['retry_at'] == stamp(now + timedelta(minutes=1))
+    delay = timedelta(seconds=20) if manual else timedelta(minutes=1)
+    assert asyncio.run(controller.cycle(settings, now + delay, retry_now=manual))['executed']
     assert device.apply.await_count == 2 and device.release.await_count == 2
     assert not db.meta('control_release_pending')
     assert db.meta('control_recovery') is None

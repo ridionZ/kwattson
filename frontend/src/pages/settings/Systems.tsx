@@ -35,6 +35,7 @@ import CallReceivedRounded from '@mui/icons-material/CallReceivedRounded';
 import NetworkCheckRounded from '@mui/icons-material/NetworkCheckRounded';
 import EditRounded from '@mui/icons-material/EditRounded';
 import BoltRounded from '@mui/icons-material/BoltRounded';
+import ControlRetry from '../../components/ControlRetry';
 import { post, put, errorText } from '../../lib/api';
 import { useApp } from '../../lib/app';
 import * as f from '../../lib/fmt';
@@ -164,7 +165,9 @@ function ControlCard({ onEnable }: { onEnable: () => void }) {
   const auto = status?.mode === 'automatic';
   const [busy, setBusy] = useState(false);
   const toast = useToast();
-  const guards: string[] = (status?.guards ?? []).filter((g: string) => !/monitor mode/i.test(g));
+  const recovery = status?.control_retry;
+  const guards = [...new Set<string>([...(status?.guards ?? []).filter((g: string) => !/monitor mode/i.test(g)),
+    ...(recovery ? [recovery.reason] : [])])];
   const controllable = (doc.settings.systems as any[]).filter((s) => s.enabled && s.battery && s.controllable);
   async function toggle() {
     if (!auto && !status?.control_commissioned) {
@@ -204,6 +207,7 @@ function ControlCard({ onEnable }: { onEnable: () => void }) {
         <Alert severity={auto ? 'warning' : 'info'} sx={{ mt: 2 }}>
           <strong>{auto ? 'Paused because:' : 'Before it can run:'}</strong>
           <Box component="ul" sx={{ m: 0, pl: 2.5 }}>{guards.map((g) => <li key={g}>{g.includes('commissioned') ? 'Complete the checklist under Turn on to commission these system settings.' : g}{/weather/i.test(g) && <Button size="small" href="#/settings/home/location">Check weather</Button>}</li>)}</Box>
+          {recovery && <ControlRetry recovery={recovery} />}
         </Alert>
       )}
     </Section>

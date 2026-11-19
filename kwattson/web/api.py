@@ -335,6 +335,7 @@ async def status(request: Request):
         'decision': {k: decision[k] for k in ('id', 'created_at', 'summary')} if decision else None,
         'guards': engine.controller.guards(settings, now) + engine.controller.recovery_reasons(now),
         'control_commissioned': engine.controller.commissioned(settings), 'control_active': db.meta('control_active', {}),
+        'control_retry': engine.controller.recovery_status(),
         'heartbeat': db.meta('worker_heartbeat'), 'advice': engine.advice(), 'today': today,
         'money': money,
         'unread': db.one('SELECT COUNT(*) AS n FROM notifications WHERE seen=0')['n'], 'demo': runtime.demo,
@@ -976,6 +977,26 @@ async def enable_control(body: EnableControl, request: Request):
             return {'mode': 'automatic', 'initial_control': {'executed': False, 'reasons': blocking}}
         result = await engine.controller.cycle(settings)
         return {'mode': 'automatic', 'decision_id': decision['id'], 'initial_control': result}
+
+
+@router.post('/control/retry')
+async def retry_control(request: Request):
+    db, _, engine, runtime = ctx(request)
+    if not runtime.worker:
+        raise HTTPException(409, 'The background worker must be running.')
+    async with engine.control_lock:
+        recovery = engine.controller.recovery_status()
+        settings = db.settings()
+        if not recovery or (settings.mode != 'automatic' and recovery['phase'] != 'release'):
+            raise HTTPException(409, 'There is no paused command or release to retry.')
+        now = utcnow()
+        last = db.meta('control_manual_retry_at')
+        if last and now - datetime.fromisoformat(last) < timedelta(seconds=15):
+            raise HTTPException(429, 'A manual retry just ran. Try again in a few seconds.')
+        db.set_meta('control_manual_retry_at', stamp(now))
+        db.audit('control_retry_requested', {'phase': recovery['phase']}, actor(request))
+        result = await engine.controller.cycle(settings, retry_now=True)
+        return {'recovery': engine.controller.recovery_status(), **result}
 
 
 @router.post('/control/stop')

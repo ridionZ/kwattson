@@ -14,8 +14,10 @@ Automatic control is only possible when **all** guards pass:
 
 If a guard fails, kWattson releases its active commands and leaves Automatic selected.
 Dispatch resumes when the guards pass. An unverified command or two distinct telemetry misses
-start a cooldown of up to 30 minutes. The controller also retries any unconfirmed release before
-it sends more commands. A device fault keeps dispatch paused while the fault is reported.
+trigger a retry after about one minute. Unconfirmed releases are retried first, about every
+30 seconds. Overview and Automatic control show the next attempt and give admins a **Retry now**
+button. Device faults keep dispatch paused until the fault clears, and manual retries still
+require the normal control checks.
 Missing weather uses a conservative fallback forecast.
 
 ## Before you enable it

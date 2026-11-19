@@ -56,11 +56,22 @@ class Engine:
         self.transitions.extend(result['transitions'])
         return result
 
+    async def run_control(self):
+        async with self.control_lock:
+            settings = self.db.settings()
+            if settings.mode == 'automatic' or self.db.meta('control_active') or self.db.meta('control_release_pending'):
+                await self.controller.cycle(settings)
+            self.next['control'] = time.time() + 30
+        return settings
+
     async def cycle(self):
         if not self.security.owner_exists() and not self.runtime.demo:
             return
         settings = self.db.settings()
         now = time.time()
+        recovery = self.controller.recovery_status()
+        if recovery and recovery['phase'] == 'release' and recovery['retry_at'] <= stamp():
+            settings = await self.run_control()
         if now >= self.next['poll']:
             self.next['poll'] = now + settings.site.poll_seconds
             first = self.db.latest_site() is None
@@ -84,12 +95,9 @@ class Engine:
             except Exception as error:
                 log.exception('Planning failed')
                 self.notifications.emit('plan_failed', {'reason': f'Planning failed ({type(error).__name__}); no automatic commands are sent.'})
-        if now >= self.next['control']:
-            self.next['control'] = now + 30
-            async with self.control_lock:
-                settings = self.db.settings()
-                if settings.mode == 'automatic' or self.db.meta('control_active') or self.db.meta('control_release_pending'):
-                    await self.controller.cycle(settings)
+        recovery = self.controller.recovery_status()
+        if time.time() >= self.next['control'] or (recovery and recovery['retry_at'] <= stamp()):
+            settings = await self.run_control()
         decision = self.latest_decision()
         alerts.check(self.db, settings, self.notifications, self.devices.status, self.transitions, decision['id'] if decision else None)
         self.transitions.clear()
@@ -144,7 +152,13 @@ class Engine:
                 log.exception('Worker cycle failed')
                 self.last_error = type(error).__name__
                 self.db.audit('worker_error', {'error': type(error).__name__})
-            await asyncio.sleep(TICK)
+            retry = self.controller.recovery_status()
+            delay = TICK
+            if retry:
+                seconds = datetime.fromisoformat(retry['retry_at']).timestamp() - time.time()
+                if seconds > 0:
+                    delay = min(delay, seconds)
+            await asyncio.sleep(delay)
 
     async def close(self):
         await self.devices.close()

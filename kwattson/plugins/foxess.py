@@ -272,9 +272,21 @@ class FoxESSCloud(SystemPlugin):
     async def release(self) -> CommandResult:
         sn = await self.serial()
         await self._request('/op/v1/device/scheduler/set/flag', {'deviceSN': sn, 'enable': 0}, write=True)
-        flag = await self._request('/op/v1/device/scheduler/get/flag', {'deviceSN': sn})
-        disabled = _same_number((flag.get('result') or {}).get('enable'), 0)
-        return CommandResult(accepted=True, verified=disabled, detail={'scheduler_enabled': not disabled})
+        attempts = 0
+        disabled = False
+        try:
+            # The disable flag can also lag behind its acknowledged write.
+            async with asyncio.timeout(8):
+                for _ in range(3):
+                    attempts += 1
+                    flag = await self._request('/op/v1/device/scheduler/get/flag', {'deviceSN': sn})
+                    if _same_number((flag.get('result') or {}).get('enable'), 0):
+                        disabled = True
+                        break
+        except TimeoutError:
+            pass
+        return CommandResult(accepted=True, verified=disabled,
+                             detail={'scheduler_enabled': not disabled, 'read_back_attempts': attempts})
 
 
 def _same_number(value, expected: int | float) -> bool:
