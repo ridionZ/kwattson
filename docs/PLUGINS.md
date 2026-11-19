@@ -171,6 +171,9 @@ Implement `history(start, end) -> list[SystemReading]` so owners can backfill wi
 Subclass `VehiclePlugin`, implement `read() -> VehicleReading | None` (return `None` when there is
 nothing new). Cloud vehicle APIs often lock accounts if polled too often: throttle inside the plugin
 (see `mg_ismart.py`). Store only energy-relevant data — no GPS tracks, VINs or trip history.
+Plugins with a remote stop can expose `supports_charge_stop` and implement `stop_charging()`.
+Report command errors as `PluginError` without credentials. A successful call means the request
+was accepted. Subsequent `VehicleReading.charging` confirms whether the car stopped.
 
 ## Testing your plugin
 

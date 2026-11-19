@@ -9,7 +9,7 @@ import logging
 import time
 from datetime import datetime, timedelta
 
-from . import advice, alerts, forecast, optimizer, outcomes, weather
+from . import advice, alerts, ev_charging, forecast, optimizer, outcomes, weather
 from .config import Runtime, Settings, stamp, utcnow
 from .control import Controller
 from .db import Database, decode
@@ -30,6 +30,7 @@ class Engine:
         self.controller = Controller(db, self.devices, self.notifications, runtime)
         self.lock = asyncio.Lock()
         self.control_lock = asyncio.Lock()
+        self.ev_lock = asyncio.Lock()
         self.next = dict(poll=0.0, vehicles=0.0, weather=0.0, plan=0.0, control=0.0, hourly=0.0, daily=0.0)
         self.transitions = []
         self.last_error = None
@@ -81,6 +82,9 @@ class Engine:
         if now >= self.next['vehicles']:
             self.next['vehicles'] = now + 300
             await self.devices.poll_vehicles(settings)
+        async with self.ev_lock:
+            if await ev_charging.monitor(self.db, self.db.settings(), self.devices, self.notifications, utcnow()):
+                self.request_plan()
         if not self.runtime.demo and settings.site.weather_enabled and now >= self.next['weather']:
             self.next['weather'] = now + 3600
             try:

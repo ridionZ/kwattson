@@ -23,7 +23,7 @@ power-based estimate for that metric. Gaps over 15 minutes remain uncovered.
 - EV charging power is taken from the vehicle plugin, or estimated (charger kW) when the car reports
   charging at home (`ev_estimated=1`). It is subtracted from load to learn *house* load.
 
-## 2. Forecast (`forecast.py`, version `profile-temperature-v2+hourly-ratio-v2`)
+## 2. Forecast (`forecast.py`, version `profile-temperature-v3+hourly-ratio-v3+ev-session-v1`)
 Weather-enabled plans use forecasts fetched within 24 hours. Within that limit, records older than six hours get a conservative blend of higher load and lower solar. Missing or older hourly records use the fallback. Early accuracy uses the same error calculation as the final daily evaluation, counting only finished half-hours with at least 25 minutes of measurements. The comparison charts use those same complete slots and show delivered solar even when output was limited. Electricity use includes the EV. Battery percentage pairs the original plan’s end-of-slot projection with the recorded site battery level, including in monitoring mode.
 
 **House load**, per half-hour slot:
@@ -49,9 +49,21 @@ Weather-enabled plans use forecasts fetched within 24 hours. Within that limit, 
   straight into the battery while its AC output is at the limit. For example, a hybrid receiving
   8 kW from its panels could send 5 kW to the AC side and 3 kW to a DC battery.
 
-**EV**: per vehicle, if charging now → energy to reach `target_pct` from now at `charger_kw`;
-otherwise sessions on `schedule.days` at `start_hour` sized from live SoC (first session) or
-weekly km × kWh/100km ÷ sessions. Away overrides/holidays remove sessions.
+**EV**: per vehicle, active quick-action charging plans forecast energy up to the first of the
+deadline, target or 100% when the battery level is available. The charging estimate uses recent
+reported power when plausible, otherwise a median rate from battery gains during recent charging
+sessions. With too little history it uses the vehicle's configured charger power. A manually entered
+starting percentage can inform estimates. Stops based on charge level require a recent vehicle reading.
+Without a quick-action session, an actively charging car is forecast to reach its configured target,
+and other sessions follow `schedule.days` and `start_hour`. The first session is sized from battery
+level when available, then from weekly km × kWh/100km ÷ sessions. Away overrides/holidays remove sessions.
+
+The paid-grid estimate uses the latest plan's forecast imports, curtailed and exported solar, tariff
+tiers and remaining daily allowance. A plan covering the full session is required. The estimate can
+change as the household plan adapts to the extra load. Connected MG iSMART cars can be opted in to a
+single stop request with follow-up confirmation from vehicle readings. Manual cars use the plan and
+time-limit reminder. The vehicle or charger timer is useful for a firm deadline during app or
+network outages.
 
 **Risk setting**: `balanced` plans on the centre; `conservative` moves load halfway to p90 and solar
 halfway to p10; `optimistic` the opposite.

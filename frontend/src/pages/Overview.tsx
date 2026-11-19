@@ -47,7 +47,7 @@ export default function Overview() {
   const { status: st, statusError, reloadStatus, can } = useApp();
   const now = useNow();
   // Everyone can see what's scheduled; only members and admins can cancel it.
-  const sched = useLoad(() => Promise.all([get<Holiday[]>('/api/holidays'), get<Override[]>('/api/overrides')]), []);
+  const sched = useLoad(() => Promise.all([get<Holiday[]>('/api/holidays'), get<Override[]>('/api/overrides')]), [Math.floor(now / 60000)]);
   const alerts = useLoad<NotificationsDoc>(() => get('/api/notifications?limit=10&unread=true'), [st?.unread]);
   const toast = useToast();
 

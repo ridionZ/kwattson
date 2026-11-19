@@ -175,7 +175,8 @@ class SystemPlugin(ABC):
 
 
 class VehiclePlugin(ABC):
-    """Reads an EV's state. Vehicle control is intentionally not part of the contract yet."""
+    """Reads an EV’s state and optionally supports ending a charging session."""
+    supports_charge_stop: ClassVar[bool] = False
     kind: ClassVar[str] = 'vehicle'
     name: ClassVar[str]
     title: ClassVar[str]
@@ -194,6 +195,9 @@ class VehiclePlugin(ABC):
     async def test(self) -> dict:
         reading = await self.read()
         return {'reading': asdict(reading) if reading else None}
+
+    async def stop_charging(self) -> None:
+        raise PluginError('This connection cannot stop charging')
 
     async def close(self) -> None:
         return None

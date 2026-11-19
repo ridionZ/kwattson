@@ -31,6 +31,22 @@ def test_mg_account_and_battery(monkeypatch, email):
     api.get_vehicle_status_cached.assert_not_called()
 
 
+def test_mg_remote_stop_requires_opt_in():
+    plugin = MGiSmart(None, MGConfig(), None)
+    plugin.api = AsyncMock()
+    plugin.vin = 'example'
+
+    async def run():
+        with pytest.raises(PluginError):
+            await plugin.stop_charging()
+        plugin.api.control_charging.assert_not_awaited()
+        plugin.config.allow_charge_stop = True
+        await plugin.stop_charging()
+        plugin.api.control_charging.assert_awaited_once_with('example', stop_charging=True)
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize('stage', ['sign-in', 'vehicle discovery', 'battery read'])
 def test_mg_failures_identify_stage_without_credentials(monkeypatch, stage):
     saic = pytest.importorskip('saic_ismart_client_ng')

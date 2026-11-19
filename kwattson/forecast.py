@@ -33,13 +33,14 @@ from statistics import median
 import numpy as np
 
 from .config import Settings, stamp, utcnow
+from .ev_charging import charge_rate, session_estimate, session_soc
 from .weather import freshness_hours
 from .db import Database, decode, encode
 from .ingest import select_intervals
 
 LOAD_VERSION = 'profile-temperature-v3'
 SOLAR_VERSION = 'hourly-ratio-v3'
-VERSION = f'{LOAD_VERSION}+{SOLAR_VERSION}'
+VERSION = f'{LOAD_VERSION}+{SOLAR_VERSION}+ev-session-v1'
 WEATHER_PREFERRED_HOURS = 6
 WEATHER_MAX_HOURS = 24
 COLD_START_SHAPE = [.45, .35, .3, .3, .3, .35, .75, 1.15, .85, .65, .55, .6, .65, .65, .65, .7, .9, 1.25, 1.6, 1.5, 1.1, .85, .65, .5]
@@ -246,20 +247,37 @@ def ev_plan(db: Database, settings: Settings, now: datetime, slots: list[tuple[d
         charging = bool(fresh and latest['charging'])
         away_now = bool(fresh and latest['at_home'] == 0)
         mine = [o for o in overrides if o['data'].get('vehicle_id') in (None, vehicle.id)]
-        force = any(o['kind'] == 'ev_charge_now' for o in mine)
+        session = max((o for o in mine if o['kind'] == 'ev_charge_now'), key=lambda o: o.get('id', 0), default=None)
+        force = bool(session and session['data'].get('state') not in ('finished', 'confirmed'))
+        rate = charge_rate(db, vehicle, now)[0]
         away_until = max((o['expires'] for o in mine if o['kind'] == 'ev_away'), default=None)
         need = lambda: max(0.0, (vehicle.target_pct - soc) / 100 * vehicle.capacity_kwh / vehicle.charger_efficiency) if soc is not None else None
         per_session = vehicle.km_per_week * vehicle.kwh_per_100km / 100 / vehicle.charger_efficiency / max(1, len(vehicle.schedule.days))
-        remaining = (need() or per_session) if (charging or force) else 0.0
+        remaining = (need() or per_session) if charging else 0.0
         first_session = True
         started = set()
+        if session:
+            start = datetime.fromisoformat(session['starts'])
+            until = datetime.fromisoformat(session['expires'])
+            started.add(start.astimezone(zone).date())
+            target = session['data'].get('target_pct')
+            current = session_soc(db, vehicle, now, session['data'], session['starts'], rate)
+            estimate = session_estimate(vehicle, rate, now, until, target, current)
+            remaining = estimate['energy_kwh'] if force else 0.0
+            first_session = False
         for i, (at, hours) in enumerate(slots):
             local = at.astimezone(zone)
             iso = stamp(at)
             away = (away_now and i < 4) or (away_until and iso < away_until) or any(
                 h['ev_away'] and h['start'] <= iso < h['end'] for h in holidays)
             day = local.date()
-            if (not remaining and local.weekday() in vehicle.schedule.days and local.hour == vehicle.schedule.start_hour
+            session_slot = bool(session and at < until)
+            if session_slot:
+                started.add(day)
+            if session and not session_slot and force:
+                remaining = 0.0
+                force = False
+            if (not session_slot and not remaining and local.weekday() in vehicle.schedule.days and local.hour == vehicle.schedule.start_hour
                     and day not in started and not away):
                 started.add(day)
                 gap = need() if first_session else None
@@ -267,11 +285,12 @@ def ev_plan(db: Database, settings: Settings, now: datetime, slots: list[tuple[d
                 first_session = False
             if away or remaining <= 0:
                 continue
-            energy = min(vehicle.charger_kw * hours, remaining)
+            duration = min(hours, (until - at).total_seconds() / 3600) if session_slot else hours
+            energy = min(rate * duration, remaining)
             total[i] += energy
             remaining -= energy
         info[vehicle.id] = dict(soc=soc, soc_source='live' if fresh and latest['soc'] is not None else 'manual' if soc is not None else 'unknown',
-                                charging=charging, forced=force, per_session_kwh=round(per_session, 2))
+                                charging=charging, forced=bool(session), per_session_kwh=round(per_session, 2))
     return total, info
 
 

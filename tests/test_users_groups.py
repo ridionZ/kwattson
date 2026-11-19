@@ -88,7 +88,7 @@ def test_alert_groups(client):
     admin = login(client)
     groups = client.get('/api/notification-groups').json()
     car = next(g for g in groups if g['id'] == 'car')
-    assert {e['event'] for e in car['events']} == {'ev_charge_opportunity', 'ev_charge_reminder'}
+    assert {e['event'] for e in car['events']} == {'ev_charge_opportunity', 'ev_charge_reminder', 'ev_charge_session'}
     channel = client.post('/api/channels', json={'name': 'Phone', 'kind': 'ntfy', 'config': {'topic': 'abc-123'}}, headers=admin).json()['id']
     r = client.put('/api/notification-groups/car', json={'events': {'ev_charge_reminder': False}, 'channels': [channel],
                                                         'cooldown_minutes': 90, 'respect_quiet': True}, headers=admin)

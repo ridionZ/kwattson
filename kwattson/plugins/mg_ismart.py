@@ -1,9 +1,9 @@
-"""MG / SAIC iSMART (read-only) via the community saic-ismart-client-ng library.
+"""MG / SAIC iSMART via the community saic-ismart-client-ng library.
 
 Unofficial API: it may break without notice and frequent polling can trigger
 account lockouts, so it polls at most every 30 minutes (10 while charging) and
 backs off for 15 minutes after any error. Only energy-relevant fields are kept;
-no GPS, journeys or VIN are stored.
+no GPS, journeys or VIN are stored. Remote charge stop is opt-in.
 """
 from __future__ import annotations
 
@@ -19,6 +19,8 @@ from .base import PluginConfig, PluginError, SecretField, VehiclePlugin, Vehicle
 
 
 class MGConfig(PluginConfig):
+    allow_charge_stop: bool = Field(False, title='Allow kWattson to stop charging',
+                                    description='Allow an opted-in charging session to send one stop request at its time or battery limit.')
     region: Literal['au', 'eu'] = 'au'
     phone_country_code: str = Field('61', pattern=r'^\d{0,4}$', title='Country calling code (phone sign-in only)',
                                     description='Used only for phone sign-in. Enter the calling code for your phone number.')
@@ -26,8 +28,9 @@ class MGConfig(PluginConfig):
 
 class MGiSmart(VehiclePlugin):
     name = 'mg_ismart'
+    supports_charge_stop = True
     title = 'MG iSMART (unofficial)'
-    description = 'Reads battery level and charging state from the MG iSMART cloud. Read-only.'
+    description = 'Reads battery level and charging state from MG iSMART, with optional remote charge stop.'
     Config = MGConfig
     secrets = (SecretField('username', 'iSMART email or phone'),
                SecretField('password', 'iSMART password'),
@@ -116,6 +119,15 @@ class MGiSmart(VehiclePlugin):
                 detail = f' (service code {int(code)})' if isinstance(code, int) else ''
                 self.last_failure = f'MG {stage} {reason}{detail}. Check the region and iSMART app before retrying.'
             raise PluginError(self.last_failure) from None
+
+    async def stop_charging(self) -> None:
+        async with self.lock:
+            if not self.config.allow_charge_stop or not self.api or not self.vin:
+                raise PluginError('MG charge stop requires opt-in and a live iSMART connection')
+            try:
+                await asyncio.wait_for(self.api.control_charging(self.vin, stop_charging=True), timeout=20)
+            except Exception:
+                raise PluginError('MG did not confirm receipt of the charging stop request') from None
 
     async def close(self) -> None:
         if self.api is not None:

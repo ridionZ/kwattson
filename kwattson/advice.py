@@ -16,11 +16,13 @@ from datetime import datetime, timedelta
 
 from .config import Settings, Vehicle, stamp, utcnow
 from .db import Database, decode
+from .ev_charging import charge_rate, session_estimate, session_soc
+from .optimizer import allowance_used, dispatch_policy, price_points
 from .vehicle_usage import daily_drain, midnight, project
 
 
 def plan_intervals(db: Database, decision_id: int) -> list[dict]:
-    rows = db.rows('SELECT di.*, fp.temperature, fp.radiation FROM decision_intervals di JOIN decisions d ON d.id=di.decision_id '
+    rows = db.rows('SELECT di.*, fp.temperature, fp.radiation, fp.ev_kwh * di.hours / fp.hours AS planned_ev_kwh FROM decision_intervals di JOIN decisions d ON d.id=di.decision_id '
                    'LEFT JOIN forecast_points fp ON fp.forecast_id=d.forecast_id AND fp.ts=('
                    'SELECT ts FROM forecast_points WHERE forecast_id=d.forecast_id AND ts<=di.ts ORDER BY ts DESC LIMIT 1) WHERE di.decision_id=? ORDER BY di.ts',
                    (decision_id,))
@@ -40,6 +42,65 @@ def marginal_cost(row: dict, extra_kwh: float) -> float:
     remaining -= take
     cost += remaining * row['buy_rate']
     return cost
+
+
+def charging_preview(db: Database, settings: Settings, vehicle: Vehicle, now: datetime, until: datetime, data: dict,
+                     starts: str, decision: dict | None) -> dict:
+    """Estimate charge delivered, and the paid part of grid import during it."""
+    rate, basis = charge_rate(db, vehicle, now)
+    soc = session_soc(db, vehicle, now, data, starts, rate)
+    estimate = session_estimate(vehicle, rate, now, until, data.get('target_pct'), soc)
+    finish = estimate['finish']
+    result = {**estimate, 'finish': stamp(finish), 'soc': soc, 'kw': round(rate, 2), 'rate_basis': basis,
+              'paid_grid_kwh': None, 'paid_grid_aud': None}
+    if estimate['energy_kwh'] == 0:
+        return {**result, 'paid_grid_kwh': 0, 'paid_grid_aud': 0}
+    if not decision or not timedelta(0) <= now - datetime.fromisoformat(decision['created_at']) <= timedelta(minutes=35):
+        return result
+
+    if decision['summary'].get('dispatch_policy') != dispatch_policy(settings):
+        return result
+    rows = plan_intervals(db, decision['id'])
+    prices = price_points(settings, rows)
+    remaining = {(entry['day'], entry['plan'], entry['index']): entry['kwh']
+                 for entry in decision['summary'].get('allowance_remaining', [])}
+    used = allowance_used(db, settings, now) if remaining else {}
+    paid = cost = covered = 0.0
+    for r, price in zip(rows, prices):
+        at = datetime.fromisoformat(r['ts'])
+        end = at + timedelta(hours=r['hours'])
+        seconds = (min(finish, end) - max(at, now)).total_seconds()
+        if seconds <= 0:
+            continue
+        planned_scale = seconds / (3600 * r['hours'])
+        energy = rate * seconds / 3600
+        included = min(energy, (r.get('planned_ev_kwh') or 0) * planned_scale)
+        other_load = max(0, r['import_kwh'] * planned_scale - included)
+        planned_grid = min(included, r['import_kwh'] * planned_scale)
+        surplus = (r['export_kwh'] + r['curtailed_kwh']) * planned_scale
+        extra_grid = max(0, energy - included - surplus)
+        ev_grid = planned_grid + extra_grid
+        tiers = price['imports']
+        for tier in tiers:
+            if tier['group'] is not None:
+                key = tier['group']
+                measured_remaining = max(0, tier['limit'] - used.get(key, 0))
+                budget = min(remaining.get(key, tier['limit']), measured_remaining)
+                other_free = min(other_load, budget)
+                other_load -= other_free
+                free_for_car = min(ev_grid, budget - other_free)
+                remaining[key] = budget - other_free - free_for_car
+                assigned = free_for_car
+            else:
+                assigned = ev_grid
+            ev_grid -= assigned
+            if tier['rate'] > 0:
+                paid += assigned
+                cost += assigned * tier['rate']
+        covered += seconds
+    if abs(covered - (finish - now).total_seconds()) <= 1:
+        result.update(paid_grid_kwh=round(paid, 2), paid_grid_aud=round(cost, 2))
+    return result
 
 
 def charge_window(rows, now, deadline, need, charger_kw, unavailable):

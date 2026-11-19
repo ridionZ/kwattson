@@ -36,7 +36,9 @@ export/house/charge/discharge kWh. No intraday detail.
 fault weeks or other unrepresentative periods). **holidays** (`name`, `start`, `end`, `load_factor` NULL = use base load,
 `ev_away`). **annotations** (`kind`: note/guests/appliance/outage/maintenance/exclude, `text`).
 **overrides** (`kind`: hold, no_battery_export, reserve, ev_charge_now, ev_away; `data` JSON e.g.
-`{"pct": 60}`; `starts`, `expires`, `cancelled_at`).
+`{"pct": 60}`; `starts`, `expires`, `cancelled_at`). EV charging overrides can store a
+`vehicle_id`, `target_pct`, `starting_soc`, `stop_at_limit`, and the observed stop state and
+request timestamp.
 **settings** (current JSON) and **settings_history** (`changed` sections, full `data` snapshot each change).
 
 ## Weather

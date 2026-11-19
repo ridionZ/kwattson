@@ -16,7 +16,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from .. import __version__, exports, forecast, outcomes, weather
+from .. import __version__, advice, ev_charging, exports, forecast, outcomes, weather
 from ..devices import DEMO_PLUGINS, check_demo_plugin
 from ..config import EnergySystem, Vehicle, Settings, stamp, utcnow
 from ..control import commissioning_hash
@@ -75,6 +75,9 @@ class OverrideIn(Body):
     minutes: int = Field(120, ge=5, le=60 * 24 * 14)
     pct: float | None = Field(None, ge=0, le=100)
     vehicle_id: str | None = Field(None, max_length=40)
+    target_pct: float | None = Field(None, gt=0, le=100)
+    starting_soc: float | None = Field(None, ge=0, le=100)
+    stop_at_limit: bool = False
 
 
 class AnnotationIn(Body):
@@ -319,7 +322,7 @@ async def status(request: Request):
         systems.append(dict(id=s.id, name=s.name, plugin=s.plugin, enabled=s.enabled, controllable=s.controllable,
                             reading=latest, poll=engine.devices.status.get(f'system:{s.id}')))
     vehicles = [dict(id=v.id, name=v.name, plugin=v.plugin, enabled=v.enabled, reading=db.latest_vehicle(v.id), manual_soc=v.manual_soc,
-                     target_pct=v.target_pct, poll=engine.devices.status.get(f'vehicle:{v.id}')) for v in settings.vehicles]
+                     target_pct=v.target_pct, can_stop_charging=ev_charging.can_stop(v), poll=engine.devices.status.get(f'vehicle:{v.id}')) for v in settings.vehicles]
     try:
         today = outcomes.today_so_far(db, settings, now)
     except Exception:
@@ -853,12 +856,50 @@ async def delete_holiday(holiday_id: int, request: Request):
     return {'deleted': True}
 
 
+def charging_vehicle(settings: Settings, vehicle_id: str | None) -> Vehicle:
+    vehicles = settings.active_vehicles()
+    vehicle = next((v for v in vehicles if v.id == vehicle_id), None)
+    if vehicle_id is None and len(vehicles) == 1:
+        return vehicles[0]
+    if vehicle is None:
+        raise HTTPException(422, 'Choose an enabled vehicle.')
+    return vehicle
+
+
+@router.get('/overrides/charge-preview')
+def preview_charge(request: Request, vehicle_id: str, minutes: int, target_pct: float | None = None,
+                   starting_soc: float | None = None):
+    db, _, engine, _ = ctx(request)
+    if (not 5 <= minutes <= 60 * 24 * 14 or (target_pct is not None and not 0 < target_pct <= 100)
+            or (starting_soc is not None and not 0 <= starting_soc <= 100)):
+        raise HTTPException(422, 'Enter a valid duration and battery percentage.')
+    settings = db.settings()
+    vehicle = charging_vehicle(settings, vehicle_id)
+    now = utcnow().replace(microsecond=0)
+    data = {'target_pct': target_pct}
+    if starting_soc is not None:
+        data['starting_soc'] = starting_soc
+    return advice.charging_preview(db, settings, vehicle, now, now + timedelta(minutes=minutes), data,
+                                   stamp(now), engine.latest_decision())
+
+
 @router.get('/overrides')
-async def overrides(request: Request):
-    db, *_ = ctx(request)
-    rows = db.rows('SELECT * FROM overrides WHERE cancelled_at IS NULL AND expires>? ORDER BY id DESC', (stamp(),))
+def overrides(request: Request):
+    db, _, engine, _ = ctx(request)
+    now = utcnow().replace(microsecond=0)
+    rows = db.rows("SELECT * FROM overrides WHERE cancelled_at IS NULL AND (expires>? OR "
+                   "(expires>? AND kind='ev_charge_now' AND json_extract(data,'$.state')='stopping')) ORDER BY id DESC",
+                   (stamp(now), stamp(now - 2 * ev_charging.END_GRACE)))
+    settings = db.settings()
+    vehicles = {v.id: v for v in settings.active_vehicles()}
+    decision = None
     for r in rows:
         r['data'] = decode(r['data'])
+        v = vehicles.get(r['data'].get('vehicle_id'))
+        if r['kind'] == 'ev_charge_now' and v and not r['data'].get('state') and r['starts'] <= stamp(now):
+            decision = decision or engine.latest_decision()
+            r['estimate'] = advice.charging_preview(db, settings, v, now, datetime.fromisoformat(r['expires']),
+                                                    r['data'], r['starts'], decision)
     return rows
 
 
@@ -868,9 +909,24 @@ async def add_override(body: OverrideIn, request: Request):
     if body.kind == 'reserve' and body.pct is None:
         raise HTTPException(422, 'Give the reserve percentage to hold')
     data = {k: v for k, v in (('pct', body.pct), ('vehicle_id', body.vehicle_id)) if v is not None}
-    now = utcnow()
-    override_id = db.execute('INSERT INTO overrides(created_at, starts, expires, kind, data) VALUES(?,?,?,?,?)',
-                             (stamp(now), stamp(now), stamp(now + timedelta(minutes=body.minutes)), body.kind, encode(data)))
+    if body.kind != 'ev_charge_now' and (body.target_pct is not None or body.starting_soc is not None or body.stop_at_limit):
+        raise HTTPException(422, 'Charging targets apply to a charging session.')
+    async with engine.ev_lock:
+        now = utcnow()
+        if body.kind == 'ev_charge_now':
+            v = charging_vehicle(db.settings(), body.vehicle_id)
+            data['vehicle_id'] = v.id
+            if body.stop_at_limit and (not ev_charging.can_stop(v) or body.minutes > 24 * 60):
+                raise HTTPException(422, 'Automatic stopping needs a compatible connection and a session of 24 hours or less.')
+            data.update({k: val for k, val in (('target_pct', body.target_pct), ('starting_soc', body.starting_soc)) if val is not None})
+            data['stop_at_limit'] = body.stop_at_limit
+        with db.connect() as c:
+            if body.kind == 'ev_charge_now':
+                c.execute("UPDATE overrides SET cancelled_at=? WHERE kind='ev_charge_now' AND cancelled_at IS NULL "
+                          "AND expires>? AND json_extract(data,'$.vehicle_id')=?",
+                          (stamp(now), stamp(now - 2 * ev_charging.END_GRACE), data['vehicle_id']))
+            override_id = c.execute('INSERT INTO overrides(created_at, starts, expires, kind, data) VALUES(?,?,?,?,?)',
+                                    (stamp(now), stamp(now), stamp(now + timedelta(minutes=body.minutes)), body.kind, encode(data))).lastrowid
     db.audit('override_added', {'id': override_id, 'kind': body.kind}, actor(request))
     engine.request_plan()
     return {'id': override_id}
@@ -879,7 +935,8 @@ async def add_override(body: OverrideIn, request: Request):
 @router.delete('/overrides/{override_id}')
 async def cancel_override(override_id: int, request: Request):
     db, _, engine, _ = ctx(request)
-    db.execute('UPDATE overrides SET cancelled_at=? WHERE id=?', (stamp(), override_id))
+    async with engine.ev_lock:
+        db.execute('UPDATE overrides SET cancelled_at=? WHERE id=?', (stamp(), override_id))
     engine.request_plan()
     return {'cancelled': True}
 
