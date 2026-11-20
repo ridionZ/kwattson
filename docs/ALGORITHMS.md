@@ -265,6 +265,23 @@ predictions available at the relevant time, and an individual checkpoint shows i
 creation timestamp.
 
 ## Known gaps / ideas
+EV schedules retain all saved windows; polling does not move or regenerate their endpoints.
+MG stores the current (or next) window in its native timer and target SOC, verified through
+independent management data. After the first window ends, the next window replaces it.
+Unchanged timers receive a read-only check every five minutes. Unplugging or confirmed-away
+charging clears the owned native timer but preserves the goal; reconnecting at home restores
+the remaining window. Manual start/stop clears the owned timer before controlling charging.
+An owner-changed timer is not overwritten. Uncertain writes are read back before bounded retry.
+
+Native timers enforce the current time cutoff offline, but uploading a later window, clearing
+while away, exact targets outside native SOC increments, and power guards require connectivity.
+MG timers repeat daily if the controller stays offline; they are cleared at goal completion.
+If disabling the timer could allow charging immediately, a final stop is always requested.
+For surplus-only charging, one marginal import/headroom sample does not interrupt a running
+window: two distinct meter samples spanning two minutes are required. Missing telemetry over
+ten minutes, faults and approaching battery reserve still pause immediately. Recovery needs
+two clear samples and ten minutes since the actual pause, with no sliding cooldown reset.
+
 Home charging: an active owner-created charge plan assumes home through missing or negative
 GPS. Fresh nearby GPS is positive evidence only. Two aligned meter samples over at least two
 minutes can rule out home when car power exceeds whole-home load, after a two-minute start

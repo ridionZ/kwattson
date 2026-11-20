@@ -82,3 +82,12 @@ pause automatic commands; missing or distant GPS does not. Enable the optional r
 only if a brief stop/restart is acceptable, including when charging away. It runs at most once
 per continuous connection and needs permission for both commands. A manual verification button
 provides the same explicit acknowledgement. Check charging if restoration cannot be confirmed.
+
+MG uses its car-native timer by default for an opted-in ready-by schedule. One verified window
+is stored at a time; its cutoff works without internet, but loading subsequent windows needs
+the controller online. The timer repeats daily until cleared. Unplugging/confirmed-away state
+suspends the native timer while keeping the plan for return; clearing requires connectivity.
+Check that the car clock matches the site's timezone. Hardware SOC targets are ten-point steps
+from 40%; exact intermediate targets need the online worker. Observe one full timer start/stop
+before relying on it for a paid-rate boundary. Set 'Use the car charging timer' off only for a
+model/firmware without timer support; that explicitly restores software start/stop control.

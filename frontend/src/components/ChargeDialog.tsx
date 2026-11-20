@@ -30,6 +30,7 @@ import ChargePlanGraph from './ChargePlanGraph';
 type Mode = 'time' | 'percentage' | 'ready_by';
 
 export interface ChargingVehicle {
+  native_timer_supported?: boolean;
   id: string;
   name: string;
   can_stop_charging?: boolean;
@@ -339,7 +340,8 @@ export default function ChargeDialog({ vehicle, onClose, onDone }: {
                 {vehicle.can_schedule_charging && <FormControlLabel label="Run this schedule automatically"
                   control={<Checkbox checked={automatic} onChange={e => setAutomatic(e.target.checked)} />} />}
                 <Typography variant="body2" color="text.secondary">{automatic
-                  ? 'Leave the car plugged in at home. Automatic start and stop depend on the car connection staying online.'
+                  ? vehicle.native_timer_supported ? 'The car stores one verified window at a time. Its time cutoff works offline. Loading later windows, clearing the timer while away and reacting to home power need connectivity. Daily timers can repeat if kWattson remains offline.'
+                    : 'Leave the car plugged in at home. Automatic start and stop depend on the car connection staying online.'
                   : 'Set the charging windows on your car or charger.'}</Typography>
                 {!automatic && <Alert severity="warning" sx={{ mt: 1 }}>Estimate only. Saving this plan will not start or stop your car.</Alert>}
               </Box>

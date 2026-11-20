@@ -18,7 +18,7 @@ from typing import Literal
 
 from pydantic import Field
 
-from .base import PluginConfig, PluginError, SecretField, VehicleClimate, VehiclePlugin, VehicleReading
+from .base import CommandResult, PluginConfig, PluginError, SecretField, VehicleClimate, VehiclePlugin, VehicleReading
 
 # The vendor library logs raw response bodies on errors. Keep those out of app
 # logs; this plugin reports only the stage, exception type and service code.
@@ -32,6 +32,8 @@ REQUEST_TIMEOUT = 45
 
 
 class MGConfig(PluginConfig):
+    use_native_charge_timer: bool = Field(True, title='Use the car charging timer',
+        description='Store one verified charging window in the car, replacing it when the next window is due. Its cutoff works offline; loading the next window and suspending it while away require connectivity. Daily timers can repeat if the controller remains offline.')
     allow_home_probe: bool = Field(False, title='Allow one home charging test after reconnecting',
                                   description='When an active plan reconnects without home evidence, permit one brief stop/restart to compare house power. It can interrupt an away charging session; requires start/stop permission. Never repeats during continuous connection.')
     home_radius_m: int = Field(200, ge=50, le=500, title='Home location radius (m)',
@@ -54,6 +56,7 @@ class MGiSmart(VehiclePlugin):
     supports_charge_stop = True
     supports_charge_schedule = True
     supports_climate_control = True
+    supports_native_charge_timer = True
     title = 'MG iSMART (unofficial)'
     description = 'Reads battery level and charging state from MG iSMART, with optional remote start and stop.'
     Config = MGConfig
@@ -257,6 +260,63 @@ class MGiSmart(VehiclePlugin):
         username, password, vin = await self._credentials()
         if self.api is None:
             await self._connect(username, password, vin)
+
+    @staticmethod
+    def _timer_state(management):
+        mode = getattr(management, 'bmsReserCtrlDspCmd', None)
+        def minute(prefix):
+            hour = getattr(management, prefix + 'HourDspCmd', None)
+            value = getattr(management, prefix + 'MintueDspCmd', None)
+            return hour * 60 + value if isinstance(hour, int) and isinstance(value, int) and 0 <= hour < 24 and 0 <= value < 60 else None
+        target = getattr(management, 'charge_target_soc', None)
+        return dict(enabled=True if mode in (1, 3) else False if mode == 2 else None, stop_at_time=mode == 1,
+                    start_minute=minute('bmsReserSt'), end_minute=minute('bmsReserSp'),
+                    target_pct=target.percentage if target is not None else None)
+
+    async def _timer_read(self):
+        reply = await self._vehicle_call('get_vehicle_charging_management_data')
+        state = self._timer_state(reply.chrgMgmtData)
+        self.context.record_raw({'charge_timer': state})
+        return state
+
+    async def read_charge_timer(self):
+        async with self.lock:
+            await self._ready()
+            return await self._timer_read()
+
+    async def set_charge_timer(self, start, end, target_pct, zone):
+        from saic_ismart_client_ng.api.vehicle_charging.schema import ScheduledChargingMode, TargetBatteryCode
+        async with self.lock:
+            if not self.config.allow_charge_schedule:
+                raise PluginError('Enable automatic charging before setting the car timer')
+            await self._ready()
+            local_start, local_end = start.astimezone(zone), end.astimezone(zone)
+            # Never select UNTIL_CONFIGURED_SOC: that mode can ignore the time cutoff.
+            target = max(40, min(100, math.ceil(target_pct / 10) * 10))
+            before = await self._timer_read()
+            if before['target_pct'] != target:
+                await self._vehicle_call('set_target_battery_soc', target_soc=TargetBatteryCode.from_percentage(target))
+            await self._vehicle_call('set_schedule_charging', start_time=local_start.time(), end_time=local_end.time(),
+                                     mode=ScheduledChargingMode.UNTIL_CONFIGURED_TIME)
+            state = await self._timer_read()
+            verified = (state['enabled'] is True and state['stop_at_time'] and state['target_pct'] == target
+                        and state['start_minute'] == local_start.hour * 60 + local_start.minute
+                        and state['end_minute'] == local_end.hour * 60 + local_end.minute)
+            return CommandResult(True, verified, state)
+
+    async def clear_charge_timer(self, restore_target_pct=None):
+        from datetime import time as clock_time
+        from saic_ismart_client_ng.api.vehicle_charging.schema import ScheduledChargingMode, TargetBatteryCode
+        async with self.lock:
+            if not self.config.allow_charge_schedule:
+                raise PluginError('Charging permission is required to clear the car timer')
+            await self._ready()
+            await self._vehicle_call('set_schedule_charging', start_time=clock_time(0), end_time=clock_time(0),
+                                     mode=ScheduledChargingMode.DISABLED)
+            if restore_target_pct in (40, 50, 60, 70, 80, 90, 100):
+                await self._vehicle_call('set_target_battery_soc', target_soc=TargetBatteryCode.from_percentage(int(restore_target_pct)))
+            state = await self._timer_read()
+            return CommandResult(True, state['enabled'] is False and (restore_target_pct is None or state['target_pct'] == restore_target_pct), state)
 
     async def read_climate(self) -> VehicleClimate:
         async with self.lock:

@@ -203,6 +203,14 @@ parked reading, maps 22 °C to temperature index 8, supports the common 17–28 
 unknown climate codes unknown. A receipt is separate from subsequent state confirmation.
 
 ## Testing your plugin
+Native EV timers are separate from software start/stop: advertise `supports_native_charge_timer`
+and implement `read_charge_timer`, `set_charge_timer` and `clear_charge_timer`. Return local
+start/end minutes, enabled state, a time-cutoff flag and target percentage. Verify against a
+separate management read, not just an accepted command. MG supports one repeating window;
+always use UNTIL_CONFIGURED_TIME, never the SOC-only mode that may run past the cutoff.
+Its native SOC target has ten-point steps from 40%; other targets are rounded up and exact
+stopping still needs the online worker. Clearing restores the original SOC target if known.
+
 
 - Unit-test parsing against recorded (anonymised) responses.
 - Run the disposable normal-mode install described above, using synthetic or anonymised responses.

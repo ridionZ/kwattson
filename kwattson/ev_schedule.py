@@ -11,6 +11,9 @@ STEP = timedelta(minutes=5)
 LEAD = timedelta(minutes=30)
 SAFETY_FACTOR = 0.8
 SURPLUS_READING_WINDOW = timedelta(minutes=7)  # Fox cloud telemetry updates about every five minutes.
+SURPLUS_CONFIRM = timedelta(minutes=2)
+SURPLUS_RESTART_DELAY = timedelta(minutes=10)
+SURPLUS_MAX_AGE = timedelta(minutes=10)
 
 
 def projection(vehicle, now, deadline, soc, target, windows, nominal_kw, conservative_kw, energy_limit=None):
@@ -422,6 +425,63 @@ def home_energy_available(db, settings, vehicle, now):
     return spare + max(0, supplied - unsafe_discharge) >= vehicle.charger_kw
 
 
+def surplus_permission(db, settings, vehicle, data, window, live, now):
+    """Keep saved windows stable through one cloud sample; recover with hysteresis."""
+    before = dict(data.get('surplus_guard') or {})
+    guard = dict(before) if before.get('window') == window['start'] else {'window': window['start']}
+    site = db.latest_site()
+    available = bool(window.get('surplus_only') and home_energy_available(db, settings, vehicle, now))
+    at = site['ts'] if site else None
+    stale = not site or not timedelta(0) <= now - datetime.fromisoformat(site['ts']) <= SURPLUS_MAX_AGE
+    reserve = any(s.battery and (r := db.latest_system(s.id)) and r['soc'] is not None
+                  and r['soc'] <= s.battery.reserve_pct + 2 for s in settings.active_systems())
+    urgent = stale or bool(site and site['fault']) or (reserve and not available)
+    reason = ('Home power telemetry is missing or more than ten minutes old.' if stale else
+              'The home meter reports a fault.' if site and site['fault'] else
+              'The home battery is approaching its reserve.' if reserve and not available else
+              'Paid imports or insufficient home energy persisted across meter readings.')
+    # Retain an existing pause when upgrading an active schedule.
+    if not before and data.get('surplus_paused_until', '') > stamp(now):
+        guard.update(paused=True, restart_after=data['surplus_paused_until'])
+
+    def samples(prefix):
+        if at and guard.get(prefix + '_last') != at:
+            guard.setdefault(prefix + '_since', at)
+            guard[prefix + '_last'] = at
+            guard[prefix + '_samples'] = guard.get(prefix + '_samples', 0) + 1
+        return (guard.get(prefix + '_samples', 0) >= 2
+                and datetime.fromisoformat(guard[prefix + '_last']) - datetime.fromisoformat(guard[prefix + '_since']) >= SURPLUS_CONFIRM)
+
+    def clear(prefix):
+        for key in ('since', 'last', 'samples'):
+            guard.pop(prefix + '_' + key, None)
+
+    running = bool(live and live['charging'] == 1)
+    pending = data.get('charge_command') or {}
+    running |= pending.get('action') == 'start' and now - datetime.fromisoformat(pending['requested_at']) < timedelta(minutes=5)
+    if available:
+        clear('bad')
+        allowed = not guard.get('paused')
+        if guard.get('paused'):
+            recovered = samples('good')
+            allowed = recovered and stamp(now) >= guard['restart_after']
+            if allowed:
+                guard.pop('paused')
+                guard.pop('restart_after')
+                guard.pop('reason', None)
+                clear('good')
+    else:
+        clear('good')
+        sustained = samples('bad')
+        allowed = running and not guard.get('paused') and not urgent and not sustained
+        if not allowed and running and not guard.get('paused'):
+            guard.update(paused=True, restart_after=stamp(now + SURPLUS_RESTART_DELAY), reason=reason)
+        if guard.get('paused'):
+            data['surplus_paused_until'] = guard['restart_after']
+    data['surplus_guard'] = guard
+    return allowed, guard != before, guard.get('reason', reason)
+
+
 async def run_schedule(db, settings, vehicle, session, devices, notify, now, away):
     """Run only the saved windows. Verify requests on a later vehicle reading."""
     data = session['data']
@@ -460,7 +520,7 @@ async def run_schedule(db, settings, vehicle, session, devices, notify, now, awa
         if cancelled:
             return finish('Charging schedule cancelled.')
         if auto and now < deadline:
-            return False  # Keep the departure goal while the car is unplugged/away.
+            return False  # Preserve the goal while home charging is suspended.
         return finish('Charging schedule ended because the car was away or disconnected. Check the car before leaving.')
 
     if auto and progressed and live['plugged_in'] == 1 and not data.get('observed_plug'):
@@ -473,22 +533,61 @@ async def run_schedule(db, settings, vehicle, session, devices, notify, now, awa
     # a user cancellation or an observed percentage target.
     should_charge = window and not (reached or cancelled or invalid_tariff) and now < deadline
     if auto and should_charge and not grid_allowed_now(db, settings, now, data.get('grid_rates')):
-        available = window.get('surplus_only') and home_energy_available(db, settings, vehicle, now)
-        cooldown = data.get('surplus_paused_until', '') > now_stamp
-        if not available or cooldown:
+        available, guard_changed, guard_reason = surplus_permission(db, settings, vehicle, data, window, live, now)
+        if guard_changed:
+            save()
+            changed = True
+        if not available:
             should_charge = False
-            if not available and not cooldown:
-                data['surplus_paused_until'] = stamp(now + timedelta(minutes=10))
+            if data.get('surplus_guard', {}).get('paused') and not data.get('surplus_warned'):
+                data['surplus_warned'] = True
                 save()
-                changed = True
-                if not data.get('surplus_warned'):
-                    data['surplus_warned'] = True
-                    save()
-                    alert('Home energy is insufficient or unverified. Charging is paused to avoid paid grid power.', 'surplus')
+                alert('Charging paused to avoid paid grid power. ' + guard_reason, 'surplus')
     charging = live['charging'] if live else None
     later = live and live['ts'] > command.get('requested_at', now_stamp)
     command_age = now - datetime.fromisoformat(command['requested_at']) if command else timedelta(0)
+    native_managed = False
+    native_installed = False
+    native_cleared = False
     if auto:
+        from . import vehicle_timer
+        device = devices.vehicle(settings, vehicle.id)
+        if vehicle_timer.supported(device, vehicle):
+            ended = reached or cancelled or invalid_tariff or now >= deadline
+            candidate = next((w for w in windows if w['end'] > now_stamp), None)
+            if not ended and (not window or should_charge) and candidate:
+                # Never install tomorrow's repeating time before today's occurrence has passed.
+                if datetime.fromisoformat(candidate['start']) - now < timedelta(days=1):
+                    ready = await vehicle_timer.ensure(db, vehicle, device, session['id'], candidate, target, settings.zone, notify, now)
+                    if not ready:
+                        return changed
+                    native_managed = native_installed = True
+                    # Only a missed native stop gets a backup stop, after cloud settling.
+                    previous_end = max((datetime.fromisoformat(w['end']) for w in windows if w['end'] <= now_stamp), default=None)
+                    if not window and charging == 1 and previous_end and now - previous_end >= timedelta(minutes=2):
+                        native_managed = False
+                    if window and charging != 1 and now - datetime.fromisoformat(candidate['start']) >= timedelta(minutes=10) and not data.get('native_start_warned'):
+                        data['native_start_warned'] = True
+                        save()
+                        alert('The native timer is confirmed, but charging has not started. Check the car or charger.', 'native-start')
+                        changed = True
+                else:
+                    owned = bool(db.meta(vehicle_timer.KEY, {}).get(vehicle.id))
+                    cleared = await vehicle_timer.clear(db, vehicle, device, notify, now, 'Next window is more than a day away')
+                    native_cleared = owned and cleared
+                    native_managed = charging != 1 and not native_cleared
+            else:
+                owned = bool(db.meta(vehicle_timer.KEY, {}).get(vehicle.id))
+                cleared = await vehicle_timer.clear(db, vehicle, device, notify, now, 'Charging target, cutoff or sustained home-power guard')
+                native_cleared = owned and cleared
+    if auto and command.get('action') == 'stop' and later and charging == 0:
+        data.pop('charge_command', None)
+        command = {}
+        save()
+        changed = True
+    if command.get('action') == 'stop':
+        native_managed = False  # Confirm/retry the backup stop even while a future timer is queued.
+    if auto and not native_managed:
         if command.get('action') == 'stop':
             if later and charging == 0:
                 data.pop('charge_command')
@@ -500,7 +599,7 @@ async def run_schedule(db, settings, vehicle, session, devices, notify, now, awa
                     return finish('The car has not confirmed it stopped. Check the car or charger now.', 'unconfirmed')
                 return changed
         outstanding_start = command.get('action') == 'start' and not (later and charging == 0)
-        if not should_charge and (charging == 1 or outstanding_start or command.get('action') == 'stop'):
+        if not should_charge and (charging == 1 or outstanding_start or command.get('action') == 'stop' or native_cleared):
             if live and live['plugged_in'] == 0:
                 return finish('Charging state is unavailable at the cutoff. Check the car or charger now.', 'unconfirmed')
             action, key = 'stop', now_stamp
@@ -515,10 +614,13 @@ async def run_schedule(db, settings, vehicle, session, devices, notify, now, awa
             attempts = command.get('tries', 0) + 1 if command.get('action') == action else 1
             data['charge_command'] = dict(action=action, key=key, requested_at=now_stamp, tries=attempts)
             save()
-            db.audit('ev_charge_command', dict(override_id=session['id'], vehicle_id=vehicle.id, action=action, attempt=attempts))
+            reason = ('Saved charging window started' if action == 'start' else 'Charging plan cancelled' if cancelled else
+                      'Battery target reached' if reached else 'Tariff changed' if invalid_tariff else
+                      data.get('surplus_guard', {}).get('reason', 'Saved charging window ended'))
+            db.audit('ev_charge_command', dict(override_id=session['id'], vehicle_id=vehicle.id, action=action, attempt=attempts, reason=reason))
             try:
                 from .ev_charging import request_control
-                await request_control(db, settings, devices, vehicle, now, stop=action == 'stop', source=f'session:{session["id"]}')
+                await request_control(db, settings, devices, vehicle, now, stop=action == 'stop', source=f'session:{session["id"]}', preserve_timer=native_installed)
             except Exception:
                 alert(f'Could not confirm the {action} request. Check the car or charger.', action)
             return True

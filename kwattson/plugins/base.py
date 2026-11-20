@@ -206,6 +206,7 @@ class VehiclePlugin(ABC):
     supports_charge_stop: ClassVar[bool] = False
     supports_charge_schedule: ClassVar[bool] = False
     supports_climate_control: ClassVar[bool] = False
+    supports_native_charge_timer: ClassVar[bool] = False
     poll_seconds = 300
     kind: ClassVar[str] = 'vehicle'
     name: ClassVar[str]
@@ -234,6 +235,16 @@ class VehiclePlugin(ABC):
 
     async def stop_charging(self) -> None:
         raise PluginError('This connection cannot stop charging')
+
+    async def read_charge_timer(self) -> dict:
+        """Enabled, start/end minutes in car-local time, stop_at_time and target_pct."""
+        raise PluginError('This connection cannot read a native charging timer')
+
+    async def set_charge_timer(self, start: datetime, end: datetime, target_pct: float, zone) -> CommandResult:
+        raise PluginError('This connection cannot set a native charging timer')
+
+    async def clear_charge_timer(self, restore_target_pct: float | None = None) -> CommandResult:
+        raise PluginError('This connection cannot clear a native charging timer')
 
     async def read_climate(self) -> VehicleClimate:
         raise PluginError('This connection cannot read parked climate status')

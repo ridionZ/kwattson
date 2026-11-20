@@ -220,3 +220,34 @@ def test_mg_location_only_confirms_home_and_never_records_coordinates(monkeypatc
     assert at_home is expected
     assert (observed is not None) == (expected is True)
     context.record_raw.assert_not_called()
+
+
+def test_mg_native_timer_uses_time_cutoff_and_independent_management_readback(monkeypatch):
+    from datetime import timedelta
+    from zoneinfo import ZoneInfo
+    saic = pytest.importorskip('saic_ismart_client_ng')
+    from saic_ismart_client_ng.api.vehicle_charging.schema import ChrgMgmtData, ChrgMgmtDataResp, ScheduledChargingMode
+    api = AsyncMock()
+    api.vehicle_list.return_value = SimpleNamespace(vinList=[SimpleNamespace(vin='test-car')])
+    before = ChrgMgmtData(bmsReserCtrlDspCmd=2, bmsOnBdChrgTrgtSOCDspCmd=5)
+    after = ChrgMgmtData(bmsReserCtrlDspCmd=1, bmsReserStHourDspCmd=18, bmsReserStMintueDspCmd=0,
+        bmsReserSpHourDspCmd=3, bmsReserSpMintueDspCmd=50, bmsOnBdChrgTrgtSOCDspCmd=7)
+    api.get_vehicle_charging_management_data.side_effect = [ChrgMgmtDataResp(chrgMgmtData=value) for value in (before, after, before)]
+    monkeypatch.setattr(saic, 'SaicApi', Mock(return_value=api))
+    context = SimpleNamespace(secret={'username': 'a@example.invalid', 'password': 'synthetic'}.get, record_raw=Mock())
+    plugin = MGiSmart(context, MGConfig(allow_charge_schedule=True), None)
+    zone = ZoneInfo('Australia/Brisbane')
+    start = utcnow().astimezone(zone).replace(hour=18, minute=0, second=0, microsecond=0)
+    end = (start + timedelta(days=1)).replace(hour=3, minute=50)
+
+    async def run():
+        result = await plugin.set_charge_timer(start, end, 100, zone)
+        assert result.verified
+        assert api.set_schedule_charging.call_args.kwargs['mode'] == ScheduledChargingMode.UNTIL_CONFIGURED_TIME
+        assert api.set_schedule_charging.call_args.kwargs['end_time'].hour == 3
+        assert api.set_target_battery_soc.call_args.kwargs['target_soc'].percentage == 100
+        result = await plugin.clear_charge_timer(80)
+        assert result.verified
+        assert api.set_schedule_charging.call_args.kwargs['mode'] == ScheduledChargingMode.DISABLED
+        api.control_charging.assert_not_called()
+    asyncio.run(run())

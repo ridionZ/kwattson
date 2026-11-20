@@ -92,6 +92,11 @@ vendor session marker, positive home evidence, power-mismatch samples and one-te
 restart deadline and confirmation. No car coordinates or journeys are retained. Charge estimates
 include `source_windows`, `projection` (timestamp, expected SOC, conservative SOC),
 `expected_end_soc`, `expected_finish` and `expected_target_reachable`; these are modelled.
+`meta.vehicle_timers` holds the owned native EV window, session ID, desired local minutes,
+target, original SOC target, command ID, read-back/clear state and bounded retry counters.
+`ev_native_timer` and `ev_native_timer_clear` commands record configuration separately from
+physical charging confirmation. `overrides.data.surplus_guard` retains distinct meter sample
+timestamps and the fixed restart deadline; saved `charge_windows` are never shifted by polling.
 **daily_outcomes** — per local day JSON: measured net cost, import cost, export credit, supply,
 counterfactual net costs (`self_use_net_aud`, `no_battery_net_aud`, `no_solar_net_aud`),
 `saving_vs_self_use_aud`, energy totals, coverage, decision/command counts.

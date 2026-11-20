@@ -15,7 +15,7 @@ END_GRACE = timedelta(minutes=30)
 CONTROL_CONFIRM_WINDOW = timedelta(minutes=5)
 
 
-async def request_control(db, settings, devices, vehicle, now, *, stop, source='manual'):
+async def request_control(db, settings, devices, vehicle, now, *, stop, source='manual', preserve_timer=False):
     """Record a request separately from later physical confirmation."""
     if not (can_stop(vehicle) if stop else can_schedule(vehicle)):
         raise PluginError('Enable the vehicle charging control permission first')
@@ -24,6 +24,15 @@ async def request_control(db, settings, devices, vehicle, now, *, stop, source='
         home = home_charging.status(db, vehicle, now)
         if not home['confirmed']:
             raise PluginError(home['reason'])
+    from . import vehicle_timer
+    timer_cleared = True
+    if db.meta(vehicle_timer.KEY, {}).get(vehicle.id) and not preserve_timer and (stop or source in ('manual', 'home_probe')):
+        from .notifications import Notifications
+        timer_cleared = await vehicle_timer.clear(db, vehicle, devices.vehicle(settings, vehicle.id),
+            Notifications(db, devices.security) if hasattr(devices, 'security') else _TimerNotifications(db), now,
+            'Charging stopped or manually controlled')
+        if not timer_cleared and not stop:
+            raise PluginError('Clear the existing car timer before manually starting charging')
     pending = db.meta('ev_charge_pending', {})
     old = pending.get(vehicle.id)
     action = 'stop' if stop else 'start'
@@ -42,7 +51,18 @@ async def request_control(db, settings, devices, vehicle, now, *, stop, source='
     except Exception as error:
         db.execute('UPDATE commands SET result=? WHERE id=?', (encode({'receipt_error': type(error).__name__}), command_id))
         raise
+    if not timer_cleared:
+        raise PluginError('Stop requested, but clearing the native car timer is unconfirmed; check iSMART')
     return command_id
+
+
+class _TimerNotifications:
+    """Fallback for callers without the application notification service."""
+    def __init__(self, db):
+        self.db = db
+
+    def emit(self, event, data, **kwargs):
+        self.db.audit(event, data)
 
 
 def verify_requests(db, settings, notify, now):
@@ -174,6 +194,11 @@ async def monitor(db: Database, settings: Settings, devices, notify, now: dateti
 
     changed = verify_requests(db, settings, notify, now)
     active = sessions(db, now)
+    from . import vehicle_timer
+    for vehicle in settings.active_vehicles():
+        owned = db.meta(vehicle_timer.KEY, {}).get(vehicle.id)
+        if owned and (owned.get('state') == 'clearing' or not any(s['id'] == owned.get('session_id') and not s['data'].get('state') for s in active)):
+            await vehicle_timer.clear(db, vehicle, devices.vehicle(settings, vehicle.id), notify, now, 'Charging plan ended')
     if not active:
         return changed
     seen = set()
@@ -194,7 +219,12 @@ async def monitor(db: Database, settings: Settings, devices, notify, now: dateti
             continue
         from . import home_charging
         home = home_charging.status(db, v, now)
-        if (data.get('auto_schedule') or data.get('stop_at_limit')) and not home['confirmed']:
+        away = away_all or None in away_vehicles or sid in away_vehicles
+        if away:
+            home = dict(confirmed=False, source='away', reason='The car is marked away from home.')
+        if (data.get('auto_schedule') or data.get('stop_at_limit')) and (not home['confirmed'] or away):
+            if db.meta(vehicle_timer.KEY, {}).get(v.id):
+                await vehicle_timer.clear(db, v, devices.vehicle(settings, v.id), notify, now, 'Home charging suspended while away or disconnected')
             if data.get('home_paused') != home['source']:
                 data['home_paused'] = home['source']
                 db.execute('UPDATE overrides SET data=? WHERE id=?', (encode(data), session['id']))
@@ -211,7 +241,6 @@ async def monitor(db: Database, settings: Settings, devices, notify, now: dateti
         elif data.pop('home_paused', None):
             db.execute('UPDATE overrides SET data=? WHERE id=?', (encode(data), session['id']))
             changed = True
-        away = away_all or None in away_vehicles or sid in away_vehicles
         if data.get('charge_mode') == 'ready_by':
             changed |= await run_schedule(db, settings, v, session, devices, notify, now, away)
             continue

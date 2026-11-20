@@ -48,6 +48,11 @@ export default function VehicleControls({ vehicle: v, climate = false }: { vehic
 
   return <Box sx={{ mt: 1 }}>
     {v.pending_charge && <Typography variant="caption" component="p" role="status">Waiting for confirmation: {v.pending_charge.action}</Typography>}
+    {v.native_timer && <Typography variant="caption" component="p" color={v.native_timer.state === 'verified' ? 'text.secondary' : 'warning.main'}>
+      {v.native_timer.state === 'verified' ? `Car timer confirmed: ${f.time(v.native_timer.desired.start)}–${f.time(v.native_timer.desired.end)}`
+        : v.native_timer.state === 'clearing' ? 'Waiting for the car timer to be disabled' : 'Car timer needs confirmation; check iSMART'}
+    </Typography>}
+    {v.native_timer?.state === 'verified' && <Typography variant="caption" component="p">This cutoff works offline. Loading later windows needs connectivity. The car timer can repeat daily if kWattson stays offline.</Typography>}
     {v.home_charging && <Typography variant="caption" component="p" color={v.home_charging.source === 'power_mismatch' ? 'warning.main' : 'text.secondary'}>
       {v.home_charging.source === 'plan_assumption' ? 'Home assumed from active charging plan' : v.home_charging.reason}
     </Typography>}

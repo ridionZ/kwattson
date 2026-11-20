@@ -17,7 +17,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from .. import __version__, advice, battery_manual, ev_charging, ev_schedule, exports, forecast, home_charging, outcomes, vehicle_climate, weather
+from .. import __version__, advice, battery_manual, ev_charging, ev_schedule, exports, forecast, home_charging, outcomes, vehicle_climate, vehicle_timer, weather
 from ..devices import DEMO_PLUGINS, check_demo_plugin
 from ..config import EnergySystem, Vehicle, Settings, stamp, utcnow
 from ..control import commissioning_hash
@@ -373,6 +373,8 @@ async def status(request: Request):
                      can_schedule_charging=ev_charging.can_schedule(v), poll=engine.devices.status.get(f'vehicle:{v.id}'),
                      climate_supported=vehicle_climate.supported(v), can_control_climate=vehicle_climate.permitted(v),
                      climate=db.meta(vehicle_climate.KEY, {}).get(v.id),
+                      native_timer=db.meta('vehicle_timers', {}).get(v.id),
+                      native_timer_supported=vehicle_timer.capable(v),
                      home_charging=home_charging.status(db, v, now),
                      pending_charge=db.meta('ev_charge_pending', {}).get(v.id)) for v in settings.vehicles]
     try:
