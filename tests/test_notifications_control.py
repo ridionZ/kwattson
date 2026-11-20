@@ -94,6 +94,51 @@ def test_dispatch_command_ends_at_buffered_step(db, security, tmp_path):
     assert db.meta('control_active')['main']['target_soc'] == 42
 
 
+def test_daily_schedule_keeps_future_groups_and_does_not_refresh_windows(db, security, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from kwattson.plugins.base import CommandResult
+    from kwattson.config import stamp
+    from test_plan_adoption import rows, NOW
+    settings = make_test_site()
+    device = SimpleNamespace(apply_schedule=AsyncMock(return_value=CommandResult(True, True)),
+                             verify_schedule=AsyncMock(return_value=CommandResult(True, True)),
+                             release=AsyncMock(return_value=CommandResult(True, True)))
+    controller = Controller(db, SimpleNamespace(system=lambda *_: device), Notifications(db, security),
+                            Runtime(data_dir=tmp_path, app_url='http://localhost:8080', dev_http=True, worker=False))
+    monkeypatch.setattr('kwattson.plans.intervals', lambda *_: rows(settings))
+    async def run():
+        decision = {'id': 1}
+        assert (await controller.send_schedule(settings, settings.systems[0], device, decision, NOW))['status'] == 'verified'
+        # The initial self-use step must not disable the future free-power charge.
+        assert db.meta('control_active')['main']['mode'] == 'self_use'
+        for minutes in (1, 6, 30, 60):
+            assert (await controller.send_schedule(settings, settings.systems[0], device, decision,
+                                                   NOW + timedelta(minutes=minutes)))['status'] == 'daily schedule unchanged'
+        assert device.apply_schedule.await_count == 1
+        assert device.verify_schedule.await_count == 3
+        device.release.assert_not_awaited()
+        assert db.one("SELECT COUNT(*) AS n FROM commands WHERE action='daily_schedule'")['n'] == 1
+        await controller.release(settings, settings.systems[0], 'test stop')
+        assert not db.meta('control_schedules')
+        assert not db.meta('control_active')
+    asyncio.run(run())
+
+
+def test_failed_background_review_invalidates_control_and_keeps_plan(db, security, tmp_path, monkeypatch):
+    from kwattson.engine import Engine
+    from kwattson import forecast
+    db.set_meta('active_plan', {'decision_id': 123, 'valid': True})
+    engine = Engine(db, security, Runtime(data_dir=tmp_path, app_url='http://localhost:8080', dev_http=True, worker=False))
+    def failed(*_):
+        raise RuntimeError('synthetic forecast failure')
+    monkeypatch.setattr(forecast, 'build', failed)
+    with pytest.raises(RuntimeError):
+        asyncio.run(engine.replan())
+    assert db.meta('active_plan')['decision_id'] == 123
+    assert not db.meta('active_plan')['valid']
+
+
 @pytest.mark.parametrize('failure', [None, 'planning', 'verification'])
 def test_enabling_control_builds_and_applies_first_step(db, security, tmp_path, monkeypatch, failure):
     from types import SimpleNamespace

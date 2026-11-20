@@ -411,6 +411,7 @@ async def latest_plan(request: Request):
                       (stamp(now),))
     return {'decision': {k: decision[k] for k in ('id', 'created_at', 'summary', 'version', 'forecast_id', 'tariff_id')} if decision else None,
             'intervals': _intervals(db, decision['id']) if decision else [], 'history': history, 'as_of': stamp(now),
+            'review': {k: v for k, v in db.meta('active_plan', {}).items() if k in ('reviewed_at', 'candidate_id', 'valid')},
             'ev_charges': [{**r, 'data': decode(r['data'])} for r in charges]}
 
 
@@ -429,19 +430,30 @@ def _intervals(db, decision_id):
 
 @router.post('/plan')
 async def replan(request: Request):
-    _, _, engine, _ = ctx(request)
+    db, _, engine, _ = ctx(request)
     decision = await engine.replan()
-    return {'id': decision['id'], 'summary': decision['summary']}
+    review = db.meta('active_plan', {})
+    return {'id': decision['id'], 'summary': decision['summary'], 'adopted': review.get('candidate_id', decision['id']) == decision['id'],
+            'review_valid': review.get('valid', True)}
 
 
 @router.get('/decisions')
-async def decisions(request: Request, limit: int = 96):
+async def decisions(request: Request, limit: int = 96, all_runs: bool = False):
     db, *_ = ctx(request)
-    rows = db.rows('SELECT id, created_at, version, forecast_id, mode, tariff_id, input_hash, summary FROM decisions ORDER BY id DESC LIMIT ?',
-                   (max(1, min(limit, 1000)),))
+    condition = '' if all_runs else " WHERE json_extract(summary, '$.adopted') IS NOT 0"
+    rows = db.rows('SELECT id, created_at, version, forecast_id, mode, tariff_id, input_hash, summary FROM decisions' + condition + ' ORDER BY id DESC LIMIT ?',
+                   (max(1, min(limit, 1000)) if all_runs else 2000,))
     for r in rows:
         r['summary'] = decode(r['summary'])
-    return rows
+    if not all_runs:
+        legacy = {}
+        zone = db.settings().zone
+        for row in reversed(rows):
+            local = datetime.fromisoformat(row['created_at']).astimezone(zone)
+            if 'adopted' not in row['summary']:
+                legacy.setdefault((local.date(), local.hour // 6), row['id'])
+        rows = [row for row in rows if row['summary'].get('adopted') or row['id'] in legacy.values()]
+    return rows[:max(1, min(limit, 1000))]
 
 
 @router.get('/decisions/{decision_id}')
@@ -488,10 +500,18 @@ async def daily_outcomes(request: Request, days: int = 60):
 
 
 @router.get('/forecast/accuracy')
-async def accuracy(request: Request, limit: int = 200):
+async def accuracy(request: Request, limit: int = 200, all_runs: bool = False):
     db, *_ = ctx(request)
     rows = db.rows('SELECT e.forecast_id, f.created_at, e.metrics FROM evaluations e JOIN forecasts f ON f.id=e.forecast_id '
-                   'ORDER BY e.forecast_id DESC LIMIT ?', (max(1, min(limit, 2000)),))
+                   'ORDER BY e.forecast_id DESC LIMIT ?', (max(1, min(limit, 2000)) if all_runs else 5000,))
+    if not all_runs:
+        checkpoints = {}
+        zone = db.settings().zone
+        for row in reversed(rows):
+            local = datetime.fromisoformat(row['created_at']).astimezone(zone)
+            checkpoints.setdefault((local.date(), local.hour // 6), row['forecast_id'])
+        adopted = {r['forecast_id'] for r in db.rows("SELECT forecast_id FROM decisions WHERE json_extract(summary, '$.adopted')=1")}
+        rows = [r for r in rows if r['forecast_id'] in checkpoints.values() or r['forecast_id'] in adopted][:max(1, min(limit, 2000))]
     params = {r['name']: dict(version=r['version'], fitted_at=r['fitted_at'], data=decode(r['data'])) for r in db.rows('SELECT * FROM model_params')}
     load = params.get('load', {}).get('data', {})
     now = utcnow()
@@ -508,16 +528,29 @@ async def accuracy(request: Request, limit: int = 200):
 
 
 @router.get('/forecast/comparison')
-def forecast_comparison(request: Request, run_id: int | None = None, today: bool = False):
+def forecast_comparison(request: Request, run_id: int | None = None, today: bool = False, all_runs: bool = False):
     db, *_ = ctx(request)
     now = utcnow()
     available = ('SELECT id, created_at FROM forecasts f WHERE EXISTS '
                  '(SELECT 1 FROM forecast_points p WHERE p.forecast_id=f.id)')
-    runs = db.rows(available + ' ORDER BY id DESC LIMIT 200')
+    settings = db.settings()
+    candidates = db.rows(available + ' ORDER BY id DESC LIMIT 5000')
+    adopted = {r['forecast_id'] for r in db.rows("SELECT forecast_id FROM decisions WHERE json_extract(summary, '$.adopted')=1")}
+    checkpoints = {}
+    for run in reversed(candidates):
+        local = datetime.fromisoformat(run['created_at']).astimezone(settings.zone)
+        run.update(day=local.date().isoformat(), hour=local.hour, adopted=run['id'] in adopted)
+        checkpoints.setdefault((run['day'], local.hour), run['id'])
+    runs = [r for r in candidates if all_runs or r['adopted'] or
+            (r['hour'] in (0, 6, 12, 18) and checkpoints[(r['day'], r['hour'])] == r['id'])][:200]
+    # A fresh installation can have no six-hour checkpoint yet.
+    if not runs and candidates:
+        runs = [candidates[-1]]
+    extra = {'current_day': now.astimezone(settings.zone).date().isoformat(), 'all_runs': all_runs}
     if today and run_id is None:
-        return {'runs': runs, **forecast.today_comparison(db, db.settings(), now)}
+        return {'runs': runs, **extra, **forecast.today_comparison(db, settings, now)}
     if not runs:
-        return {'runs': [], 'points': [], 'forecast_id': None}
+        return {'runs': [], 'points': [], 'forecast_id': None, **extra}
     if run_id is None:
         # Prefer a run with most of its first day elapsed, including on a new installation.
         first_day = stamp(now - timedelta(hours=24))
@@ -527,7 +560,7 @@ def forecast_comparison(request: Request, run_id: int | None = None, today: bool
         if not selected:
             raise HTTPException(404, 'Forecast run no longer available')
         runs.append(selected)
-    return {'runs': runs, **forecast.comparison(db, run_id, now)}
+    return {'runs': runs, **extra, **forecast.comparison(db, run_id, now)}
 
 
 # -------------------------------------------------------------- settings

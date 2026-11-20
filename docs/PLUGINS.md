@@ -127,7 +127,12 @@ acme = "kwattson_acme:AcmeInverter"
 - Leave unknown values as `None` — never guess zeros.
 - Raise `PluginError("short owner-friendly message")` for expected failures. Messages are shown in
   the UI and logs, so **never include tokens, passwords or full URLs** in them.
-- A system connection test can return a `hardware` object beside `reading`. The wizard reads optional numeric `ac_kw` (inverter AC rating) and `reserve_pct` (on-grid battery reserve). Return only device-reported values. Missing values stay editable.
+- A connection test can return `hardware` beside `reading`: `ac_kw` (AC rating),
+  `capacity_kwh` (reported battery design capacity), `reserve_pct` (reported on-grid reserve),
+  `min_soc_pct` (hardware floor), `scheduler_limit_kw` (AC control limit), and scheduling
+  capabilities. `connection.serial` identifies an auto-discovered inverter; `warnings` is a
+  list of setup cautions. Return only reported values. Do not present an AC limit as a battery
+  DC charge rating, or a hardware minimum as the owner's chosen reserve.
 - `read()` must not change device settings. It may be called every 1–5 minutes; respect vendor rate
   limits (see `foxess.py` for a shared lock + minimum interval).
 - Use `self.context.remember/recall` for small non-secret state (e.g. a discovered serial).
@@ -160,6 +165,15 @@ Contract:
 - The core separately checks the *physical* response (does the battery actually charge/discharge?)
   and stops control after two misses.
 - Document limitations in `control_notes`; they're shown to the owner before commissioning.
+
+For daily scheduling, expose `supports_battery_schedule = True` and implement
+`apply_schedule(commands: list[BatteryCommand])` plus the read-only
+`verify_schedule(commands)`. The controller sends the adopted plan's remaining local day,
+keeps its confirmed command list, checks every five minutes, and does not refresh short
+windows. `apply_schedule` should reuse an already-matching enabled program without writes.
+Reject oversized, overlapping, unsupported, or out-of-range programs rather than dropping
+groups. A stop/fault must disable every future group. Explain recurrence when offline in
+`control_notes`. Individual commands within a daily program can exceed 30 minutes.
 
 ## Optional: history
 

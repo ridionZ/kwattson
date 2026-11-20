@@ -42,7 +42,7 @@ interface MeasuredInterval {
 
 export default function Plan() {
   const { status, reloadStatus, can } = useApp();
-  const plan = useLoad<{ decision: any; intervals: Interval[]; history: MeasuredInterval[]; as_of: string; ev_charges?: Override[] }>(
+  const plan = useLoad<{ decision: any; intervals: Interval[]; history: MeasuredInterval[]; as_of: string; ev_charges?: Override[]; review?: { reviewed_at?: string } }>(
     () => get('/api/plan'), [status?.decision?.id]);
   useEffect(() => {
     const timer = setInterval(() => { if (!document.hidden) void plan.reload(); }, 60000);
@@ -56,7 +56,9 @@ export default function Plan() {
     setBusy(true);
     try {
       const r = await post('/api/plan');
-      toast(`New plan made: ${action(r.summary?.action).label} now.`);
+      toast(r.review_valid === false ? 'Background plan needs verification; automatic control is waiting.' : r.adopted === false
+        ? 'Forecast checked. Current plan kept because changes are below the adoption thresholds.'
+        : `New plan adopted: ${action(r.summary?.action).label} now.`);
       await Promise.all([plan.reload(), reloadStatus()]);
     } catch (e) {
       toast(errorText(e), 'error');
@@ -73,7 +75,7 @@ export default function Plan() {
     onChanged={() => { void plan.reload(); void reloadStatus(); }} />;
   return (
     <Box>
-      <PageHeader title="Plan" sub={d ? `Plan made ${f.relative(d.created_at, now)}` : undefined}
+      <PageHeader title="Plan" sub={d ? `Plan adopted ${f.relative(d.created_at, now)}${plan.data?.review?.reviewed_at ? ` · checked ${f.relative(plan.data.review.reviewed_at, now)}` : ''}` : undefined}
         actions={can('member') && <Button variant="contained" startIcon={<RefreshRounded />} onClick={replan} disabled={busy}>{busy ? 'Planning…' : 'Re-plan'}</Button>} />
       {plan.error ? <ErrorState message={plan.error} onRetry={plan.reload} /> : !plan.data ? <LoadingBlock height={480} /> : (
         <Stack spacing={2.5}>

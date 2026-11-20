@@ -68,10 +68,38 @@ def test_mg_failures_identify_stage_without_credentials(monkeypatch, stage):
 def test_fox_discovery_only_prefills_reported_ratings(reserve_available):
     plugin = FoxESSCloud(None, FoxConfig(serial='example'), None)
     plugin.read = AsyncMock(return_value=SystemReading(ts=utcnow(), time_verified=True, soc=80))
-    plugin._request = AsyncMock(side_effect=[{'result': {'capacity': 5}}, {'result': {'minSocOnGrid': 18}} if reserve_available else PluginError('unsupported')])
+    async def request(path, payload):
+        if path == '/op/v1/device/detail':
+            return {'result': {'capacity': 5}}
+        if path == '/op/v0/device/battery/soc/get' and reserve_available:
+            return {'result': {'minSocOnGrid': 18}}
+        raise PluginError('unsupported')
+    plugin._request = AsyncMock(side_effect=request)
     result = asyncio.run(plugin.test())
     assert result['reading']['soc'] == 80
-    assert result['hardware'] == ({'ac_kw': 5, 'reserve_pct': 18} if reserve_available else {'ac_kw': 5})
+    assert result['hardware'] == ({'ac_kw': 5, 'reserve_pct': 18, 'daily_schedule_supported': False} if reserve_available else {'ac_kw': 5, 'daily_schedule_supported': False})
+    assert result['warnings']
+
+
+def test_fox_discovery_separates_dc_battery_capacity_from_scheduler_ac_power():
+    plugin = FoxESSCloud(None, FoxConfig(serial='example'), SimpleNamespace(ac_kw=1))
+    plugin.read = AsyncMock(return_value=SystemReading(ts=utcnow(), time_verified=True, soc=40))
+    async def request(path, payload):
+        if path == '/op/v1/device/detail':
+            return {'result': {'capacity': 9.9, 'batteryDesignCapacity': 41.93}}
+        if path == '/op/v0/device/battery/soc/get':
+            return {'result': {'minSoc': 10}}
+        return {'result': {'maxGroupCount': 96, 'properties': {'fdpwr': {'unit': 'W', 'range': {'max': 10500}}}}}
+    plugin._request = AsyncMock(side_effect=request)
+    result = asyncio.run(plugin.test())
+    assert result['hardware']['capacity_kwh'] == 41.93
+    assert result['hardware']['scheduler_limit_kw'] == 10.5
+    assert result['hardware']['min_soc_pct'] == 10
+    assert result['hardware']['daily_schedule_supported']
+    assert 'charge_kw' not in result['hardware']
+    assert 'reserve_pct' not in result['hardware']
+    assert result['connection']['serial'] == 'example'
+    assert sum(call.args[0] == '/op/v1/device/detail' for call in plugin._request.call_args_list) == 1
 
 
 def test_fox_solar_only_can_connect_without_battery_data():

@@ -19,6 +19,8 @@ import TextField from '@mui/material/TextField';
 import MenuItem from '@mui/material/MenuItem';
 import Alert from '@mui/material/Alert';
 import Chip from '@mui/material/Chip';
+import Switch from '@mui/material/Switch';
+import FormControlLabel from '@mui/material/FormControlLabel';
 import Table from '@mui/material/Table';
 import TableHead from '@mui/material/TableHead';
 import TableBody from '@mui/material/TableBody';
@@ -156,7 +158,8 @@ interface ComparisonPoint {
 }
 
 interface ComparisonData {
-  runs: { id: number; created_at: string }[];
+  runs: { id: number; created_at: string; day?: string; hour?: number; adopted?: boolean }[];
+  current_day?: string;
   forecast_id: number | null;
   mode?: string;
   points: ComparisonPoint[];
@@ -184,7 +187,8 @@ function energyBins(points: ComparisonPoint[], hours: number) {
 function ForecastCharts() {
   const [selected, setSelected] = useState<number | null>(null);
   const [hours, setHours] = useState(1);
-  const query = selected === null ? 'today=true' : `run_id=${selected}`;
+  const [allRuns, setAllRuns] = useState(false);
+  const query = (selected === null ? 'today=true' : `run_id=${selected}`) + `&all_runs=${allRuns}`;
   const comparison = useLoad<ComparisonData>(() => get('/api/forecast/comparison?' + query), [query]);
   const { t } = useTokens();
   const compact = useMediaQuery((th: Theme) => th.breakpoints.down('sm'));
@@ -205,14 +209,17 @@ function ForecastCharts() {
       <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1.5}>
         <TextField select label="Forecast" value={selected ?? ''} onChange={e => setSelected(e.target.value === '' ? null : Number(e.target.value))}
           sx={{ width: { xs: '100%', sm: 340 } }} slotProps={{ inputLabel: { shrink: true }, select: { native: true } }}>
-          <option value="">Today’s forecasts</option>
-          {data.runs.map(run => <option key={run.id} value={run.id}>{f.dateTime(run.created_at)} · #{run.id}</option>)}
+          <option value="">Latest forecast before each interval</option>
+          {data.runs.map(run => <option key={run.id} value={run.id}>{f.dateTime(run.created_at)}{run.adopted ? ' · adopted plan' : ' · checkpoint'}</option>)}
         </TextField>
+        <Button variant="outlined" disabled={!data.runs.some(r => r.day === data.current_day && r.hour === 6)}
+          onClick={() => setSelected([...data.runs].reverse().find(r => r.day === data.current_day && r.hour === 6)?.id ?? null)}>6 am checkpoint</Button>
         <ToggleButtonGroup size="small" exclusive value={hours} onChange={(_, value) => value && setHours(value)} aria-label="Energy chart interval">
           <ToggleButton value={1}>Hourly</ToggleButton>
           <ToggleButton value={3}>3-hourly</ToggleButton>
         </ToggleButtonGroup>
       </Stack>
+      <FormControlLabel control={<Switch checked={allRuns} onChange={e => setAllRuns(e.target.checked)} />} label="Show every background forecast" />
       {(selected !== data.forecast_id) ? <LoadingBlock /> : !bins.length ?
         <Empty>Waiting for the first complete half-hour to finish.</Empty> : <>
         <Typography variant="body2" color="text.secondary">
@@ -251,7 +258,8 @@ function ForecastCharts() {
 }
 
 function Accuracy() {
-  const acc = useLoad<any>(() => get('/api/forecast/accuracy'));
+  const [allRuns, setAllRuns] = useState(false);
+  const acc = useLoad<any>(() => get(`/api/forecast/accuracy?all_runs=${allRuns}`), [allRuns]);
   useEffect(() => {
     const timer = setInterval(() => { if (!document.hidden) void acc.reload(); }, 60000);
     return () => clearInterval(timer);
@@ -269,6 +277,7 @@ function Accuracy() {
         <Facts rows={[['Load history', `${f.n(lm.days ?? 0, 0)} days`], ['Hot / cold samples', `${lm.hot_samples ?? '–'} / ${lm.cold_samples ?? '–'}`]]} />
       </Section>
       <Section title="Forecast error by run">
+        <FormControlLabel control={<Switch checked={allRuns} onChange={e => setAllRuns(e.target.checked)} />} label="Include every background evaluation" />
         <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>Each error is the average difference in kWh per measured half-hour during the forecast’s first day. Smaller is better.</Typography>
         {!ev.length ? <Empty>No forecasts have been scored yet. Each forecast is checked once its day has passed.</Empty> : (
           <Box role="region" aria-label="Forecast errors" tabIndex={0} sx={{ overflow: 'auto', maxHeight: 420 }}>
@@ -291,7 +300,8 @@ function Accuracy() {
 }
 
 function Decisions() {
-  const list = useLoad<any[]>(() => get('/api/decisions?limit=50'));
+  const [allRuns, setAllRuns] = useState(false);
+  const list = useLoad<any[]>(() => get(`/api/decisions?limit=50&all_runs=${allRuns}`), [allRuns]);
   const [selected, setSel] = useState<number | null>(null);
   const sel = selected ?? list.data?.[0]?.id;
   const detail = useLoad<any>(() => (sel ? get(`/api/decisions/${sel}`) : Promise.resolve(null)), [sel]);
@@ -299,6 +309,7 @@ function Decisions() {
   return (
     <Box sx={{ display: 'grid', gap: 2.5, gridTemplateColumns: { xs: 'minmax(0, 1fr)', md: '320px minmax(0, 1fr)' } }}>
       <Section title="Decisions">
+        <FormControlLabel control={<Switch checked={allRuns} onChange={e => { setAllRuns(e.target.checked); setSel(null); }} />} label="Include background candidates" />
         {list.error ? <ErrorState message={list.error} onRetry={list.reload} /> : !list.data ? <LoadingBlock /> : !list.data.length ? <Empty>Decisions appear here when the planner runs.</Empty> : (
           <List dense disablePadding sx={{ maxHeight: 520, overflow: 'auto' }}>
             {list.data.map((d) => (

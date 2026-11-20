@@ -5,10 +5,9 @@ while a command is active, the device is released back to its own normal mode
 (fail-safe). Automatic mode remains selected while checks fail. Command failures
 trigger a cooldown and a verified release before the controller can try again.
 
-Each command is short (<= 30 min) and refreshed while the plan still wants it,
-so a crashed controller leaves at most one short window behind. FoxESS-style
-schedulers that repeat daily are covered by ``release()`` on stop/failure; see
-docs/COMMISSIONING.md for the residual risk.
+Schedule-capable devices receive a confirmed program for the rest of the day.
+Other devices receive short commands (<=30 min). Both paths are released on
+stop/failure; recurring schedules can repeat if the controller is offline.
 """
 from __future__ import annotations
 
@@ -20,6 +19,7 @@ from .config import Settings, stamp, utcnow
 from .db import Database, decode, encode
 from .optimizer import VERSION, dispatch_policy
 from .plugins.base import BatteryCommand
+from . import plans, schedules
 from .tariffs import pending_plans
 
 COMMAND_MINUTES = 20
@@ -39,10 +39,7 @@ class Controller:
         self.applying: set[str] = set()
 
     def latest_decision(self):
-        row = self.db.one('SELECT * FROM decisions ORDER BY id DESC LIMIT 1')
-        if row:
-            row['summary'] = decode(row['summary'])
-        return row
+        return plans.latest(self.db)
 
     def guards(self, settings: Settings, now: datetime | None = None, *, commissioning=False, check_plan=True) -> list[str]:
         """Reasons automatic control may not act right now (empty list = clear)."""
@@ -72,7 +69,13 @@ class Controller:
                 reasons.append(f'{s.name}: battery level unknown')
         if check_plan:
             decision = self.latest_decision()
-            if not decision or now - datetime.fromisoformat(decision['created_at']) > timedelta(minutes=35):
+            review = self.db.meta('active_plan', {})
+            checked_at = review.get('reviewed_at') if decision and review.get('decision_id') == decision['id'] else None
+            if review and not review.get('valid', True):
+                reasons.append('Latest background plan was not verified with fresh readings')
+            if review and review.get('policy') != plans.policy(self.db, settings, now):
+                reasons.append('Waiting for a plan with the current settings and manual overrides')
+            if not decision or now - datetime.fromisoformat(checked_at or decision['created_at']) > timedelta(minutes=35):
                 reasons.append('Plan missing or older than 35 minutes')
             elif decision['version'] != VERSION or decision['summary'].get('dispatch_policy') != dispatch_policy(settings):
                 reasons.append('Waiting for a plan with the current tariff and battery buffers')
@@ -167,6 +170,12 @@ class Controller:
         step_end = step_start + timedelta(hours=row['hours'])
         results = {}
         for system in [s for s in settings.active_systems() if s.controllable and s.battery]:
+            device = self.devices.system(settings, system.id)
+            if getattr(device, 'supports_battery_schedule', False):
+                results[system.id] = await self.send_schedule(settings, system, device, decision, now)
+                if results[system.id]['status'] in ('failed', 'unverified'):
+                    break
+                continue
             command = (systems.get(system.id) or {}).get('command') or {'mode': 'self_use', 'power_kw': 0, 'target_soc': None}
             results[system.id] = await self.send(settings, system, command, decision['id'], now, row['reason'], step_start, step_end, retry_now=retry_now)
             if results[system.id]['status'] in ('failed', 'unverified') or self.db.meta('control_release_pending'):
@@ -177,6 +186,65 @@ class Controller:
         if not reasons and not deferred and self.db.meta('control_recovery'):
             self.db.set_meta('control_recovery', None)
         return {'executed': not reasons and not deferred, 'results': results, 'reasons': reasons}
+
+    async def send_schedule(self, settings, system, device, decision, now):
+        stored = self.db.meta('control_schedules', {})
+        record = stored.get(system.id)
+        same = record and record['decision_id'] == decision['id'] and now < datetime.fromisoformat(record['expires'])
+        if same:
+            commands = schedules.decode_commands(record['commands'])
+            if commands and now < commands[-1].end and now - datetime.fromisoformat(record['checked_at']) >= timedelta(minutes=5):
+                try:
+                    result = await device.verify_schedule(commands)
+                except Exception:
+                    result = None
+                if not result or not result.verified:
+                    await self.pause(settings, system, f'{system.name}: daily schedule no longer confirmed.', now)
+                    return {'status': 'unverified'}
+                record['checked_at'] = stamp(now)
+                stored[system.id] = record
+                self.db.set_meta('control_schedules', stored)
+        else:
+            live = self.db.latest_system(system.id)
+            commands, expiry = schedules.build(settings, system, plans.intervals(self.db, decision['id']), now,
+                                               live['soc'] if live else None)
+            if not commands:
+                return {'status': 'day ending; no schedule needed'}
+            payload = dict(system=system.id, commands=schedules.encode_commands(commands), end=stamp(expiry))
+            key = f'daily:{system.id}:{decision["id"]}:{expiry.astimezone(settings.zone).date()}:{uuid4().hex}'
+            command_id = self.db.execute('INSERT INTO commands(created_at,decision_id,action,payload,status,result,idempotency_key) '
+                                         'VALUES(?,?,?,?,?,?,?)', (stamp(now), decision['id'], 'daily_schedule', encode(payload), 'sending', '{}', key))
+            self.expect_release(system.id, 'Checking an interrupted daily schedule', now)
+            self.applying.add(system.id)
+            try:
+                result = await device.apply_schedule(commands)
+            except Exception as error:
+                self.db.execute("UPDATE commands SET status='failed', result=? WHERE id=?", (encode({'error': type(error).__name__}), command_id))
+                await self.pause(settings, system, f'{system.name}: daily schedule failed ({type(error).__name__}).', now)
+                return {'status': 'failed'}
+            finally:
+                self.applying.discard(system.id)
+            status = 'verified' if result.verified else 'unverified'
+            self.db.execute('UPDATE commands SET status=?,result=?,verified_at=? WHERE id=?',
+                            (status, encode(result.detail), stamp() if result.verified else None, command_id))
+            if not result.verified:
+                await self.pause(settings, system, f'{system.name}: device did not confirm the daily schedule.', now)
+                return {'status': 'unverified'}
+            record = dict(decision_id=decision['id'], command_id=command_id, commands=payload['commands'],
+                          expires=stamp(expiry), checked_at=stamp(now))
+            stored[system.id] = record
+            self.db.set_meta('control_schedules', stored)
+            self.release_confirmed(system.id)
+        command = schedules.current(commands, now)
+        active = self.db.meta('control_active', {})
+        existing = active.get(system.id) or {}
+        if command is None:
+            command = BatteryCommand('self_use', now, datetime.fromisoformat(record['expires']))
+        if existing.get('start') != stamp(command.start) or existing.get('command_id') != record['command_id']:
+            active[system.id] = dict(mode=command.mode, power_kw=command.power_kw, target_soc=command.target_soc,
+                                     start=stamp(command.start), end=stamp(command.end), command_id=record['command_id'], mismatches=0)
+            self.db.set_meta('control_active', active)
+        return {'status': 'daily schedule unchanged' if same else 'verified', 'command_id': record['command_id']}
 
     async def send(self, settings: Settings, system, command: dict, decision_id: int, now: datetime, reason: str, step_start: datetime, step_end: datetime, *, retry_now=False) -> dict:
         active = self.db.meta('control_active', {})
@@ -298,6 +366,9 @@ class Controller:
             active.pop(system.id, None)
             self.db.set_meta('control_active', active)
             self.release_confirmed(system.id)
+            schedules_active = self.db.meta('control_schedules', {})
+            schedules_active.pop(system.id, None)
+            self.db.set_meta('control_schedules', schedules_active)
         return {'status': status}
 
     async def release_all(self, settings: Settings, why: str) -> list[str]:

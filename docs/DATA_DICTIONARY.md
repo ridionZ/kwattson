@@ -54,7 +54,9 @@ start and expiry as their planned time range.
 vehicles, holidays, overrides, confidence, weather freshness).
 **forecast_points** — per forecast and interval: `lead_minutes`, `hours`, `house_kwh` (+`house_p10`,
 `house_p90`), `ev_kwh`, `solar_kwh` (+p10/p90), `temperature`, `radiation`, `load_basis`, `solar_basis`
-(text), `samples`, `solar_by_system` (JSON). After 30 days only one forecast per 3 hours keeps points.
+(text), `samples`, `solar_by_system` (JSON). `model.checkpoint` identifies the first forecast
+saved in each local hour. Checkpoints and adopted forecasts retain detail after 30 days;
+other historical detail is thinned to the existing three-hour sample.
 **evaluations** — `metrics` JSON: samples, house/solar MAE and bias (kWh per half-hour), totals,
 `band_coverage` (share of actuals inside p10–p90).
 **model_params** — latest fitted parameters (`load`, `solar`), JSON.
@@ -63,12 +65,20 @@ vehicles, holidays, overrides, confidence, weather freshness).
 **decisions** — one per planner run: `version`, `forecast_id`, `mode`, `tariff_id`, `input_hash`
 (SHA-256 of inputs), `inputs` (JSON: settings, initial battery energy, overrides, allowance use),
 `summary` (JSON: solver status, plan vs baseline cash, modelled saving, curtailment, action, reason).
+Every candidate remains stored. `summary.adopted` identifies plans chosen for use;
+`summary.adoption` records the reason, changed battery/grid energy, modelled cost change,
+and changed schedule minutes. `meta.active_plan` records the adopted decision ID, last
+candidate review time and ID, review validity, local day, and a hash of settings/overrides.
+The current plan can be older than its last successful background review.
 **decision_intervals** — per run and interval: `action`, `fox_mode`, `load_kwh`, `solar_kwh`,
 `pv_to_ac_kwh`, `pv_to_battery_kwh`, `grid_to_battery_kwh`, `discharge_kwh`, `import_kwh`, `export_kwh`,
 `curtailed_kwh`, `soc_pct`, `buy_rate`, `sell_rate`, `cost`, `baseline_soc_pct`, `baseline_cost`,
 `baseline_curtailed_kwh`, `reason`, `systems` (JSON per-system flows and the `command` sent).
 **commands** — device commands: `action`, `payload` (JSON), `status` (sending/verified/unverified/
 failed/released/...), `result` (JSON, credential-free), `verified_at`, `idempotency_key`.
+`daily_schedule` actions contain the vendor-neutral command list and expiry. Results contain
+the confirmed vendor time groups and scheduler limit. `meta.control_schedules` retains the
+day's confirmed program and last read-only verification time; release removes it.
 **daily_outcomes** — per local day JSON: measured net cost, import cost, export credit, supply,
 counterfactual net costs (`self_use_net_aud`, `no_battery_net_aud`, `no_solar_net_aud`),
 `saving_vs_self_use_aud`, energy totals, coverage, decision/command counts.

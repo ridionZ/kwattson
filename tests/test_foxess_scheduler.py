@@ -134,3 +134,78 @@ def test_release_checks_flag_again_after_delayed_readback(monkeypatch):
     assert result.verified
     assert result.detail['read_back_attempts'] == 2
     assert writes == [0]
+
+
+def test_daily_schedule_is_written_once_then_only_read(monkeypatch):
+    from copy import deepcopy
+    fox = FoxESSCloud(SimpleNamespace(timezone='Australia/Brisbane'), FoxConfig(serial='example'),
+                      SimpleNamespace(battery=BatterySpec(capacity_kwh=40, charge_kw=13, discharge_kw=10), ac_kw=9.9))
+    start = utcnow().replace(second=0, microsecond=0)
+    # Keep the synthetic test away from local midnight.
+    start = start.astimezone(foxess.ZoneInfo('Australia/Brisbane')).replace(hour=11)
+    commands = [BatteryCommand('force_charge', start, start + timedelta(hours=2), 13, 80),
+                BatteryCommand('self_use', start + timedelta(hours=2), start + timedelta(hours=3))]
+    state = {'enable': 0, 'groups': [], 'maxGroupCount': 96,
+             'properties': {'fdpwr': {'unit': 'W', 'range': {'min': 0, 'max': 10500}}}}
+    writes = []
+    async def request(path, payload, write=False):
+        if write:
+            writes.append(path)
+            if path.endswith('/scheduler/enable'):
+                state['groups'] = deepcopy(payload['groups'])
+            else:
+                state['enable'] = payload['enable']
+            return {'errno': 0}
+        return {'result': deepcopy(state)}
+    monkeypatch.setattr(fox, '_request', request)
+    async def run():
+        first = await fox.apply_schedule(commands)
+        assert first.verified
+        assert first.detail['groups'][0]['extraParam']['fdPwr'] == 10500
+        assert 'enable' not in first.detail['groups'][0]
+        assert (await fox.verify_schedule(commands)).verified
+        assert (await fox.apply_schedule(commands)).detail['reused']
+        state['groups'][0]['extraParam']['maxSoc'] = 100
+        assert not (await fox.verify_schedule(commands)).verified
+    asyncio.run(run())
+    assert writes == ['/op/v3/device/scheduler/enable', '/op/v1/device/scheduler/set/flag']
+
+
+def test_daily_schedule_rejects_unsupported_reserve_and_group_capacity(monkeypatch):
+    fox = FoxESSCloud(SimpleNamespace(timezone='UTC'), FoxConfig(serial='example'),
+                      SimpleNamespace(battery=BatterySpec(capacity_kwh=40, charge_kw=5, discharge_kw=5, reserve_pct=5), ac_kw=5))
+    start = utcnow().replace(hour=11)
+    command = BatteryCommand('hold', start, start + timedelta(hours=1), min_soc=5)
+    metadata = {'maxGroupCount': 96, 'properties': {'minsocongrid': {'range': {'min': 10, 'max': 100}}}}
+    with pytest.raises(PluginError, match='minSocOnGrid'):
+        fox._schedule_groups([command], metadata)
+    with pytest.raises(PluginError, match='cannot hold'):
+        fox._schedule_groups([command], {'maxGroupCount': 0})
+
+
+def test_release_allows_slow_cloud_flag_without_resending_disable(monkeypatch):
+    fox = FoxESSCloud(None, FoxConfig(serial='example'), None)
+    reads, writes = [], []
+    async def request(path, payload, write=False):
+        if write:
+            writes.append(path)
+            return {'errno': 0}
+        reads.append(path)
+        return {'result': {'enable': len(reads) < 5}}
+    monkeypatch.setattr(foxess, 'SCHEDULER_READ_PAUSE', 0)
+    monkeypatch.setattr(fox, '_request', request)
+    assert asyncio.run(fox.release()).verified
+    assert len(reads) == 5 and len(writes) == 1
+
+
+def test_daily_schedule_ignores_completed_prefix_but_not_future_changes():
+    start = utcnow().replace(hour=11, minute=0, second=0, microsecond=0)
+    fox = FoxESSCloud(SimpleNamespace(timezone='UTC'), FoxConfig(serial='example'),
+                      SimpleNamespace(battery=BatterySpec(capacity_kwh=40, charge_kw=5, discharge_kw=5), ac_kw=5))
+    command = BatteryCommand('force_charge', start, start + timedelta(hours=3), 4, 80)
+    sent = fox._group(command)
+    sent.pop('enable')
+    got = {**sent, 'startHour': 10}
+    assert foxess._same_schedule([sent], {'enable': 1, 'groups': [got]}, start + timedelta(hours=1))
+    assert not foxess._same_schedule([sent], {'enable': 1, 'groups': [{**got, 'endHour': 15}]}, start + timedelta(hours=1))
+    assert not foxess._same_schedule([sent], {'enable': 1, 'groups': [{**got, 'enable': 0}]}, start + timedelta(hours=1))
