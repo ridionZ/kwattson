@@ -218,11 +218,17 @@ def cmd_export_settings(args):
 
 
 def cmd_plan(args):
-    from . import forecast, optimizer
+    from . import forecast, optimizer, plans
     runtime, db, security = _open(args)
     settings = db.settings()
+    previous = plans.latest(db)
     fid, points, model = forecast.build(db, settings)
+    now = datetime.fromisoformat(db.one('SELECT created_at FROM forecasts WHERE id=?', (fid,))['created_at'])
+    plans.checkpoint(db, fid, settings, now)
     decision = optimizer.plan(db, settings, fid, points, model)
+    candidate = db.one('SELECT * FROM decisions WHERE id=?', (decision['id'],))
+    candidate['summary'] = json.loads(candidate['summary'])
+    decision = plans.consider(db, settings, previous, candidate, now)
     print(json.dumps({k: v for k, v in decision['summary'].items() if k != 'limitations'}, indent=2, default=str))
 
 

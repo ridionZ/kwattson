@@ -37,7 +37,7 @@ With this command each new container starts with a fresh sample house.
    You can add an EV under **Settings → Vehicles** and enable two-step sign-in under **My account**.
 
 Keep the first installation in monitoring mode while you compare its readings with your inverter.
-FoxESS scheduler writes and the unofficial MG integration still need verification on physical devices.
+FoxESS scheduler writes and release have been checked on a KH9.9; other models and the unofficial MG integration still need verification on physical devices.
 Read the commissioning guide before enabling battery commands. [Commissioning](docs/COMMISSIONING.md)
 
 ## What it does

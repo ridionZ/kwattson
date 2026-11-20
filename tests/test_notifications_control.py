@@ -94,6 +94,76 @@ def test_dispatch_command_ends_at_buffered_step(db, security, tmp_path):
     assert db.meta('control_active')['main']['target_soc'] == 42
 
 
+def test_daily_schedule_keeps_future_groups_and_does_not_refresh_windows(db, security, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from kwattson.plugins.base import CommandResult
+    from kwattson.config import stamp
+    from test_plan_adoption import rows, NOW
+    settings = make_test_site()
+    device = SimpleNamespace(apply_schedule=AsyncMock(return_value=CommandResult(True, True)),
+                             verify_schedule=AsyncMock(return_value=CommandResult(True, True)),
+                             release=AsyncMock(return_value=CommandResult(True, True)))
+    controller = Controller(db, SimpleNamespace(system=lambda *_: device), Notifications(db, security),
+                            Runtime(data_dir=tmp_path, app_url='http://localhost:8080', dev_http=True, worker=False))
+    monkeypatch.setattr('kwattson.plans.intervals', lambda *_: rows(settings))
+    async def run():
+        decision = {'id': 1}
+        assert (await controller.send_schedule(settings, settings.systems[0], device, decision, NOW))['status'] == 'verified'
+        # The initial self-use step must not disable the future free-power charge.
+        assert db.meta('control_active')['main']['mode'] == 'self_use'
+        for minutes in (1, 6, 30, 60):
+            assert (await controller.send_schedule(settings, settings.systems[0], device, decision,
+                                                   NOW + timedelta(minutes=minutes)))['status'] == 'daily schedule unchanged'
+        assert device.apply_schedule.await_count == 1
+        assert device.verify_schedule.await_count == 3
+        device.release.assert_not_awaited()
+        assert db.one("SELECT COUNT(*) AS n FROM commands WHERE action='daily_schedule'")['n'] == 1
+        await controller.release(settings, settings.systems[0], 'test stop')
+        assert not db.meta('control_schedules')
+        assert not db.meta('control_active')
+    asyncio.run(run())
+
+
+def test_failed_background_review_invalidates_control_and_keeps_plan(db, security, tmp_path, monkeypatch):
+    from kwattson.engine import Engine
+    from kwattson import forecast
+    db.set_meta('active_plan', {'decision_id': 123, 'valid': True})
+    engine = Engine(db, security, Runtime(data_dir=tmp_path, app_url='http://localhost:8080', dev_http=True, worker=False))
+    def failed(*_):
+        raise RuntimeError('synthetic forecast failure')
+    monkeypatch.setattr(forecast, 'build', failed)
+    with pytest.raises(RuntimeError):
+        asyncio.run(engine.replan())
+    assert db.meta('active_plan')['decision_id'] == 123
+    assert not db.meta('active_plan')['valid']
+
+
+def test_adopted_plan_uses_review_freshness_and_blocks_next_day(db, security, tmp_path, monkeypatch):
+    from kwattson.config import stamp
+    from kwattson import optimizer, plans
+    from kwattson.ingest import store_system
+    from kwattson.plugins.base import SystemReading
+    settings = make_test_site()
+    settings.systems[0].controllable = True
+    settings.mode = 'automatic'
+    settings.tariffs = [t for t in settings.tariffs if t.status != 'pending']
+    now = datetime(2026, 11, 20, 12, tzinfo=ZONE)
+    db.save_settings(settings)
+    store_system(db, 'main', 'simulator', SystemReading(ts=now, time_verified=True, soc=50, fault=False))
+    controller = Controller(db, Devices(db, security), Notifications(db, security),
+                            Runtime(data_dir=tmp_path, app_url='http://localhost:8080', dev_http=True, worker=False))
+    db.set_meta('control_commissioned', {'hash': commissioning_hash(settings)})
+    db.set_meta('active_plan', dict(decision_id=1, day='2026-11-20', valid=True, reviewed_at=stamp(now),
+                                    policy=plans.policy(db, settings, now)))
+    monkeypatch.setattr(controller, 'latest_decision', lambda: dict(id=1, created_at=stamp(now - timedelta(hours=6)),
+                        version=optimizer.VERSION, summary=dict(solver='HiGHS MILP', telemetry_fresh=True,
+                                                                 dispatch_policy=optimizer.dispatch_policy(settings))))
+    assert controller.guards(settings, now) == []
+    assert any('new local day' in reason for reason in controller.guards(settings, now + timedelta(days=1)))
+    assert any('older than 35 minutes' in reason for reason in controller.guards(settings, now + timedelta(minutes=36)))
+
+
 @pytest.mark.parametrize('failure', [None, 'planning', 'verification'])
 def test_enabling_control_builds_and_applies_first_step(db, security, tmp_path, monkeypatch, failure):
     from types import SimpleNamespace

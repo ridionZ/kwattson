@@ -9,7 +9,7 @@ import logging
 import time
 from datetime import datetime, timedelta
 
-from . import advice, alerts, ev_charging, forecast, optimizer, outcomes, weather
+from . import advice, alerts, ev_charging, forecast, optimizer, outcomes, plans, weather
 from .config import Runtime, Settings, stamp, utcnow
 from .control import Controller
 from .db import Database, decode
@@ -43,13 +43,29 @@ class Engine:
 
     async def replan(self, settings: Settings | None = None) -> dict:
         async with self.lock:
-            settings = settings or self.db.settings()
-            forecast_id, points, model = await asyncio.to_thread(forecast.build, self.db, settings)
-            decision = await asyncio.to_thread(optimizer.plan, self.db, settings, forecast_id, points, model)
-            if decision['summary']['solver'] != 'HiGHS MILP':
-                self.notifications.emit('plan_failed', {'reason': 'The optimiser found no verified solution; showing a self-use plan. '
-                                                                  f"Solver said: {decision['summary']['solver_message']}"})
-            return decision
+            try:
+                return await self._build_plan(settings or self.db.settings())
+            except Exception:
+                plans.invalidate_review(self.db)
+                raise
+
+    async def _build_plan(self, settings):
+        previous = self.latest_decision()
+        active = self.db.meta('active_plan', {})
+        if active:
+            self.db.set_meta('active_plan', {**active, 'candidate_policy': plans.policy(self.db, settings, utcnow()),
+                                             'candidate_day': utcnow().astimezone(settings.zone).date().isoformat()})
+        forecast_id, points, model = await asyncio.to_thread(forecast.build, self.db, settings)
+        run = self.db.one('SELECT created_at FROM forecasts WHERE id=?', (forecast_id,))
+        reviewed_at = datetime.fromisoformat(run['created_at'])
+        plans.checkpoint(self.db, forecast_id, settings, reviewed_at)
+        decision = await asyncio.to_thread(optimizer.plan, self.db, settings, forecast_id, points, model)
+        if decision['summary']['solver'] != 'HiGHS MILP':
+            self.notifications.emit('plan_failed', {'reason': 'The optimiser found no verified solution; automatic control is waiting. '
+                                                              f"Solver said: {decision['summary']['solver_message']}"})
+        candidate = self.db.one('SELECT * FROM decisions WHERE id=?', (decision['id'],))
+        candidate['summary'] = decode(candidate['summary'])
+        return plans.consider(self.db, settings, previous, candidate, reviewed_at)
 
     async def poll(self):
         settings = self.db.settings()
@@ -92,11 +108,17 @@ class Engine:
             except Exception as error:
                 self.next['weather'] = now + 600
                 self.db.audit('weather_failed', {'error': type(error).__name__})
+        active_plan = self.db.meta('active_plan', {})
+        if active_plan and (active_plan.get('candidate_policy', active_plan.get('policy')) != plans.policy(self.db, settings, utcnow())
+                            or active_plan.get('candidate_day', active_plan.get('day')) != utcnow().astimezone(settings.zone).date().isoformat()):
+            self.next['plan'] = 0
         if now >= self.next['plan']:
             self.next['plan'] = now + PLAN_SECONDS
             try:
                 await self.replan()
             except Exception as error:
+                plans.invalidate_review(self.db)
+                self.next['plan'] = time.time() + 60
                 log.exception('Planning failed')
                 self.notifications.emit('plan_failed', {'reason': f'Planning failed ({type(error).__name__}); no automatic commands are sent.'})
         recovery = self.controller.recovery_status()
@@ -127,6 +149,8 @@ class Engine:
         cutoff = stamp(utcnow() - timedelta(days=30))
         with self.db.connect() as c:
             old = [r['id'] for r in c.execute("SELECT id, created_at FROM forecasts WHERE created_at<? AND "
+                                               "json_extract(model, '$.checkpoint') IS NULL AND NOT EXISTS "
+                                               "(SELECT 1 FROM decisions d WHERE d.forecast_id=forecasts.id AND json_extract(d.summary, '$.adopted')=1) AND "
                                                "(CAST(strftime('%H', created_at) AS INTEGER) % 3 != 0 OR CAST(strftime('%M', created_at) AS INTEGER) >= 15)",
                                                (cutoff,))]
             for i in range(0, len(old), 500):

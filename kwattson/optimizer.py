@@ -47,7 +47,7 @@ from .dispatch import overnight_need, split_points
 from .ingest import select_intervals
 from .tariffs import plan_at
 
-VERSION = 'milp-dc-coupled-v1.5'
+VERSION = 'milp-dc-coupled-v1.6'
 EPS = 1e-6
 
 

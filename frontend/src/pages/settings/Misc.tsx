@@ -444,6 +444,12 @@ function Planning() {
               help="Extra battery reserve for uncertain overnight use, above the minimum reserve and expected household demand through 6 am." />
             <NumField label="End-of-plan value" value={v.terminal_value_factor} onChange={(x) => set({ terminal_value_factor: x })} min={0} max={1.5}
               help="How much energy left in the battery at the end of the plan is worth, as a share of future prices. Lower lets the plan use the battery more freely; higher keeps more in reserve." />
+            <NumField label="Plan timing change" unit="min" value={v.plan_change_minutes ?? 30} onChange={(x) => set({ plan_change_minutes: x })} min={0} max={120}
+              help="Keep the adopted plan unless a schedule boundary moves by more than this. Safety changes and manual overrides apply immediately." />
+            <NumField label="Plan energy change" unit="kWh" value={v.plan_change_kwh ?? 1} onChange={(x) => set({ plan_change_kwh: x })} min={0.01} max={20}
+              help="Adopt a candidate when the remaining day's battery or grid energy changes by this amount." />
+            <NumField label="Plan cost change" unit="$" value={v.plan_change_aud ?? 0.5} onChange={(x) => set({ plan_change_aud: x })} min={0.01} max={20}
+              help="Adopt a candidate when the remaining day's modelled energy cost changes by this amount. Every background run is still saved." />
           </Box>
           <FormFoot {...fc} />
         </Section>

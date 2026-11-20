@@ -142,6 +142,7 @@ class SystemPlugin(ABC):
     Config: ClassVar[type[PluginConfig]] = PluginConfig
     secrets: ClassVar[tuple[SecretField, ...]] = ()
     can_control: ClassVar[bool] = False
+    supports_battery_schedule: bool = False
     supported_modes: ClassVar[tuple[str, ...]] = ()
     control_notes: ClassVar[str] = ''
 
@@ -165,6 +166,14 @@ class SystemPlugin(ABC):
 
     async def apply(self, command: BatteryCommand) -> CommandResult:
         raise NotImplementedError(f'{self.title} does not support battery control')
+
+    async def apply_schedule(self, commands: list[BatteryCommand]) -> CommandResult:
+        """Replace and verify today's complete schedule, without a rolling refresh."""
+        raise NotImplementedError(f'{self.title} does not support battery schedules')
+
+    async def verify_schedule(self, commands: list[BatteryCommand]) -> CommandResult:
+        """Read-only confirmation that the enabled schedule still matches."""
+        raise NotImplementedError(f'{self.title} does not support battery schedules')
 
     async def release(self) -> CommandResult:
         """Return the device to its own normal mode and remove any schedule we wrote."""

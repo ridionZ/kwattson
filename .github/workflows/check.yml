@@ -1,0 +1,26 @@
+name: Check app and dashboard
+on:
+  push:
+    branches: ['fix/**']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  app:
+    runs-on: ubuntu-latest
+    container: python:3.13-slim
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+      - run: pip install --disable-pip-version-check -r deploy/requirements.lock 'pytest>=8,<10'
+      - run: pytest -q
+  dashboard:
+    runs-on: ubuntu-latest
+    container: node:24-slim
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm run build

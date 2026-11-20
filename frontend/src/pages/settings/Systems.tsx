@@ -188,7 +188,7 @@ function ControlCard({ onEnable }: { onEnable: () => void }) {
 
   return (
     <Section title="Automatic control" help={<HelpTip label="automatic control">
-      In automatic mode kWattson sends the plan to controllable systems every few minutes and checks each command took effect.
+      In automatic mode kWattson confirms the adopted schedule and keeps checking it. FoxESS daily schedules are only rewritten for material plan changes.
       When a check fails, kWattson pauses commands, returns to self-use and resumes when checks pass.
     </HelpTip>}>
       <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2} sx={{ alignItems: { sm: 'center' }, justifyContent: 'space-between' }}>
@@ -203,6 +203,9 @@ function ControlCard({ onEnable }: { onEnable: () => void }) {
           {auto ? 'Turn off' : status?.control_commissioned ? 'Turn on' : 'Turn on…'}
         </Button>}
       </Stack>
+      {controllable.some(s => s.plugin === 'foxess' && s.plugin_config.daily_schedule !== false) && <Alert severity="info" sx={{ mt: 2 }}>
+        FoxESS uses a confirmed daily schedule. If kWattson goes offline, that schedule can repeat each day until replaced or disabled in the FoxESS app.
+      </Alert>}
       {guards.length > 0 && (
         <Alert severity={auto ? 'warning' : 'info'} sx={{ mt: 2 }}>
           <strong>{auto ? 'Paused because:' : 'Before it can run:'}</strong>
@@ -316,7 +319,9 @@ function SystemWizard({ editId, onClose }: { editId?: string; onClose: () => voi
   });
   const [secrets, setSecrets] = useState<Record<string, string>>({});
   const [tested, setTested] = useState<'ok' | 'skipped' | null>(editId ? 'skipped' : null);
-  const [reported, setReported] = useState<Partial<Pick<Draft, 'ac_kw' | 'reserve_pct'>>>({});
+  const [reported, setReported] = useState<Partial<Pick<Draft, 'ac_kw' | 'reserve_pct' | 'capacity_kwh'>>>({});
+  const [hardware, setHardware] = useState<Record<string, any>>({});
+  const [connectionWarnings, setConnectionWarnings] = useState<string[]>([]);
   const [testMsg, setTestMsg] = useState<{ ok: boolean; text: string } | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -325,6 +330,8 @@ function SystemWizard({ editId, onClose }: { editId?: string; onClose: () => voi
   const configured = !editId ? [] : doc.configured_secrets[`system:${draft.id}`] ?? [];
   function resetTest() {
     setReported({});
+    setHardware({});
+    setConnectionWarnings([]);
     setTested(null);
     setTestMsg(null);
     setError(null);
@@ -332,15 +339,27 @@ function SystemWizard({ editId, onClose }: { editId?: string; onClose: () => voi
   function set(patch: Partial<Draft>) {
     if (step < 2) resetTest();
     // Once an owner edits a discovered rating, the field stays fully editable, including blank.
-    if ('ac_kw' in patch || 'reserve_pct' in patch) {
-      setReported(previous => ({ ...previous, ...('ac_kw' in patch ? { ac_kw: undefined } : {}), ...('reserve_pct' in patch ? { reserve_pct: undefined } : {}) }));
+    if ('ac_kw' in patch || 'reserve_pct' in patch || 'capacity_kwh' in patch) {
+      setReported(previous => ({ ...previous, ...('ac_kw' in patch ? { ac_kw: undefined } : {}), ...('reserve_pct' in patch ? { reserve_pct: undefined } : {}), ...('capacity_kwh' in patch ? { capacity_kwh: undefined } : {}) }));
     }
     setDraft((previous) => ({ ...previous, ...patch }));
   }
 
   const discoverySummary = [reported.ac_kw && ('an inverter rating of ' + reported.ac_kw + ' kW'),
+    reported.capacity_kwh && ('a battery capacity of ' + reported.capacity_kwh + ' kWh'),
     reported.reserve_pct && ('a grid-connected reserve of ' + reported.reserve_pct + '%')].filter(Boolean).join(' and ');
-  const hardwareDraft = { ...draft, ac_kw: draft.ac_kw || reported.ac_kw || '', reserve_pct: draft.reserve_pct || reported.reserve_pct || '' };
+  const hardwareDraft = { ...draft, ac_kw: draft.ac_kw || reported.ac_kw || '', reserve_pct: draft.reserve_pct || reported.reserve_pct || '', capacity_kwh: draft.capacity_kwh || reported.capacity_kwh || '' };
+  const hardwareWarnings = [...connectionWarnings];
+  if (hardware.work_modes?.length) {
+    const missing = ['SelfUse', 'Feedin', 'ForceCharge', 'ForceDischarge'].filter(mode => !hardware.work_modes.includes(mode));
+    if (missing.length) hardwareWarnings.push(`The inverter does not report support for: ${missing.join(', ')}. A plan requiring those modes cannot be sent.`);
+  }
+  if (draft.hasBattery && hardware.scheduler_limit_kw && Number(draft.charge_kw) > hardware.scheduler_limit_kw) {
+    hardwareWarnings.push(`The battery DC charge limit is above the ${f.kw(hardware.scheduler_limit_kw)} AC scheduler limit. Solar can use the DC limit; grid charging commands will be capped automatically.`);
+  }
+  if (draft.hasBattery && hardware.capacity_kwh && hardwareDraft.capacity_kwh && Math.abs(Number(hardwareDraft.capacity_kwh) - hardware.capacity_kwh) > 0.1) {
+    hardwareWarnings.push(`FoxESS reports ${f.kwh(hardware.capacity_kwh)} battery capacity. Check the capacity you entered.`);
+  }
 
   function stepError(i: number, requireTest = true): string | null {
     if (i === 0) return draft.plugin ? null : 'Choose what you’re connecting.';
@@ -356,14 +375,19 @@ function SystemWizard({ editId, onClose }: { editId?: string; onClose: () => voi
     if (i === 2) {
       const n = (v: string) => Number(v);
       if (!(n(hardwareDraft.ac_kw) > 0 && n(hardwareDraft.ac_kw) <= 100)) return 'Inverter limit must be between 0 and 100 kW.';
+      if (hardware.ac_kw && n(hardwareDraft.ac_kw) > hardware.ac_kw + 0.01) return `Inverter AC limit cannot exceed the reported ${hardware.ac_kw} kW rating.`;
       if (draft.pv_kwp === '' || n(draft.pv_kwp) < 0 || n(draft.pv_kwp) > 200) return 'Panels must be between 0 and 200 kWp.';
       if (draft.pv_dc_max_kw && !(n(draft.pv_dc_max_kw) > 0 && n(draft.pv_dc_max_kw) <= 200)) return 'Max PV DC must be above 0 and at most 200 kW.';
-      if (n(draft.capacity_kwh) > 500 && draft.hasBattery) return 'Battery capacity must be at most 500 kWh.';
+      if (n(hardwareDraft.capacity_kwh) > 500 && draft.hasBattery) return 'Battery capacity must be at most 500 kWh.';
       if (draft.hasBattery && (n(draft.charge_kw) > 100 || n(draft.discharge_kw) > 100)) return 'Charge and discharge limits must be at most 100 kW.';
       if (draft.site_meter && draft.enabled && doc.settings.systems.some((s: any) => s.id !== editId && s.enabled && s.site_meter)) return 'Another system already measures the whole house. Turn this switch off.';
-      if (draft.hasBattery && !(n(draft.capacity_kwh) > 0.5 && n(draft.charge_kw) > 0 && n(draft.discharge_kw) > 0)) return 'Enter the battery size and its charge and discharge limits.';
+      if (draft.hasBattery && !(n(hardwareDraft.capacity_kwh) > 0.5 && n(draft.charge_kw) > 0 && n(draft.discharge_kw) > 0)) return 'Enter the battery size and its charge and discharge limits.';
       if (draft.hasBattery && hardwareDraft.reserve_pct === '') return 'Enter the battery reserve.';
       if (draft.hasBattery && !(n(hardwareDraft.reserve_pct) >= 0 && n(hardwareDraft.reserve_pct) <= 90)) return 'Reserve must be between 0 and 90%.';
+      if (draft.hasBattery && !(Number(draft.battery_extra.max_soc_pct ?? 100) >= 30 && Number(draft.battery_extra.max_soc_pct ?? 100) <= 100)) return 'Maximum battery level must be between 30 and 100%.';
+      if (draft.hasBattery && n(hardwareDraft.reserve_pct) >= Number(draft.battery_extra.max_soc_pct ?? 100)) return 'Reserve must be below the maximum battery level.';
+      if (draft.hasBattery && hardware.min_soc_pct != null && n(hardwareDraft.reserve_pct) < hardware.min_soc_pct) return `Reserve must be at least the inverter minimum of ${hardware.min_soc_pct}%.`;
+      if (draft.plugin === 'foxess' && draft.hasBattery && draft.controllable && hardware.daily_schedule_supported === false && draft.plugin_config.daily_schedule !== false) return 'Disable Daily schedule in Connection, or retest to confirm the inverter supports it.';
     }
     return null;
   }
@@ -382,7 +406,13 @@ function SystemWizard({ editId, onClose }: { editId?: string; onClose: () => voi
       setReported({
         ...(typeof hw.ac_kw === 'number' ? { ac_kw: String(hw.ac_kw) } : {}),
         ...(typeof hw.reserve_pct === 'number' ? { reserve_pct: String(hw.reserve_pct) } : {}),
+        ...(typeof hw.capacity_kwh === 'number' ? { capacity_kwh: String(hw.capacity_kwh) } : {}),
       });
+      setHardware(hw);
+      setConnectionWarnings(r.warnings ?? []);
+      if (r.connection?.serial && !draft.plugin_config.serial) {
+        setDraft(previous => ({ ...previous, plugin_config: { ...previous.plugin_config, serial: r.connection.serial } }));
+      }
       const reading = r?.reading ?? r;
       const soc = reading?.soc;
       setTested('ok');
@@ -492,11 +522,18 @@ function SystemWizard({ editId, onClose }: { editId?: string; onClose: () => voi
           <FormControlLabel control={<Switch checked={draft.hasBattery} onChange={(e) => set({ hasBattery: e.target.checked })} />} label="Has a battery" />
         </Box>
         {draft.hasBattery && <>
-          <Num label="Battery capacity" unit="kWh" value={draft.capacity_kwh} onChange={(v) => set({ capacity_kwh: v })} required help="Usable capacity, as the inverter reports it." />
+          <Num label="Battery capacity" unit="kWh" value={hardwareDraft.capacity_kwh} onChange={(v) => set({ capacity_kwh: v })} required help="Battery design capacity, when reported by the inverter. Unknown values are left for you to confirm." />
           <Num label="Reserve" unit="%" value={hardwareDraft.reserve_pct} onChange={(v) => set({ reserve_pct: v })} help="The plan never takes the battery below this. Keep some for blackouts." />
-          <Num label="Charge limit" unit="kW" value={draft.charge_kw} onChange={(v) => set({ charge_kw: v })} required />
+          <Num label="Maximum battery level" unit="%" value={String(draft.battery_extra.max_soc_pct ?? 100)} onChange={v => set({ battery_extra: { ...draft.battery_extra, max_soc_pct: Number(v) } })} help="Charging targets cannot exceed this level. It must stay above the reserve." />
+          <Num label="Battery DC charge limit" unit="kW" value={draft.charge_kw} onChange={(v) => set({ charge_kw: v })} required help="Maximum combined battery charging from solar and grid. This can be higher than the AC scheduler limit." />
           <Num label="Discharge limit" unit="kW" value={draft.discharge_kw} onChange={(v) => set({ discharge_kw: v })} required />
         </>}
+        {!!hardware.scheduler_limit_kw && <Alert severity="info" sx={{ gridColumn: '1 / -1' }}>FoxESS scheduler limit: {f.kw(hardware.scheduler_limit_kw)} AC. This is read from the inverter before commands are sent. Battery DC charge power must be confirmed separately.</Alert>}
+        {hardware.min_soc_pct != null && <Typography variant="body2" sx={{ gridColumn: '1 / -1' }}>Inverter minimum battery level: {f.pct(hardware.min_soc_pct)}. Choose a reserve at or above this.</Typography>}
+        {draft.plugin === 'foxess' && draft.hasBattery && draft.plugin_config.daily_schedule !== false && <Alert severity="info" sx={{ gridColumn: '1 / -1' }}>
+          Daily control confirms the remaining day's schedule and only replaces it for material plan changes. If kWattson goes offline, the schedule repeats each day until disabled in the FoxESS app.
+        </Alert>}
+        {hardwareWarnings.map((warning, index) => <Alert key={index} severity="warning" sx={{ gridColumn: '1 / -1' }}>{warning}</Alert>)}
         <Box sx={{ gridColumn: '1 / -1', display: 'flex', alignItems: 'center' }}>
           <FormControlLabel control={<Switch checked={draft.site_meter} onChange={(e) => set({ site_meter: e.target.checked })} />} label="This system measures the whole house" />
           <HelpTip label="whole-house meter">Turn on if this inverter’s meter sees all grid import and export for the house. Only one system should have this on.</HelpTip>
@@ -517,9 +554,10 @@ function SystemWizard({ editId, onClose }: { editId?: string; onClose: () => voi
           ['Connection', tested === 'ok' ? 'Tested and working' : draft.plugin === 'push' && !editId ? 'Waiting for the first push' : 'Not tested'],
           ['Inverter', `${f.kw(Number(hardwareDraft.ac_kw))} AC · ${draft.coupling.toUpperCase()} coupled`],
           ['Panels', `${f.n(Number(draft.pv_kwp || 0))} kWp${draft.pv_dc_max_kw ? ` · max DC ${f.kw(Number(draft.pv_dc_max_kw))}` : ''}`],
-          ['Battery', draft.hasBattery ? `${f.kwh(Number(draft.capacity_kwh))}, ${f.kw(Number(draft.charge_kw))} in / ${f.kw(Number(draft.discharge_kw))} out, reserve ${f.pct(Number(hardwareDraft.reserve_pct))}` : 'None'],
+          ['Battery', draft.hasBattery ? `${f.kwh(Number(hardwareDraft.capacity_kwh))}, ${f.kw(Number(draft.charge_kw))} DC in / ${f.kw(Number(draft.discharge_kw))} out, reserve ${f.pct(Number(hardwareDraft.reserve_pct))}` : 'None'],
           ['Whole-house meter', draft.site_meter ? 'Yes' : 'No'],
         ]} />
+        {hardwareWarnings.map((warning, index) => <Alert key={index} severity="warning" sx={{ mt: 1 }}>{warning}</Alert>)}
         <Alert severity="info" variant="outlined" sx={{ mt: 2 }}>{draft.controllable ? 'This system allows battery commands when automatic control is on.' : 'This system will be monitored. Battery commands are disabled for it.'}</Alert>
       </Box>
     ),

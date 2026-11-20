@@ -33,19 +33,26 @@ Missing weather uses a conservative fallback forecast.
    Changing the commissioned system configuration requires commissioning again.
 
 ## FoxESS specifics
-- Control uses the Cloud Open API *scheduler* (time groups). Each command writes one ≤20-minute group
-  and enables the scheduler. Each group ends by its plan interval's boundary, including the
-  configured buffer around favourable tariff windows. Force-discharge targets retain the
-  planned overnight reserve. The controller reads the schedule back up to five times within
-  15 seconds to allow for cloud delays. It continues only when the scheduler is enabled and the
-  requested group and its required limits match. *Release* disables the scheduler.
+- Control defaults to one Cloud Open API v3 schedule for the rest of the local day. It is
+  confirmed once, checked with reads every five minutes, and replaced when a materially
+  different plan is adopted. Tariff buffers, charge cutoffs, and overnight reserves remain
+  in the schedule. Daily read-back allows up to 45 seconds for cloud delays; release allows
+  up to 20 seconds. An unchanged enabled schedule is reused without writes. Disable
+  **Daily schedule** in the connection settings for the older ≤20-minute command path.
 - **Residual risk:** FoxESS time groups repeat **daily**. If kWattson crashes or loses internet
-  while a group is active, that group can recur at the same time each day until replaced. The worst
-  case is one ≤20-minute force charge/discharge window per day, bounded by your reserve. To clear it
+  while a schedule is active, the entire stored daily schedule can recur until replaced, even
+  if prices or the weather change. Keep the controller online. To clear it
   manually: FoxESS app → device → *Mode Scheduler* → turn off.
 - Force-charge power may be capped by the inverter's own settings.
-- Write support has not yet been verified on hardware by this project. Treat the first commissioning
-  as a test.
+- Before writing a schedule, the plugin reads the inverter's `fdPwr` range and caps the
+  requested power at that limit. The battery's configured charge limit describes DC power;
+  it can exceed the scheduler's AC limit (for example, 13 kW DC versus 10.5 kW AC).
+  Older firmware without this range uses the configured inverter AC rating. Invalid reported
+  limits block the write. The applied group and scheduler limit are stored in the command result.
+  FoxESS can acknowledge an out-of-range request without applying it, so matching read-back
+  remains mandatory.
+- Scheduler writes and release have been checked on a KH9.9. Treat commissioning on other
+  models or firmware as a test and confirm physical charging in the inverter app.
 
 ## Stopping
 - Dashboard: **Stop automatic control** (always visible in automatic mode).

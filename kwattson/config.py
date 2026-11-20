@@ -150,6 +150,9 @@ class SiteSettings(Strict):
 
 
 class ForecastSettings(Strict):
+    plan_change_minutes: int = Field(30, ge=0, le=120, description='Adopt a new plan when a schedule boundary shifts by more than these minutes')
+    plan_change_kwh: float = Field(1, gt=0, le=20, description='Adopt a new plan when battery or grid energy changes by this many kWh')
+    plan_change_aud: float = Field(0.5, gt=0, le=20, description='Adopt a new plan when modelled energy cost changes by this many dollars')
     risk: str = Field('balanced', pattern='^(conservative|balanced|optimistic)$')
     history_days: int = Field(84, ge=14, le=730)
     half_life_days: float = Field(28, ge=3, le=365)

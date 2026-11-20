@@ -181,6 +181,41 @@ For past days with ≥90% coverage, uses measured load/solar as a *perfect* fore
 optimiser vs self-use under each tariff. PV in output-limited intervals is reconstructed from the
 solar model where higher. Upper bound on achievable savings; real results are lower.
 
+## 7. FoxESS command limits
+
+Before each scheduler write, the plugin reads the inverter's advertised maximum `fdPwr`
+in watts. It caps force-charge and force-discharge commands at this limit while retaining
+the configured battery DC limits for planning and solar charging. If older firmware omits
+the range, the configured inverter AC rating is the fallback. An invalid advertised limit
+prevents the write. This avoids acknowledged but unapplied commands when the DC charging
+limit exceeds the scheduler's AC limit. The command result records the applied group and
+the scheduler power limit; enabled-schedule read-back and telemetry checks still apply.
+
+## 8. Plan adoption and daily control
+
+Forecasting and optimisation continue every 15 minutes. Every candidate and its forecast are
+stored. The adopted plan is separate from the newest candidate: it changes at local midnight,
+after settings or manual overrides change, or when the remaining day's schedule changes by
+more than 30 minutes, battery/grid energy or a cutoff changes by at least 1 kWh, or modelled
+net energy cost changes by at least $0.50. These thresholds are configurable. Cost change is
+a comparison of forecast cash flows, not a measured saving. The adoption reason and comparison
+are stored in the decision summary. Background reviews keep the plan fresh only when a new
+candidate has a verified solution and fresh telemetry; failed/stale reviews pause control.
+
+FoxESS defaults to one v3 schedule for the rest of the local day. Adjacent commands in the
+same mode and tariff band are combined; overnight reserve floors are retained. The full
+schedule is read back before acceptance and checked again every five minutes without writes.
+An unchanged adopted plan does not refresh rolling windows. Materially changed plans replace
+the remaining schedule; already-completed groups do not force a rewrite. Stop, stale data,
+faults, and unconfirmed schedules disable the scheduler. Other plugins retain short commands.
+
+History defaults to adopted decisions and six-hour forecast checkpoints, including a direct
+6 am checkpoint selection. All background runs remain available through a toggle. The first
+forecast saved in each local hour and every adopted forecast retain detail after 30 days,
+so morning baselines are not lost during thinning. Forecast accuracy still compares only
+predictions available at the relevant time, and an individual checkpoint shows its actual
+creation timestamp.
+
 ## Known gaps / ideas
 - Temperature response is one global linear term; per-hour responses would fit AC use better.
 - No ensemble weather or stochastic optimisation yet; risk is handled by the risk setting.
