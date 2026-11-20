@@ -181,8 +181,8 @@ export function ToastProvider({ children }: { children: ReactNode }) {
 }
 
 /* ------------------------------------------------------------ confirmation */
-export function ConfirmDialog({ open, title, children, confirm, danger, busy, onConfirm, onClose, error }: {
-  open: boolean; title: string; children?: ReactNode; confirm: string; danger?: boolean; busy?: boolean; error?: string | null;
+export function ConfirmDialog({ open, title, children, confirm, danger, busy, onConfirm, onClose, error, disabled, cancelLabel = 'Keep' }: {
+  open: boolean; title: string; children?: ReactNode; confirm: string; danger?: boolean; busy?: boolean; error?: string | null; disabled?: boolean; cancelLabel?: string;
   onConfirm: () => void; onClose: () => void;
 }) {
   const id = useId();
@@ -194,8 +194,8 @@ export function ConfirmDialog({ open, title, children, confirm, danger, busy, on
         {error && <Alert severity="error" sx={{ mt: 2 }}>{error}</Alert>}
       </DialogContent>
       <DialogActions sx={{ px: 3, pb: 2.5 }}>
-        <Button onClick={onClose} disabled={busy} autoFocus>Keep</Button>
-        <Button variant="contained" color={danger ? 'error' : 'primary'} onClick={onConfirm} disabled={busy}>{confirm}</Button>
+        <Button onClick={onClose} disabled={busy} autoFocus>{cancelLabel}</Button>
+        <Button variant="contained" color={danger ? 'error' : 'primary'} onClick={onConfirm} disabled={busy || disabled}>{confirm}</Button>
       </DialogActions>
     </Dialog>
   );

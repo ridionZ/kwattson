@@ -37,6 +37,8 @@ def store_vehicle(db: Database, vehicle_id: str, plugin: str, r: VehicleReading)
     db.execute('INSERT OR REPLACE INTO vehicle_readings VALUES(?,?,?,?,?,?,?,?,?,?,?)', (
         stamp(r.ts), vehicle_id, plugin, r.soc, flag(r.charging), flag(r.plugged_in), flag(r.at_home),
         r.charge_kw, r.range_km, int(r.time_verified), stamp()))
+    from . import home_charging
+    home_charging.observe_vehicle(db, vehicle_id, plugin, r)
 
 
 def combine(settings: Settings, readings: dict[str, SystemReading], ev_kw: float = 0.0, ev_estimated: bool = False) -> dict | None:
@@ -114,6 +116,8 @@ def store_site(db: Database, site: dict):
     with db.connect() as c:
         store_site_row(c, site)
         rebuild_intervals(c, at - MAX_GAP, at + MAX_GAP)
+    from . import home_charging
+    home_charging.observe_site(db, site)
 
 
 def counter_deltas(before: dict, after: dict, seconds: float) -> dict:

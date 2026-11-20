@@ -28,6 +28,7 @@ EVENTS = {
     'ev_charge_opportunity': ('Good time to charge the car', 'info', 'Good time to charge {vehicle}', '{reason}', True, 360),
     'ev_charge_reminder': ('Car charging reminder', 'info', 'Charge {vehicle}', '{reason}', True, 600),
     'ev_charge_session': ('Car charging session limit', 'warning', '{vehicle} charge limit', '{reason}', True, 0),
+    'vehicle_climate': ('Parked climate control', 'warning', '{vehicle} climate control', '{reason}', True, 0),
     'climate_opportunity': ('Cheap heating / cooling', 'info', 'Good time to {climate_mode}', '{reason}', True, 360),
     'clipping_expected': ('Solar would be wasted', 'info', 'About {kwh} kWh of solar may be clipped today', '{reason}', True, 720),
     'cheap_power_window': ('Free / cheap power window', 'info', '{label} starts soon', '{reason}', False, 720),
@@ -51,8 +52,8 @@ GROUPS = {
                 ['daily_summary', 'good_day', 'bad_day', 'weekly_report']),
     'battery': ('Battery & solar', 'Low battery and solar that would be wasted',
                 ['low_battery', 'clipping_expected']),
-    'car': ('Car charging', 'Cheapest time to charge and charging reminders',
-            ['ev_charge_opportunity', 'ev_charge_reminder', 'ev_charge_session']),
+    'car': ('Car charging & controls', 'Charging advice, session limits and parked climate control',
+            ['ev_charge_opportunity', 'ev_charge_reminder', 'ev_charge_session', 'vehicle_climate']),
     'comfort': ('Comfort', 'Good times to cool or heat the house',
                 ['climate_opportunity']),
 }

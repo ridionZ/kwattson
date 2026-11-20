@@ -19,7 +19,7 @@ from .config import Settings, stamp, utcnow
 from .db import Database, decode, encode
 from .optimizer import VERSION, dispatch_policy
 from .plugins.base import BatteryCommand
-from . import plans, schedules
+from . import battery_manual, plans, schedules
 from .tariffs import pending_plans
 
 COMMAND_MINUTES = 20
@@ -147,7 +147,14 @@ class Controller:
         pinned_time = now
         await self.retry_releases(settings, now or utcnow(), retry_now=retry_now)
         now = pinned_time or utcnow()
-        reasons = self.guards(settings, now) + self.recovery_reasons(now, retry_now=retry_now)
+        manual = self.db.meta(battery_manual.KEY, {})
+        for sid, record in list(manual.items()):
+            if record['end'] <= stamp(now):
+                battery_manual.cancel(self.db, sid)
+                manual.pop(sid)
+                self.db.audit('battery_manual_expired', {'system': sid, 'mode': record['mode']})
+        checked_settings = settings.model_copy(update={'mode': 'automatic'}) if manual else settings
+        reasons = self.guards(checked_settings, now) + self.recovery_reasons(now, retry_now=retry_now)
         active = self.db.meta('control_active', {})
         if reasons:
             pending = self.db.meta('control_release_pending', {})
@@ -173,6 +180,13 @@ class Controller:
         results = {}
         for system in [s for s in settings.active_systems() if s.controllable and s.battery]:
             device = self.devices.system(settings, system.id)
+            if system.id in manual:
+                results[system.id] = await self.send_manual(settings, system, device, decision, manual[system.id], now)
+                if results[system.id]['status'] in ('failed', 'unverified'):
+                    break
+                continue
+            if settings.mode != 'automatic':
+                continue
             if getattr(device, 'supports_battery_schedule', False):
                 results[system.id] = await self.send_schedule(settings, system, device, decision, now)
                 if results[system.id]['status'] in ('failed', 'unverified'):
@@ -188,6 +202,90 @@ class Controller:
         if not reasons and not deferred and self.db.meta('control_recovery'):
             self.db.set_meta('control_recovery', None)
         return {'executed': not reasons and not deferred, 'results': results, 'reasons': reasons}
+
+    async def send_manual(self, settings, system, device, decision, record, now):
+        active = self.db.meta('control_active', {})
+        current = active.get(system.id) or {}
+        if record['mode'] in ('force_charge', 'force_discharge'):
+            charge, export = battery_manual.power_limits(self.db, settings, system, now)
+            maximum = charge if record['mode'] == 'force_charge' else export
+            if maximum is None or maximum <= 0:
+                battery_manual.cancel(self.db, system.id)
+                await self.pause(settings, system, 'Temporary battery mode ended because site power headroom is unavailable.', now)
+                return {'status': 'unverified'}
+            if maximum < record['power_kw'] - .1:
+                record['power_kw'] = maximum
+                record.pop('command_id', None)
+        if record['mode'] == 'force_discharge':
+            try:
+                floor = battery_manual.export_floor(self.db, settings, system, now, datetime.fromisoformat(record['end']))
+            except Exception:
+                battery_manual.cancel(self.db, system.id)
+                await self.pause(settings, system, 'Manual export has no verified overnight reserve forecast.', now)
+                return {'status': 'unverified'}
+            if floor > record['target_soc']:
+                live = self.db.latest_system(system.id)
+                if floor >= system.battery.max_soc_pct or not live or live['soc'] is None or live['soc'] <= floor:
+                    battery_manual.cancel(self.db, system.id)
+                    await self.pause(settings, system, 'The protected reserve increased; temporary battery export ended.', now)
+                    return {'status': 'unverified'}
+                record.update(target_soc=floor, min_soc=floor)
+                record.pop('command_id', None)
+        if record.get('command_id') and current.get('command_id') == record['command_id']:
+            if record.get('program') and now - datetime.fromisoformat(record['checked_at']) >= timedelta(minutes=5):
+                try:
+                    verified = await device.verify_schedule(schedules.decode_commands(record['program']))
+                except Exception:
+                    verified = None
+                if not verified or not verified.verified:
+                    await self.pause(settings, system, f'{system.name}: temporary mode no longer confirmed.', now)
+                    return {'status': 'unverified'}
+                record['checked_at'] = stamp(now)
+                records = self.db.meta(battery_manual.KEY, {})
+                records[system.id] = record
+                self.db.set_meta(battery_manual.KEY, records)
+            return {'status': 'manual mode unchanged', 'command_id': record['command_id']}
+        command = battery_manual.command(record)
+        payload = dict(system=system.id, manual=record)
+        commands = None
+        if getattr(device, 'supports_battery_schedule', False):
+            live = self.db.latest_system(system.id)
+            base, _ = schedules.build(settings, system, plans.intervals(self.db, decision['id']), now, live['soc'] if live else None)
+            commands = battery_manual.overlay(base, command)
+            payload['commands'] = schedules.encode_commands(commands)
+        command_id = self.db.execute('INSERT INTO commands(created_at,decision_id,action,payload,status,result,idempotency_key) VALUES(?,?,?,?,?,?,?)',
+                    (stamp(now), decision['id'], 'manual_' + record['mode'], encode(payload), 'sending', '{}', f'manual:{system.id}:{uuid4().hex}'))
+        self.expect_release(system.id, 'Checking a temporary owner-selected mode', now)
+        self.applying.add(system.id)
+        try:
+            result = await device.apply_schedule(commands) if commands is not None else await device.apply(command)
+        except Exception as error:
+            self.db.execute("UPDATE commands SET status='failed',result=? WHERE id=?", (encode({'error': type(error).__name__}), command_id))
+            await self.pause(settings, system, f'{system.name}: temporary mode request failed.', now)
+            return {'status': 'failed'}
+        finally:
+            self.applying.discard(system.id)
+        status = 'verified' if result.verified else 'unverified'
+        self.db.execute('UPDATE commands SET status=?,result=?,verified_at=? WHERE id=?',
+                        (status, encode(result.detail), stamp(now) if result.verified else None, command_id))
+        if not result.verified:
+            await self.pause(settings, system, f'{system.name}: temporary mode was not confirmed.', now)
+            return {'status': status}
+        record['command_id'] = command_id
+        record['checked_at'] = stamp(now)
+        if commands is not None:
+            record['program'] = schedules.encode_commands(commands)
+        records = self.db.meta(battery_manual.KEY, {})
+        records[system.id] = record
+        self.db.set_meta(battery_manual.KEY, records)
+        active[system.id] = dict(mode=command.mode, power_kw=command.power_kw, target_soc=command.target_soc,
+                                 start=stamp(command.start), end=stamp(command.end), command_id=command_id, mismatches=0)
+        self.db.set_meta('control_active', active)
+        stored = self.db.meta('control_schedules', {})
+        stored.pop(system.id, None)
+        self.db.set_meta('control_schedules', stored)
+        self.release_confirmed(system.id)
+        return {'status': status, 'command_id': command_id}
 
     async def send_schedule(self, settings, system, device, decision, now):
         stored = self.db.meta('control_schedules', {})
@@ -383,6 +481,7 @@ class Controller:
         return problems
 
     async def stop(self, settings: Settings, why: str, actor='owner'):
+        self.db.set_meta(battery_manual.KEY, {})
         if settings.mode == 'automatic':
             settings.mode = 'monitor'
             self.db.save_settings(settings, actor)

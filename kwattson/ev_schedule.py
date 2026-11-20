@@ -13,6 +13,41 @@ SAFETY_FACTOR = 0.8
 SURPLUS_READING_WINDOW = timedelta(minutes=7)  # Fox cloud telemetry updates about every five minutes.
 
 
+def projection(vehicle, now, deadline, soc, target, windows, nominal_kw, conservative_kw, energy_limit=None):
+    """Show physical-rate expectation separately from the scheduling safety margin."""
+    if soc is None:
+        return dict(projection=[], expected_end_soc=None, expected_target_reachable=None)
+    capacity = vehicle.capacity_kwh / vehicle.charger_efficiency
+    need = max(0, target - soc) / 100 * capacity
+    segments = [(max(now, datetime.fromisoformat(w['start'])), min(deadline, datetime.fromisoformat(w['end']))) for w in windows]
+    segments = [(start, end) for start, end in segments if end > start]
+    budget = min(need, energy_limit if energy_limit is not None else sum((end - start).total_seconds() / 3600 * conservative_kw / SAFETY_FACTOR for start, end in segments))
+
+    def energy(at, kw, limit):
+        return min(limit, sum(max(0, (min(at, end) - start).total_seconds()) / 3600 * kw for start, end in segments))
+
+    def finish(kw, limit):
+        if limit <= 1e-9:
+            return now
+        remaining = limit
+        for start, end in segments:
+            possible = (end - start).total_seconds() / 3600 * kw
+            if remaining <= possible:
+                return start + timedelta(hours=remaining / kw)
+            remaining -= possible
+        return segments[-1][1] if segments else now
+
+    expected_energy = energy(deadline, nominal_kw, budget)
+    expected_finish = finish(nominal_kw, expected_energy)
+    conservative_finish = finish(conservative_kw, energy(deadline, conservative_kw, need))
+    times = sorted({now, deadline, expected_finish, conservative_finish, *(at for segment in segments for at in segment)})
+    points = [dict(ts=stamp(at), soc=min(100, soc + energy(at, nominal_kw, budget) / capacity * 100),
+                   conservative_soc=min(100, soc + energy(at, conservative_kw, need) / capacity * 100)) for at in times]
+    return dict(projection=points, expected_end_soc=points[-1]['soc'], expected_energy_kwh=expected_energy,
+                expected_finish=stamp(expected_finish), expected_target_reachable=expected_energy >= need - 1e-6,
+                expected_kw=round(nominal_kw, 2))
+
+
 def forecast_rows(decision, settings, now, rows, reviewed_at=None):
     return rows if (decision and decision['summary'].get('dispatch_policy') == dispatch_policy(settings)
                     and reviewed_at and timedelta(0) <= now - datetime.fromisoformat(reviewed_at) <= timedelta(minutes=35)) else []
@@ -110,12 +145,33 @@ def home_battery(db, settings, now, deadline, rows):
                 discharged = sum(p.get('dis', 0) for p in row['systems'].values())
                 battery_export = min(row['export_kwh'], discharged)
                 share = flow.get('dis', 0) / discharged if discharged > 0 else 0
-                refunded += battery_export * share * fraction / spec.round_trip_efficiency ** .5
+                refunded += (battery_export + row.get('_replaced_ev_battery_kwh', 0)) * share * fraction / spec.round_trip_efficiency ** .5
             levels.append(flow['soc_kwh'] + refunded)
         available = min(levels) - reserve
         if available > 0:
             assets.append((system, available * spec.round_trip_efficiency ** .5 * .8))
     return assets
+
+
+def replacement_context(settings, vehicle, rows):
+    """A replacement goal reuses this car's already allocated energy, not just spare energy.
+
+    Older forecasts only record total EV demand, so disaggregate it only when
+    this is the site's sole active vehicle. Other vehicles retain their budget.
+    """
+    if [v.id for v in settings.active_vehicles()] != [vehicle.id]:
+        return rows
+    out = []
+    for row in rows:
+        ev = max(0, row.get('planned_ev_kwh', row.get('ev_kwh', 0)) or 0)
+        imports = min(ev, row['import_kwh'])
+        discharged = sum(flow.get('dis', 0) for flow in row['systems'].values())
+        battery_export = min(row['export_kwh'], discharged)
+        battery = min(ev - imports, max(0, discharged - battery_export))
+        solar = max(0, ev - imports - battery)
+        out.append({**row, 'import_kwh': row['import_kwh'] - imports,
+                    '_replaced_ev_battery_kwh': battery, '_replaced_ev_solar_kwh': solar})
+    return out
 
 
 def preview(db, settings, vehicle, now, deadline, data, decision, rows):
@@ -128,9 +184,8 @@ def preview(db, settings, vehicle, now, deadline, data, decision, rows):
     need = None if soc is None else max(0, (target - soc) / 100 * capacity)
     allowed = data.get('grid_rates')
     away = unavailable_periods(db, vehicle.id, now, deadline)
-    if live and live['at_home'] == 0:
-        away.append((now, deadline))
     rows = forecast_rows(decision, settings, now, rows, plans.reviewed_at(db, decision))
+    rows = replacement_context(settings, vehicle, rows)
     batteries = home_battery(db, settings, now, deadline, rows)
     battery_budget = sum(kwh for _, kwh in batteries)
     pv = any(s.pv_kwp > 0 for s in settings.active_systems())
@@ -174,7 +229,7 @@ def preview(db, settings, vehicle, now, deadline, data, decision, rows):
         battery_kw = 0.0
         if row and row['import_kwh'] < .01:
             if pv:
-                solar_kw = max(0, (row['export_kwh'] - row['discharge_kwh']) / row['hours']) * .85
+                solar_kw = (max(0, row['export_kwh'] - row['discharge_kwh']) + row.get('_replaced_ev_solar_kwh', 0)) / row['hours'] * .85
             if row['action'] in ('self_use', 'force_discharge', 'export_priority'):
                 for system, _ in batteries:
                     flow = row['systems'].get(system.id, {})
@@ -183,7 +238,8 @@ def preview(db, settings, vehicle, now, deadline, data, decision, rows):
                         ac = system.ac_kw - flow.get('pv_ac', 0) / row['hours']
                         total_dis = sum(p.get('dis', 0) for p in row['systems'].values()) / row['hours']
                         exported = min(dis, row['export_kwh'] / row['hours'] * dis / total_dis) if system.controllable and total_dis > 0 else 0
-                        battery_kw += max(0, min(system.battery.discharge_kw, ac) - dis + exported) * .8
+                        reused = row.get('_replaced_ev_battery_kwh', 0) / row['hours'] * dis / total_dis if total_dis > 0 else 0
+                        battery_kw += max(0, min(system.battery.discharge_kw, ac) - dis + exported + reused) * .8
         grid_allowed = allowed is None or possible_rate in allowed
         # Keep automatic windows inside permitted tariff boundaries, including quota
         # boundaries. Reserve one interval on either side of an ineligible period.
@@ -241,17 +297,29 @@ def preview(db, settings, vehicle, now, deadline, data, decision, rows):
     end_soc = min(100, soc + energy / capacity * 100) if soc is not None else None
     source = {key: sum(r[key] for r in chosen) for key in ('solar_kwh', 'battery_kwh', 'grid_kwh', 'paid_grid_kwh', 'grid_cost')}
     finish = windows[-1]['end'] if windows else stamp(now)
-    return dict(finish=finish, deadline=stamp(deadline), energy_kwh=energy, end_soc=end_soc, soc=soc,
+    sources = []
+    for item in chosen:
+        total = item['solar_kwh'] + item['battery_kwh'] + item['grid_kwh']
+        label = next((key.removesuffix('_kwh') for key in ('solar_kwh', 'battery_kwh', 'grid_kwh') if item[key] >= total * .6), 'mixed')
+        if sources and sources[-1]['end'] == item['start'] and sources[-1]['source'] == label:
+            sources[-1]['end'] = item['end']
+        else:
+            sources.append(dict(start=item['start'], end=item['end'], source=label))
+    result = dict(finish=finish, deadline=stamp(deadline), energy_kwh=energy, end_soc=end_soc, soc=soc,
                 target_reachable=missing <= 1e-6 if missing is not None else None, kw=round(planned_kw, 2),
                 rate_basis=basis, paid_grid_kwh=round(source['paid_grid_kwh'], 2), paid_grid_aud=round(source['grid_cost'], 2),
                 solar_kwh=round(source['solar_kwh'], 2), battery_kwh=round(source['battery_kwh'], 2),
                 grid_kwh=round(source['grid_kwh'], 2), windows=windows, tariffs=merge(tariffs, ('rate', 'overflow_rate')),
-                rate_options=sorted({t.rate_after for p in settings.tariffs if p.status == 'active'
+                source_windows=sources, rate_options=sorted({t.rate_after for p in settings.tariffs if p.status == 'active'
                                               for t in p.allowances if t.kind == 'import'}
                                     | {p.import_rate for plan in settings.tariffs if plan.status == 'active' for p in plan.periods}))
+    result.update(projection(vehicle, now, deadline, soc, target, windows, min(vehicle.charger_kw, rate), planned_kw, energy / SAFETY_FACTOR))
+    if result.get('expected_energy_kwh', energy) > energy + .1 and result['paid_grid_aud']:
+        result.update(paid_grid_aud=None, paid_grid_kwh=None)
+    return result
 
 
-def remaining_estimate(db, vehicle, now, session):
+def remaining_estimate(db, vehicle, now, session, settings=None):
     """Update the saved schedule's projection without changing its control windows."""
     data = session['data']
     live = recent_reading(db, vehicle, now, timedelta(hours=1))
@@ -286,6 +354,19 @@ def remaining_estimate(db, vehicle, now, session):
     outside = bool(live and live['charging'] and not any(
         w['start'] <= stamp(now) < w['end'] for w in data.get('charge_windows', [])))
     estimate['charging_outside_window'] = outside
+    estimate.update(projection(vehicle, now, datetime.fromisoformat(session['expires']), soc, target,
+                               data.get('charge_windows', []), min(vehicle.charger_kw, rate), kw, energy / SAFETY_FACTOR))
+    if not estimate.get('source_windows') and settings:
+        decision = plans.latest(db)
+        rows = plans.intervals(db, decision['id']) if decision else []
+        source_windows = []
+        for window in windows:
+            start, end = datetime.fromisoformat(window['start']), datetime.fromisoformat(window['end'])
+            overlap = [r for r in rows if datetime.fromisoformat(r['ts']) < end and datetime.fromisoformat(r['ts']) + timedelta(hours=r['hours']) > start]
+            solar = sum(r['solar_kwh'] for r in overlap)
+            load = sum(r['load_kwh'] for r in overlap)
+            source_windows.append({**window, 'source': 'solar' if solar > load else 'mixed' if solar > .1 else 'battery'})
+        estimate['source_windows'] = source_windows
     if not data.get('auto_schedule') and live and live['charging'] and live['at_home'] != 0:
         actual = session_estimate(vehicle, rate, now, datetime.fromisoformat(session['expires']), 100, soc)
         estimate.update(continuous_end_soc=actual['end_soc'], continuous_target_reachable=(
@@ -321,10 +402,15 @@ def home_energy_available(db, settings, vehicle, now):
         if (not live or live['soc'] is None or live['fault']
                 or not timedelta(0) <= now - datetime.fromisoformat(live['ts']) <= SURPLUS_READING_WINDOW):
             continue
+        manual = db.meta('battery_manual', {}).get(system.id)
+        if manual and manual['end'] > stamp(now) and manual['mode'] in ('hold', 'force_charge'):
+            unsafe_discharge += live['discharge_kw'] or 0
+            continue
         # Leave time to see reserve approaching and complete a cloud stop.
         margin = max(.02 * battery.capacity_kwh,
                      min(battery.discharge_kw, system.ac_kw) * (SURPLUS_READING_WINDOW.total_seconds() + 120) / 3600)
-        available = (live['soc'] - battery.reserve_pct) / 100 * battery.capacity_kwh
+        reserve = max(battery.reserve_pct, manual.get('target_soc') or 0) if manual and manual['end'] > stamp(now) and manual['mode'] == 'force_discharge' else battery.reserve_pct
+        available = (live['soc'] - reserve) / 100 * battery.capacity_kwh
         if available > margin:
             spare += max(0, min(battery.discharge_kw, system.ac_kw) - (live['discharge_kw'] or 0))
         else:
@@ -350,8 +436,7 @@ async def run_schedule(db, settings, vehicle, session, devices, notify, now, awa
     windows = data['charge_windows']
     window = next((w for w in windows if w['start'] <= now_stamp < w['end']), None)
     progressed = live and live['ts'] >= session['starts']
-    moved = away or (live and (live['at_home'] == 0 or
-                              (data.get('observed_plug') and live['plugged_in'] == 0)))
+    moved = away or (live and data.get('observed_plug') and live['plugged_in'] == 0)
     invalid_tariff = auto and data['dispatch_policy'] != dispatch_policy(settings)
     cancelled = data.get('cancel_requested')
     changed = False
@@ -374,6 +459,8 @@ async def run_schedule(db, settings, vehicle, session, devices, notify, now, awa
     if moved:
         if cancelled:
             return finish('Charging schedule cancelled.')
+        if auto and now < deadline:
+            return False  # Keep the departure goal while the car is unplugged/away.
         return finish('Charging schedule ended because the car was away or disconnected. Check the car before leaving.')
 
     if auto and progressed and live['plugged_in'] == 1 and not data.get('observed_plug'):
@@ -461,7 +548,7 @@ async def run_schedule(db, settings, vehicle, session, devices, notify, now, awa
         hours = sum(max(0, (datetime.fromisoformat(w['end']) - max(since, datetime.fromisoformat(w['start']))).total_seconds())
                     for w in windows) / 3600
         if progressed and actual is not None:
-            expected = actual + hours * data['schedule_kw'] / capacity * 100
+            expected = actual + hours * min(vehicle.charger_kw, charge_rate(db, vehicle, now)[0]) / capacity * 100
         elif now_stamp < (windows[0]['start'] if windows else session['expires']):
             expected = data['scheduled_end_soc']
         else:

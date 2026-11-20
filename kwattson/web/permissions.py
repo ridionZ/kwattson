@@ -29,6 +29,7 @@ RULES: list[tuple[str, str, str]] = [
     ('POST', '/api/notifications/seen', 'member'),
     ('POST', '/api/plan', 'member'),
     ('POST', '/api/vehicles/', 'member'),
+    ('POST', '/api/systems/', 'member'),
     ('POST', '/api/control/stop', 'member'),   # stopping is always safe
     # admin-only reads (credentials-adjacent or configuration detail)
     ('GET', '/api/settings', 'admin'),

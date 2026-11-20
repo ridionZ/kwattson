@@ -58,3 +58,27 @@ Missing weather uses a conservative fallback forecast.
 - Dashboard: **Stop automatic control** (always visible in automatic mode).
 - Console: `docker exec kwattson kwattson stop-control` (releases devices too).
 - If the app or the internet is down: disable the scheduler in the vendor app.
+
+## Temporary mode buttons
+
+Overview and Solar & batteries offer self-use, pause discharge, grid charging, battery export and
+solar-export-priority modes when the plugin supports them. Choose 5–30 minutes; configured
+inverter, battery and site export limits cap power. Grid charging shows the current import price
+before confirmation. Export retains the highest forecast home/car reserve throughout the override,
+even if a lower cutoff is entered. An increased protected reserve can end manual export early.
+
+The same commissioning, telemetry, fault, tariff and verified-plan guards apply. These requests do
+not enable automatic mode or change commissioning settings. The confirmed short mode is overlaid
+on the adopted daily program, preserving later steps, and checked periodically. The latest automatic
+plan resumes at expiry. In monitor mode, expiry releases the inverter to its own default. Stop
+automatic control also cancels temporary modes. FoxESS recurring-schedule risks described above
+also apply to the overlaid program; keep the controller online.
+
+The automatic forecast remains a reference during a temporary mode. Actual readings and command
+results remain stored. Overview identifies the temporary mode and does not present automatic-plan
+savings as the savings from that manual action.
+An active car charging plan assumes home. Sustained incompatible car/house power readings
+pause automatic commands; missing or distant GPS does not. Enable the optional reconnect test
+only if a brief stop/restart is acceptable, including when charging away. It runs at most once
+per continuous connection and needs permission for both commands. A manual verification button
+provides the same explicit acknowledgement. Check charging if restoration cannot be confirmed.

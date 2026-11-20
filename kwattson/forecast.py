@@ -38,9 +38,9 @@ from .weather import freshness_hours
 from .db import Database, decode, encode
 from .ingest import select_intervals
 
-LOAD_VERSION = 'profile-temperature-v4'
+LOAD_VERSION = 'profile-temperature-v5'
 SOLAR_VERSION = 'hourly-ratio-v3'
-VERSION = f'{LOAD_VERSION}+{SOLAR_VERSION}+ev-session-v4'
+VERSION = f'{LOAD_VERSION}+{SOLAR_VERSION}+ev-session-v5'
 WEATHER_PREFERRED_HOURS = 6
 WEATHER_MAX_HOURS = 24
 COLD_START_SHAPE = [.45, .35, .3, .3, .3, .35, .75, 1.15, .85, .65, .55, .6, .65, .65, .65, .7, .9, 1.25, 1.6, 1.5, 1.1, .85, .65, .5]
@@ -246,11 +246,13 @@ def ev_plan(db: Database, settings: Settings, now: datetime, slots: list[tuple[d
         fresh = (latest and latest['plugin'] == vehicle.plugin
                  and timedelta(0) <= now - datetime.fromisoformat(latest['ts']) < timedelta(hours=6))
         soc = latest['soc'] if fresh and latest['soc'] is not None else vehicle.manual_soc
-        charging = bool(fresh and latest['charging'] and now - datetime.fromisoformat(latest['ts']) <= timedelta(minutes=25))
-        away_now = bool(fresh and latest['at_home'] == 0)
+        from . import home_charging
+        home = home_charging.status(db, vehicle, now)
+        charging = bool(fresh and latest['charging'] and home['confirmed'] and now - datetime.fromisoformat(latest['ts']) <= timedelta(minutes=25))
+        away_now = home['source'] == 'power_mismatch'
         mine = [o for o in overrides if o['data'].get('vehicle_id') in (None, vehicle.id)]
         session = max((o for o in mine if o['kind'] == 'ev_charge_now'), key=lambda o: o.get('id', 0), default=None)
-        force = bool(session and session['data'].get('state') not in ('finished', 'confirmed'))
+        force = bool(session and session['data'].get('state') not in ('finished', 'confirmed') and not away_now)
         rate = charge_rate(db, vehicle, now)[0]
         saved = [o for o in mine if o['kind'] == 'ev_charge_planned']
         booked = [planned_window(vehicle, rate, o) for o in saved]
@@ -318,7 +320,9 @@ def ev_plan(db: Database, settings: Settings, now: datetime, slots: list[tuple[d
                 continue
             if session_slot and windows is not None:
                 overlap = sum(max(0, (min(stop, end) - max(at, start)).total_seconds()) for start, end in windows)
-                energy = min(remaining, overlap * session['data']['schedule_kw'] / 3600)
+                # Forecast physical demand at the observed/configured wall rate.
+                # The slower schedule rate is a planning margin, not measured load.
+                energy = min(remaining, overlap * min(vehicle.charger_kw, rate) / 3600)
                 remaining -= energy
             else:
                 duration = min(hours, (until - at).total_seconds() / 3600) if session_slot else hours

@@ -9,7 +9,7 @@ import logging
 import time
 from datetime import datetime, timedelta
 
-from . import advice, alerts, ev_charging, forecast, optimizer, outcomes, plans, weather
+from . import advice, alerts, ev_charging, forecast, home_charging, optimizer, outcomes, plans, vehicle_climate, weather
 from .config import Runtime, Settings, stamp, utcnow
 from .control import Controller
 from .db import Database, decode
@@ -76,7 +76,7 @@ class Engine:
     async def run_control(self):
         async with self.control_lock:
             settings = self.db.settings()
-            if settings.mode == 'automatic' or self.db.meta('control_active') or self.db.meta('control_release_pending'):
+            if settings.mode == 'automatic' or self.db.meta('control_active') or self.db.meta('control_release_pending') or self.db.meta('battery_manual'):
                 await self.controller.cycle(settings)
             self.next['control'] = time.time() + 30
         return settings
@@ -99,9 +99,11 @@ class Engine:
             await self.devices.poll_vehicles(settings)
             self.next['vehicles'] = time.time() + self.devices.vehicle_poll_seconds(settings)
         async with self.ev_lock:
+            await home_charging.monitor(self.db, self.db.settings(), self.devices, self.notifications, utcnow())
             if await ev_charging.monitor(self.db, self.db.settings(), self.devices, self.notifications, utcnow()):
                 self.request_plan()
                 self.next['vehicles'] = min(self.next['vehicles'], time.time() + 30)
+            await vehicle_climate.monitor(self.db, self.db.settings(), self.devices, self.notifications, utcnow())
         if not self.runtime.demo and settings.site.weather_enabled and now >= self.next['weather']:
             self.next['weather'] = now + 3600
             try:

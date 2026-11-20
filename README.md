@@ -37,7 +37,7 @@ With this command each new container starts with a fresh sample house.
    You can add an EV under **Settings → Vehicles** and enable two-step sign-in under **My account**.
 
 Keep the first installation in monitoring mode while you compare its readings with your inverter.
-FoxESS scheduler writes and release have been checked on a KH9.9; other models and the unofficial MG integration still need verification on physical devices.
+FoxESS scheduler writes/release have been checked on a KH9.9, and MG charging start/stop on an MGS5. Other models and parked climate actuation still need physical-device verification.
 Read the commissioning guide before enabling battery commands. [Commissioning](docs/COMMISSIONING.md)
 
 ## What it does
@@ -112,7 +112,7 @@ Screenshots show the simulated demo house and a new installation with sample set
 | | |
 |---|---|
 | **Inverters and batteries** | FoxESS (directly), or anything Home Assistant can already see, or any device that can send readings over the network |
-| **Cars** | MG (read-only), anything in Home Assistant, or just type in the battery level yourself |
+| **Cars** | MG monitoring, opt-in charging and parked climate controls; Home Assistant; or a manually entered battery level |
 | **Power prices** | Flat rates from a bill, time-of-use tariff files, or Australian Energy Made Easy plan-detail JSON |
 
 ### Add another device brand

@@ -43,6 +43,7 @@ import * as f from '../../lib/fmt';
 import { ConfirmDialog, Empty, Facts, HelpTip, PageHeader, useToast } from '../../components/common';
 import { clone, useSettings } from './ctx';
 import { Num, SchemaField, slug } from './fields';
+import VehicleControls from '../../components/VehicleControls';
 
 const ICON: Record<string, typeof CloudRounded> = { manual: EditNoteRounded, homeassistant_vehicle: HubRounded, push_vehicle: CallReceivedRounded, simulator_vehicle: ScienceRounded, mg_ismart: CloudRounded };
 const HOURS = Array.from({ length: 24 }, (_, h) => [h, `${h % 12 === 0 ? 12 : h % 12}:00 ${h < 12 ? 'am' : 'pm'}`] as const);
@@ -113,6 +114,7 @@ export default function Vehicles({ sub }: { sub?: string }) {
                     <Spec label="Driving" value={`${f.n(v.km_per_week, 0)} km/week`} />
                     <Spec label="Usually charges" value={schedText(v.schedule)} />
                   </Box>
+                  {v.enabled && live && <VehicleControls vehicle={live} climate />}
                 </Box>
                 <Stack direction="row" spacing={1} sx={{ flexShrink: 0 }}>
                   {v.plugin !== 'manual' && <Button size="small" disabled={!!testing} onClick={() => testVehicle(v.id)}>{testing === v.id ? 'Testing…' : 'Test'}</Button>}

@@ -11,13 +11,14 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import math
 import time
 from datetime import datetime, timezone
 from typing import Literal
 
 from pydantic import Field
 
-from .base import PluginConfig, PluginError, SecretField, VehiclePlugin, VehicleReading
+from .base import PluginConfig, PluginError, SecretField, VehicleClimate, VehiclePlugin, VehicleReading
 
 # The vendor library logs raw response bodies on errors. Keep those out of app
 # logs; this plugin reports only the stage, exception type and service code.
@@ -31,6 +32,12 @@ REQUEST_TIMEOUT = 45
 
 
 class MGConfig(PluginConfig):
+    allow_home_probe: bool = Field(False, title='Allow one home charging test after reconnecting',
+                                  description='When an active plan reconnects without home evidence, permit one brief stop/restart to compare house power. It can interrupt an away charging session; requires start/stop permission. Never repeats during continuous connection.')
+    home_radius_m: int = Field(200, ge=50, le=500, title='Home location radius (m)',
+                               description='Fresh GPS inside this radius confirms home. Missing or distant GPS never rules home out; vehicle coordinates are not retained.')
+    allow_climate_control: bool = Field(False, title='Allow parked climate control',
+                                       description='Allow manual climate start/stop while parked. Starting needs a fresh parked reading. Timed stopping requires this controller online.')
     single_phase_ac: bool = Field(False, title='Read single-phase AC charger power',
                                   description='Enable for a single-phase home or portable AC charger. Leave off for three-phase or DC charging; its power remains estimated.')
     allow_charge_stop: bool = Field(False, title='Allow kWattson to stop charging',
@@ -46,6 +53,7 @@ class MGiSmart(VehiclePlugin):
     name = 'mg_ismart'
     supports_charge_stop = True
     supports_charge_schedule = True
+    supports_climate_control = True
     title = 'MG iSMART (unofficial)'
     description = 'Reads battery level and charging state from MG iSMART, with optional remote start and stop.'
     Config = MGConfig
@@ -64,6 +72,9 @@ class MGiSmart(VehiclePlugin):
         self.next_poll = 0.0
         self.fast_poll_until = 0.0
         self.last: VehicleReading | None = None
+        self.last_climate: VehicleClimate | None = None
+        self.home_checked_after = 0.0
+        self.home_seen_at = None
 
     async def read(self) -> VehicleReading | None:
         async with self.lock:
@@ -92,6 +103,9 @@ class MGiSmart(VehiclePlugin):
             self.signature = signature
             self.next_poll = self.retry_after = 0
             self.last = None
+            self.last_climate = None
+            self.home_seen_at = None
+            self.home_checked_after = 0
         return username, password, vin
 
     async def _read(self) -> VehicleReading | None:
@@ -145,8 +159,19 @@ class MGiSmart(VehiclePlugin):
                     charge_kw = round(current / 5 * voltage * 2 / 1000, 3)
             # The management reply has no device timestamp. Preserve receipt time as unverified.
             ts = datetime.now(timezone.utc)
+            at_home, home_seen_at = await self._home_presence()
+            history = getattr(charge, 'rvsChargeStatus', None)
+            session_start = getattr(history, 'startTime', None)
+            battery_kw = None
+            if charging and getattr(management, 'bmsPackCrntV', None) == 0:
+                dc = getattr(management, 'decoded_power', None)
+                if isinstance(dc, (int, float)) and -1000 <= dc < 0:
+                    battery_kw = round(-dc, 3)
             reading = VehicleReading(ts=ts, time_verified=False, soc=raw_soc / 10, charging=charging,
-                                     plugged_in=plugged_in, charge_kw=charge_kw)
+                                     plugged_in=plugged_in, charge_kw=charge_kw, at_home=at_home,
+                                     home_source='gps' if at_home else None, home_seen_at=home_seen_at,
+                                     charge_session=str(session_start) if isinstance(session_start, (int, float)) and session_start > 0 else None,
+                                     battery_charge_kw=battery_kw)
             self.context.record_raw({'soc': reading.soc, 'charging': charging, 'plugged_in': plugged_in,
                                      'charge_kw': charge_kw, 'ts': ts.isoformat()})
             self.last = reading
@@ -164,6 +189,32 @@ class MGiSmart(VehiclePlugin):
                 detail = f' (service code {int(code)})' if isinstance(code, int) else ''
                 self.last_failure = f'MG {stage} {reason}{detail}. Check the region and iSMART app before retrying.'
             raise PluginError(self.last_failure) from None
+
+    async def _home_presence(self):
+        home = getattr(self.context, 'home_coordinates', lambda: None)()
+        if not home:
+            return None, None
+        if time.time() >= self.home_checked_after:
+            self.home_checked_after = time.time() + 300
+            self.home_seen_at = None
+            try:
+                response = await self._vehicle_call('get_vehicle_status_cached')
+                gps = response.gpsPosition
+                point = gps.wayPoint.position if gps and gps.wayPoint else None
+                if gps and gps.gpsStatus in (2, 3) and point and gps.timeStamp:
+                    observed = datetime.fromtimestamp(gps.timeStamp, timezone.utc)
+                    if 0 <= time.time() - observed.timestamp() <= 600 and point.latitude is not None and point.longitude is not None:
+                        lat, lon = point.latitude / 1_000_000, point.longitude / 1_000_000
+                        if -90 <= lat <= 90 and -180 <= lon <= 180:
+                            a, b = math.radians(home[0]), math.radians(lat)
+                            dlat, dlon = b - a, math.radians(lon - home[1])
+                            distance = 6_371_000 * 2 * math.asin(min(1, math.sqrt(math.sin(dlat / 2) ** 2 + math.cos(a) * math.cos(b) * math.sin(dlon / 2) ** 2)))
+                            if distance <= self.config.home_radius_m:
+                                self.home_seen_at = observed
+                # Coordinates, GPS fixes and journeys are discarded immediately.
+            except Exception:
+                pass  # Optional location failure must not break energy monitoring.
+        return (True, self.home_seen_at) if self.home_seen_at and time.time() - self.home_seen_at.timestamp() <= 600 else (None, None)
 
     async def _connect(self, username, password, vin):
         from saic_ismart_client_ng import SaicApi
@@ -201,6 +252,69 @@ class MGiSmart(VehiclePlugin):
 
     async def stop_charging(self) -> None:
         await self._request_charge(stop=True)
+
+    async def _ready(self):
+        username, password, vin = await self._credentials()
+        if self.api is None:
+            await self._connect(username, password, vin)
+
+    async def read_climate(self) -> VehicleClimate:
+        async with self.lock:
+            await self._ready()
+            return await self._read_climate()
+
+    async def _read_climate(self, *, force=False):
+        if not force and self.last_climate and time.time() - self.last_climate.ts.timestamp() < 30:
+            return self.last_climate
+        try:
+            response = await self._vehicle_call('get_vehicle_status')
+            basic = response.basicVehicleStatus
+            if basic is None:
+                raise PluginError('MG did not provide parked climate status')
+            parked = True if basic.handBrake == 1 or basic.engineStatus == 0 else False if basic.handBrake == 0 and basic.engineStatus == 1 else None
+            mode = {0: 'off', 1: 'fan', 2: 'on', 5: 'defrost'}.get(basic.remoteClimateStatus)
+            received = datetime.now(timezone.utc)
+            reported = getattr(response, 'statusTime', None)
+            ts = datetime.fromtimestamp(reported / 1000 if reported > 1e12 else reported, timezone.utc) if isinstance(reported, (int, float)) and reported > 0 else received
+            temperature = lambda value: float(value) if isinstance(value, (int, float)) and -50 <= value <= 80 else None
+            state = VehicleClimate(ts=ts, time_verified=ts != received, parked=parked, mode=mode,
+                                   interior_c=temperature(basic.interiorTemperature), exterior_c=temperature(basic.exteriorTemperature))
+            self.last_climate = state
+            # No GPS, lock, journey or VIN data is retained from the status reply.
+            self.context.record_raw({'climate': {'ts': ts.isoformat(), 'parked': parked, 'mode': mode,
+                                                'interior_c': state.interior_c, 'exterior_c': state.exterior_c}})
+            return state
+        except PluginError:
+            raise
+        except Exception as error:
+            code = getattr(error, 'return_code', None)
+            detail = f' (service code {code})' if isinstance(code, int) else ''
+            raise PluginError('MG parked climate status is unavailable' + detail) from None
+
+    async def set_climate(self, enabled: bool, temperature_c: int = 22) -> None:
+        async with self.lock:
+            if not self.config.allow_climate_control:
+                raise PluginError('Enable parked climate control in the vehicle connection first')
+            await self._ready()
+            state = await self._read_climate(force=True)
+            age = time.time() - state.ts.timestamp()
+            if state.parked is not True or not state.time_verified or not 0 <= age <= 120:
+                raise PluginError('Climate control needs a fresh device-verified reading showing the car parked')
+            if enabled:
+                if not 17 <= temperature_c <= 28:
+                    raise PluginError('Choose a parked climate temperature between 17 and 28 C')
+            try:
+                if enabled:
+                    # Both common MG temperature tables map 22 C to index 8.
+                    await self._vehicle_call('start_ac', temperature_idx=temperature_c - 14)
+                else:
+                    await self._vehicle_call('stop_ac')
+                self.last_climate = None
+                self.next_poll = min(self.next_poll, time.time() + 30)
+            except Exception as error:
+                code = getattr(error, 'return_code', None)
+                detail = f' (service code {code})' if isinstance(code, int) else ''
+                raise PluginError('MG climate request receipt is uncertain' + detail) from None
 
     async def _vehicle_call(self, method, **kwargs):
         try:

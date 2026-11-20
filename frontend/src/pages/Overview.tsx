@@ -31,7 +31,9 @@ import { useApp } from '../lib/app';
 import { action } from '../lib/actions';
 import { tokens, ACTION_COLOR } from '../theme';
 import * as f from '../lib/fmt';
-import { ConfirmDialog, ErrorState, Facts, HelpTip, LoadingBlock, Section, useToast } from '../components/common';
+import { ErrorState, Facts, HelpTip, LoadingBlock, Section, useToast } from '../components/common';
+import VehicleControls from '../components/VehicleControls';
+import BatteryModeControls from '../components/BatteryModeControls';
 import ControlRetry from '../components/ControlRetry';
 import QuickActions from '../components/QuickActions';
 import Scheduled, { describe, type Holiday, type Override } from '../components/Scheduled';
@@ -106,7 +108,10 @@ export default function Overview() {
           </Section>}
           <Section title="Alerts" titleId="overview-alerts"
             action={can('member') && alerts.data?.notifications.some((n) => !n.seen) && <Button size="small" onClick={() => void dismissAlert()}>Clear all</Button>}>
-            {alerts.error ? <ErrorState message={alerts.error} onRetry={alerts.reload} /> : !alerts.data ? <LoadingBlock /> : <AlertsList doc={alerts.data} onDismiss={can('member') ? dismissAlert : undefined} />}
+            {alerts.error ? <ErrorState message={alerts.error} onRetry={alerts.reload} /> : !alerts.data ? <LoadingBlock /> :
+              <Box role="region" aria-label="Recent alerts" tabIndex={0} sx={{ maxHeight: { xs: 360, md: 440 }, overflowY: 'auto', scrollbarGutter: 'stable', pr: .5 }}>
+                <AlertsList doc={alerts.data} onDismiss={can('member') ? dismissAlert : undefined} />
+              </Box>}
             {can('admin') && <Button size="small" href="#/settings/alerts" sx={{ mt: 1.5 }}>Alert settings</Button>}
           </Section>
         </Grid>
@@ -173,8 +178,10 @@ function RightNow({ st, now }: { st: any; now: number }) {
   const { actions, dark } = useTokens();
   const d = st.decision;
   const s = d?.summary;
-  const a = action(s?.action);
-  const color = (actions as Record<string, string>)[s?.action] ?? actions.self_use;
+  const manual = (st.systems ?? []).filter((system: any) => system.manual_mode);
+  const mode = manual.length === 1 ? manual[0].manual_mode.mode : s?.action;
+  const a = action(mode);
+  const color = (actions as Record<string, string>)[mode] ?? actions.self_use;
   const t = st.tariff;
   return (
     <Card component="section" aria-labelledby="now-title" sx={{
@@ -188,9 +195,10 @@ function RightNow({ st, now }: { st: any; now: number }) {
           </Box>
           <Box sx={{ minWidth: 0 }}>
             <Typography id="now-title" variant="overline" component="h2" color="text.secondary" sx={{ display: 'block', lineHeight: 1.6 }}>Right now</Typography>
-            <Typography variant="h5" component="p" sx={{ fontSize: { xs: '1.25rem', sm: '1.5rem' } }}>{d ? a.label : 'No plan yet'}</Typography>
+            <Typography variant="h5" component="p" sx={{ fontSize: { xs: '1.25rem', sm: '1.5rem' } }}>{manual.length > 1 ? 'Temporary battery modes' : manual.length && !manual[0].manual_mode.confirmed ? 'Waiting for mode confirmation' : d ? a.label : 'No plan yet'}</Typography>
             <Typography variant="body2" sx={{ mt: 0.5, color: 'text.secondary' }}>
-              {d ? s.reason : 'The planner runs every few minutes once readings arrive.'}
+              {manual.length ? manual.map((system: any) => `${system.name}: ${action(system.manual_mode.mode).label} until ${f.when(system.manual_mode.end)}.`).join(' ')
+                : d ? s.reason : 'The planner runs every few minutes once readings arrive.'}
             </Typography>
             {d && (
               <Button size="small" onClick={() => setWhy(!why)} aria-expanded={why} aria-controls="why-panel"
@@ -225,7 +233,7 @@ function RightNow({ st, now }: { st: any; now: number }) {
             <Typography variant="body2" sx={{ mb: 1.5 }}>{a.help}</Typography>
             <Facts rows={[
               ['Plan made', `${f.time(d.created_at)} (${f.relative(d.created_at, now)})`],
-              ['Saving vs self-use', <>{f.money(s.modelled_saving_24h_aud)} over 24 h <Typography component="span" variant="caption" color="text.secondary">(modelled)</Typography></>],
+              !manual.length ? ['Saving vs self-use', <>{f.money(s.modelled_saving_24h_aud)} over 24 h <Typography component="span" variant="caption" color="text.secondary">(modelled)</Typography></>] : null,
               ['Forecast confidence', s.confidence === 'established' ? 'Established' : s.confidence ?? '–'],
               t?.allowances?.length ? ['Allowances', t.allowances.map((x: any) => `${x.kwh_per_day} kWh/day ${x.kind}, then ${f.cents(x.rate_after)}`).join('; ')] : null,
               (s.overrides ?? []).length ? ['Your overrides', s.overrides.map((o: any) => (typeof o === 'string' ? o : o.kind)).join(', ')] : null,
@@ -359,60 +367,29 @@ function LivePower({ st, now }: { st: any; now: number }) {
             {importing ? <ArrowDownwardRounded sx={{ fontSize: 14 }} /> : exporting ? <ArrowUpwardRounded sx={{ fontSize: 14, color: t.gridOut }} /> : null}
             <span>{importing ? `Importing at ${f.cents(st.tariff?.buy)}/kWh` : exporting ? `Exporting at ${f.cents(st.tariff?.sell)}/kWh` : 'Not importing or exporting'}</span>
           </Stack>} />
-        {vehicles.map((v: any) => <VehicleTile key={v.id} vehicle={v} now={now} price={st.tariff?.buy} />)}
+        {vehicles.map((v: any) => <VehicleTile key={v.id} vehicle={v} now={now} />)}
       </Box>
+      {(st.systems ?? []).map((s: any) => <BatteryModeControls key={s.id} system={s} />)}
     </Section>
   );
 }
 
-function VehicleTile({ vehicle: v, now, price }: { vehicle: any; now: number; price?: number }) {
+function VehicleTile({ vehicle: v, now }: { vehicle: any; now: number }) {
   const { t } = useTokens();
-  const { can, reloadStatus } = useApp();
-  const toast = useToast();
-  const [busy, setBusy] = useState(false);
-  const [startOpen, setStartOpen] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const r = v.reading;
   const fresh = r && f.ageMinutes(r.ts, now) <= 25;
   const soc = r?.soc ?? v.manual_soc;
   const state = !r ? 'No live data' : !fresh ? 'Reading is out of date' : r.at_home === 0 ? 'Away'
     : r.charging === 1 ? `Charging${r.charge_kw ? ` ${f.kw(r.charge_kw)}` : ' (power estimated)'}`
     : r.plugged_in === 1 ? 'Plugged in, not charging' : r.plugged_in === 0 ? 'Not plugged in' : 'Connection state unknown';
-  async function send(action: 'start' | 'stop' | 'refresh') {
-    setBusy(true);
-    setError(null);
-    try {
-      await post(`/api/vehicles/${encodeURIComponent(v.id)}/${action === 'refresh' ? 'refresh' : 'charge'}`,
-        action === 'refresh' ? undefined : { action });
-      setStartOpen(false);
-      toast(action === 'refresh' ? 'Car reading refreshed.' : `${action === 'start' ? 'Start' : 'Stop'} requested. Waiting for the car to confirm.`);
-    } catch (e) {
-      setError(errorText(e));
-    } finally {
-      setBusy(false);
-      await reloadStatus();
-    }
-  }
   return <Tile icon={<ElectricCarRounded />} tone={{ fg: t.batteryText, bg: t.batteryContainer }} label={v.name}
-    value={soc != null ? f.pct(soc) : '–'} sub={`${state} · target ${f.pct(v.target_pct)}`}>
+    value={soc != null ? f.pct(soc) : '–'}>
+    <Typography variant="body2" sx={{ my: .75 }}>{state}</Typography>
     {soc != null && <LinearProgress variant="determinate" value={soc} aria-label={`${v.name} battery level`}
       sx={{ bgcolor: t.battery + '33', '& .MuiLinearProgress-bar': { bgcolor: t.battery } }} />}
     {r?.ts && <Typography variant="caption" component="p" sx={{ mt: .5 }}>Read {f.relative(r.ts, now)}</Typography>}
     {v.poll?.ok === false && <Typography variant="caption" color="error" component="p">{v.poll.error}</Typography>}
-    {v.pending_charge && <Typography variant="caption" component="p">Waiting for confirmation: {v.pending_charge.action}</Typography>}
-    {error && <Typography variant="caption" color="error" component="p" role="alert">{error}</Typography>}
-    {can('member') && <Stack direction="row" spacing={.5} sx={{ flexWrap: 'wrap', mt: .5 }}>
-      <Button size="small" disabled={busy} onClick={() => void send('refresh')}>Refresh</Button>
-      {v.can_schedule_charging && r?.charging !== 1 && <Button size="small" disabled={busy || !!v.pending_charge || !fresh || r?.plugged_in !== 1}
-        onClick={() => { setError(null); setStartOpen(true); }}>Start charging</Button>}
-      {v.can_stop_charging && <Button size="small" color="error" disabled={busy || (v.pending_charge?.action === 'stop' && f.ageMinutes(v.pending_charge.requested_at, now) < 1.5)}
-        onClick={() => void send('stop')}>Stop charging</Button>}
-    </Stack>}
-    {can('member') && v.can_stop_charging && <Typography variant="caption" component="p">Manual commands end this car's automatic charging plans.</Typography>}
-    <ConfirmDialog open={startOpen} title={`Start charging ${v.name}?`} confirm="Start charging" busy={busy} error={error}
-      onConfirm={() => void send('start')} onClose={() => setStartOpen(false)}>
-      <Typography>Charging starts now{price != null ? `; the current grid rate is ${f.cents(price)}/kWh` : ''}. This replaces automatic charging control for this car. Set a new charge plan if you want an automatic cutoff.</Typography>
-    </ConfirmDialog>
+    <VehicleControls vehicle={v} />
   </Tile>;
 }
 

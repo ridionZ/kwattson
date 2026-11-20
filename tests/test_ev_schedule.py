@@ -177,7 +177,7 @@ def test_schedule_forecast_places_only_the_saved_window(db, settings):
     session = dict(id=identity, kind='ev_charge_now', starts=stamp(NOW), expires=stamp(DEPART), data=data)
     slots = [(MIDNIGHT + timedelta(minutes=30*i), .5) for i in range(-1, 3)]
     energy, _, _ = forecast.ev_plan(db, settings, NOW, slots, [], [session])
-    assert energy == pytest.approx([0, 2.56, 2.56, 0])
+    assert energy == pytest.approx([0, 3.2, 3.2, 0])
 
 
 def test_manual_schedule_does_not_hide_observed_charging_or_confirm_a_stop(db, settings):
@@ -237,6 +237,18 @@ def test_adopted_forecast_can_supply_context_when_recently_reviewed(db, settings
     assert ev_schedule.forecast_rows(decision, settings, NOW, rows, plans.reviewed_at(db, decision)) == rows
     db.set_meta('active_plan', dict(decision_id=4, reviewed_at=stamp(NOW), valid=False))
     assert ev_schedule.forecast_rows(decision, settings, NOW, rows, plans.reviewed_at(db, decision)) == []
+
+
+def test_replacing_a_car_goal_reuses_its_existing_energy_allocation(db, settings):
+    settings.vehicles = [CAR]
+    settings.systems[0].controllable = True
+    row = dict(ts=stamp(NOW), hours=1, import_kwh=0, export_kwh=0, discharge_kwh=8,
+               planned_ev_kwh=6, systems={'main': {'soc_kwh': 6, 'dis': 8}}, action='self_use')
+    result = ev_schedule.replacement_context(settings, CAR, [row])[0]
+    assert result['_replaced_ev_battery_kwh'] == 6
+    assert '_replaced_ev_battery_kwh' not in row  # preserve the saved evidence
+    settings.vehicles = [CAR, CAR.model_copy(update={'id': 'second'})]
+    assert ev_schedule.replacement_context(settings, CAR, [row]) == [row]
 
 
 def test_automatic_schedule_starts_and_stops_once_and_waits_for_confirmation(db, settings):
@@ -317,3 +329,15 @@ def test_pinned_ev_charge_replaces_regular_load_same_evening_and_lifts_weekly_pr
     outlook = ev_advice(db, settings, [], car, NOW, [], [row])
     assert outlook['projection'][1]['soc_pct'] == pytest.approx(61.2)
     assert outlook['projection'][1]['planned_charge_pct'] == pytest.approx(19.2)
+
+
+def test_projection_shows_overnight_pause_and_expected_target_separately():
+    windows = [dict(start=stamp(NOW), end=stamp(NOW + timedelta(hours=2))),
+               dict(start=stamp(NOW + timedelta(hours=6)), end=stamp(NOW + timedelta(hours=8)))]
+    result = ev_schedule.projection(CAR, NOW, NOW + timedelta(hours=8), 65, 100,
+                                    windows, 6.4, 5.12)
+    points = {point['ts']: point for point in result['projection']}
+    assert result['expected_end_soc'] == 100
+    assert result['expected_target_reachable'] is True
+    assert points[stamp(NOW + timedelta(hours=2))]['soc'] == points[stamp(NOW + timedelta(hours=6))]['soc']
+    assert points[stamp(NOW + timedelta(hours=8))]['conservative_soc'] < 100

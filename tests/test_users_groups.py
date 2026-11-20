@@ -46,6 +46,9 @@ def test_permission_table():
     assert allowed('member', 'POST', '/api/vehicles/car/charge')
     assert not allowed('viewer', 'POST', '/api/vehicles/car/charge')
     assert not allowed('viewer', 'POST', '/api/vehicles/car/refresh')
+    assert not allowed('viewer', 'POST', '/api/vehicles/car/climate')
+    assert allowed('member', 'POST', '/api/systems/main/mode')
+    assert not allowed('viewer', 'POST', '/api/systems/main/mode')
 
 
 def test_roles_are_enforced(client):

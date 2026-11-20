@@ -25,6 +25,7 @@ import ExpandMoreRounded from '@mui/icons-material/ExpandMoreRounded';
 import { errorText, get, post } from '../lib/api';
 import * as f from '../lib/fmt';
 import { useToast } from './common';
+import ChargePlanGraph from './ChargePlanGraph';
 
 type Mode = 'time' | 'percentage' | 'ready_by';
 
@@ -41,6 +42,13 @@ export interface ChargingVehicle {
 interface Window { start: string; end: string }
 interface TariffWindow extends Window { rate: number; overflow_rate: number | null }
 export interface ChargeEstimate {
+  projection?: { ts: string; soc: number; conservative_soc: number }[];
+  expected_end_soc?: number | null;
+  expected_finish?: string;
+  expected_energy_kwh?: number;
+  expected_target_reachable?: boolean | null;
+  expected_kw?: number;
+  source_windows?: { start: string; end: string; source: string }[];
   soc?: number | null;
   soc_at?: string | null;
   charging?: boolean;
@@ -167,6 +175,9 @@ export default function ChargeDialog({ vehicle, onClose, onDone }: {
     fields.grid_rates.forEach(rate => params.append('grid_rates', String(rate)));
   }
   const query = params.toString();
+  const expectedSoc = preview?.expected_end_soc ?? preview?.end_soc;
+  const expectedReachable = preview?.expected_target_reachable ?? preview?.target_reachable;
+  const expectedFinish = preview?.expected_finish ?? preview?.finish;
   const extraRate = allowedRates !== null && preview?.tariffs
     ? [...new Set(preview.tariffs.flatMap(t => t.overflow_rate === null ? [t.rate] : [t.rate, t.overflow_rate]))]
       .sort((a, b) => a - b).find(rate => !allowedRates.includes(rate))
@@ -261,14 +272,14 @@ export default function ChargeDialog({ vehicle, onClose, onDone }: {
             <Box aria-live="polite" sx={{ px: 2, py: 1.5, bgcolor: 'battery.light', color: 'battery.main', borderRadius: 2 }}>
               <Typography variant="body2" sx={{ fontWeight: 600 }}>Estimated at {readyBy ? 'departure' : 'stop'}</Typography>
               <Stack direction="row" spacing={1} sx={{ alignItems: "baseline", flexWrap: "wrap" }}>
-                <Typography variant="h4" component="p">{preview.end_soc == null ? 'Battery % unknown' : f.pct(preview.end_soc)}</Typography>
+                <Typography variant="h4" component="p">{expectedSoc == null ? 'Battery % unknown' : f.pct(expectedSoc)}</Typography>
                 {preview.energy_kwh > 0 && <Typography variant="body2">
-                  {readyBy && preview.target_reachable === false ? `by ${f.when(preview.deadline)}` : `at ${f.when(preview.finish)}`}
+                  {readyBy && expectedReachable === false ? `by ${f.when(preview.deadline)}` : `at ${f.when(expectedFinish)}`}
                 </Typography>}
                 {preview.target_reachable && preview.energy_kwh === 0 && <Typography variant="body2">Target already reached</Typography>}
               </Stack>
               {preview.energy_kwh > 0 && <Typography variant="body2">
-                {f.n(preview.kw)} kW {readyBy ? 'planning rate' : `(${preview.rate_basis})`}
+                {readyBy ? `${f.n(preview.expected_kw ?? preview.kw)} kW expected · ${f.n(preview.kw)} kW with planning margin` : `${f.n(preview.kw)} kW (${preview.rate_basis})`}
                 {!!preview.solar_kwh && ` · ${f.kwh(preview.solar_kwh)} solar`}
                 {!!preview.battery_kwh && ` · ${f.kwh(preview.battery_kwh)} home battery`}
               </Typography>}
@@ -280,8 +291,8 @@ export default function ChargeDialog({ vehicle, onClose, onDone }: {
           {!!preview?.paid_grid_kwh && <Alert severity="warning">
             About {f.kwh(preview.paid_grid_kwh)} of paid grid power ({f.money(preview.paid_grid_aud)} estimated).
           </Alert>}
-          {preview?.target_reachable === false && readyBy && <Alert severity="warning">
-            {f.pct(targetPct)} is unlikely by {f.when(preview.deadline)}. Expect about {f.pct(preview.end_soc)} with this plan.
+          {expectedReachable === false && preview && readyBy && <Alert severity="warning">
+            {f.pct(targetPct)} is unlikely by {f.when(preview.deadline)}. Expect about {f.pct(expectedSoc)} with this plan.
             {extraRate !== undefined && allowedRates !== null && <Box sx={{ mt: .5 }}>
               <Button size="small" color="inherit" onClick={() => setAllowedRates([...allowedRates, extraRate].sort((a, b) => a - b))}>
                 Also allow {rateLabel(extraRate)}
@@ -299,6 +310,7 @@ export default function ChargeDialog({ vehicle, onClose, onDone }: {
             <strong>Charging windows</strong>{' '}
             {preview.windows.map(w => `${f.when(w.start)}–${f.when(w.end)}`).join(', ')}
           </Typography>}
+          {preview && readyBy && <ChargePlanGraph estimate={preview} target={targetPct ?? 100} deadline={preview.deadline} />}
           {readyBy && (
             <Accordion disableGutters elevation={0} expanded={tariffsOpen} onChange={(_, expanded) => setTariffsOpen(expanded)}
               sx={{ bgcolor: 'action.hover', borderRadius: 2, '&::before': { display: 'none' } }}>

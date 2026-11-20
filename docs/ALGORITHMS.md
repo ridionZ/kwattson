@@ -117,6 +117,19 @@ for that car and is recorded separately from confirmation. Start requires a fres
 stop remains available when readings are missing. Grid-rate restrictions on a plan do not restrict
 an explicit manual start, whose confirmation shows the current grid rate.
 
+When replacing a goal, the sole active car's existing forecast energy allocation is released before
+checking available solar and battery energy. Otherwise a currently charging car's energy could be
+reserved twice, leaving a misleading shortfall despite an available home battery. Original forecasts
+are preserved. Older forecasts store only total EV demand; with several active vehicles this reuse
+is conservatively disabled rather than spending another car's allocation.
+
+Parked climate has separate opt-in and does not cancel charging plans. Its 5–15 minute stop timer
+is stored before sending the start, including when receipt is uncertain. Subsequent status verifies
+commands. The worker requests the timed stop and limits stop retries to three, at least 90 seconds
+apart. Unknown state cannot confirm a stop; missing confirmation raises a car-control alert.
+Disabling control ends the timer with an unconfirmed-stop alert. Timed stopping depends on the
+controller, internet and car remaining available.
+
 **Risk setting**: `balanced` plans on the centre; `conservative` moves load halfway to p90 and solar
 halfway to p10; `optimistic` the opposite.
 
@@ -252,6 +265,21 @@ predictions available at the relevant time, and an individual checkpoint shows i
 creation timestamp.
 
 ## Known gaps / ideas
+Home charging: an active owner-created charge plan assumes home through missing or negative
+GPS. Fresh nearby GPS is positive evidence only. Two aligned meter samples over at least two
+minutes can rule out home when car power exceeds whole-home load, after a two-minute start
+settling period. A large house load alone never proves home. Unplugging pauses remote control
+without deleting the goal. An optional reconnect check performs at most one paired stop/restart
+per continuous connection, restores charging within three minutes, and compares both power
+changes. Inconclusive meter evidence keeps the plan assumption; an unconfirmed restart alerts
+and blocks further automatic control. The test requires start and stop permission.
+
+Ready-by graphs show every selected window, pauses, nominal expected SOC and the conservative
+80%-rate planning projection separately. Expected energy is capped at the unbuffered allocated
+energy and target. The home forecast reserves nominal EV power, so its protected battery floor
+includes the actual expected car demand. Replacing a sole vehicle's plan releases its existing
+allocation before evaluating new windows, avoiding double-counting the same EV energy.
+
 - Temperature response is one global linear term; per-hour responses would fit AC use better.
 - No ensemble weather or stochastic optimisation yet; risk is handled by the risk setting.
 - Battery charge taper near 100% and real efficiency are not learned.

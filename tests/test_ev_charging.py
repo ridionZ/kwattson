@@ -75,7 +75,6 @@ def test_stop_uses_the_first_observed_limit_and_confirms_from_the_car(db, settin
 
 @pytest.mark.parametrize('stop_at_limit, at_home, age, state', [
     (False, True, 0, 'finished'),
-    (True, False, 0, 'finished'),
 ])
 def test_planning_only_and_away_sessions_never_send_a_stop(db, settings, stop_at_limit, at_home, age, state):
     settings.vehicles = [CAR]

@@ -17,7 +17,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from .. import __version__, advice, ev_charging, ev_schedule, exports, forecast, outcomes, weather
+from .. import __version__, advice, battery_manual, ev_charging, ev_schedule, exports, forecast, home_charging, outcomes, vehicle_climate, weather
 from ..devices import DEMO_PLUGINS, check_demo_plugin
 from ..config import EnergySystem, Vehicle, Settings, stamp, utcnow
 from ..control import commissioning_hash
@@ -86,6 +86,23 @@ class ChargeOptions(Body):
 
 class VehicleCharge(Body):
     action: Literal['start', 'stop']
+
+
+class SystemMode(Body):
+    mode: Literal['automatic', 'self_use', 'hold', 'force_charge', 'force_discharge', 'export_priority']
+    minutes: int = Field(15, ge=5, le=30)
+    power_kw: float | None = Field(None, gt=0, le=1000)
+    target_pct: float | None = Field(None, ge=0, le=100)
+
+
+class ClimateRequest(Body):
+    action: Literal['start', 'stop']
+    temperature_c: int = Field(22, ge=17, le=28)
+    minutes: int = Field(10, ge=5, le=15)
+
+
+class HomeVerification(Body):
+    acknowledge_interruption: bool = False
 
 
 class OverrideIn(ChargeOptions):
@@ -332,11 +349,31 @@ async def status(request: Request):
     systems = []
     for s in settings.systems:
         latest = db.latest_system(s.id)
+        manual = db.meta(battery_manual.KEY, {}).get(s.id)
+        if manual and manual['end'] <= stamp(now):
+            manual = None
+        floor = None
+        power_limits = (None, None)
+        if s.battery and s.enabled and s.controllable:
+            power_limits = battery_manual.power_limits(db, settings, s, now)
+            try:
+                floor = battery_manual.export_floor(db, settings, s, now, now + timedelta(minutes=30))
+            except Exception:
+                pass
         systems.append(dict(id=s.id, name=s.name, plugin=s.plugin, enabled=s.enabled, controllable=s.controllable,
-                            reading=latest, poll=engine.devices.status.get(f'system:{s.id}')))
+                            reading=latest, poll=engine.devices.status.get(f'system:{s.id}'),
+                            battery=s.battery.model_dump() if s.battery else None, ac_kw=s.ac_kw,
+                            supported_modes=list(getattr(registry.get(s.plugin, 'system'), 'supported_modes', ())),
+                            export_floor_pct=floor,
+                            manual_charge_limit_kw=power_limits[0], manual_export_limit_kw=power_limits[1],
+                            manual_mode={**{k: manual[k] for k in ('mode', 'start', 'end', 'power_kw', 'target_soc', 'command_id') if k in manual},
+                                         'confirmed': bool(manual.get('command_id') and db.meta('control_active', {}).get(s.id, {}).get('command_id') == manual['command_id'] and not db.meta('control_release_pending', {}).get(s.id))} if manual else None))
     vehicles = [dict(id=v.id, name=v.name, plugin=v.plugin, enabled=v.enabled, reading=db.latest_vehicle(v.id), manual_soc=v.manual_soc,
                      target_pct=v.target_pct, can_stop_charging=ev_charging.can_stop(v),
                      can_schedule_charging=ev_charging.can_schedule(v), poll=engine.devices.status.get(f'vehicle:{v.id}'),
+                     climate_supported=vehicle_climate.supported(v), can_control_climate=vehicle_climate.permitted(v),
+                     climate=db.meta(vehicle_climate.KEY, {}).get(v.id),
+                     home_charging=home_charging.status(db, v, now),
                      pending_charge=db.meta('ev_charge_pending', {}).get(v.id)) for v in settings.vehicles]
     try:
         today = outcomes.today_so_far(db, settings, now)
@@ -347,6 +384,8 @@ async def status(request: Request):
         money['projected_today'] = outcomes.projected_today(db, settings, now, decision, money.get('today'))
     return {
         'mode': settings.mode, 'server_time': stamp(now), 'timezone': settings.site.timezone, 'site_name': settings.site.name,
+        'manual_control_guards': engine.controller.guards(settings.model_copy(update={'mode': 'automatic'})) + engine.controller.recovery_reasons(now),
+        'grid_export_limit_kw': settings.site.export_kw,
         'tariff': rate_at(settings.tariffs, now, settings.zone),
         'pending_tariffs': [dict(id=p.id, name=p.name, retailer=p.retailer) for p in pending_plans(settings.tariffs)],
         'site': site, 'systems': systems, 'vehicles': vehicles,
@@ -949,11 +988,12 @@ async def vehicle_charge(vehicle_id: str, body: VehicleCharge, request: Request)
                 except Exception:
                     raise HTTPException(502, 'Could not read the car before starting charging.') from None
                 live = ev_charging.recent_reading(db, vehicle, utcnow(), timedelta(minutes=2))
-            if not live or live['plugged_in'] != 1 or live['at_home'] == 0:
-                raise HTTPException(409, 'Starting requires a fresh reading showing the car connected and not away.')
+            if not live or live['plugged_in'] != 1:
+                raise HTTPException(409, 'Starting requires a fresh reading showing the car connected.')
         now = utcnow()
         # An explicit manual command replaces automatic charging control for this
         # car, so a background schedule cannot immediately undo the owner's action.
+        home_charging.cancel_probe(db, vehicle_id, 'Owner issued a manual charging command')
         for session in ev_charging.sessions(db, now):
             data = session['data']
             if data.get('vehicle_id') == vehicle_id and (data.get('auto_schedule') or data.get('stop_at_limit')):
@@ -966,6 +1006,57 @@ async def vehicle_charge(vehicle_id: str, body: VehicleCharge, request: Request)
             engine.next['vehicles'] = 0
             engine.request_plan()
         db.audit('ev_manual_command', dict(vehicle_id=vehicle_id, action=body.action, command_id=command_id), actor(request))
+        return {'command_id': command_id, 'status': 'pending', 'action': body.action}
+
+
+@router.post('/vehicles/{vehicle_id}/home-verification')
+async def verify_home_charging(vehicle_id: str, body: HomeVerification, request: Request):
+    db, _, engine, runtime = ctx(request)
+    if not runtime.worker:
+        raise HTTPException(409, 'Home verification needs the background worker running.')
+    if not body.acknowledge_interruption:
+        raise HTTPException(422, 'Confirm the brief stop/restart, including the possibility of interrupting an away charging session.')
+    async with engine.ev_lock:
+        settings = db.settings()
+        vehicle = charging_vehicle(settings, vehicle_id)
+        try:
+            await home_charging.begin_probe(db, settings, engine.devices, vehicle, utcnow(), explicit=True)
+        except Exception as error:
+            from ..devices import _message
+            raise HTTPException(409, _message(error)) from None
+        engine.next['vehicles'] = 0
+        return {'status': 'verifying', 'home_charging': home_charging.status(db, vehicle, utcnow())}
+
+
+@router.post('/vehicles/{vehicle_id}/climate/refresh')
+async def refresh_vehicle_climate(vehicle_id: str, request: Request):
+    db, _, engine, _ = ctx(request)
+    settings = db.settings()
+    vehicle = charging_vehicle(settings, vehicle_id)
+    async with engine.ev_lock:
+        try:
+            return await vehicle_climate.refresh(db, settings, engine.devices, vehicle, utcnow())
+        except Exception as error:
+            from ..devices import _message
+            raise HTTPException(502, _message(error)) from None
+
+
+@router.post('/vehicles/{vehicle_id}/climate')
+async def control_vehicle_climate(vehicle_id: str, body: ClimateRequest, request: Request):
+    db, _, engine, runtime = ctx(request)
+    if body.action == 'start' and not runtime.worker:
+        raise HTTPException(409, 'Timed parked climate needs the background worker running.')
+    async with engine.ev_lock:
+        settings = db.settings()
+        vehicle = charging_vehicle(settings, vehicle_id)
+        try:
+            command_id = await vehicle_climate.request(db, settings, engine.devices, vehicle, utcnow(), enabled=body.action == 'start',
+                                                        temperature_c=body.temperature_c, minutes=body.minutes)
+        except Exception as error:
+            from ..devices import _message
+            pending = db.meta(vehicle_climate.KEY, {}).get(vehicle_id, {}).get('request')
+            raise HTTPException(502 if pending else 422, _message(error)) from None
+        db.audit('vehicle_climate_requested', dict(vehicle_id=vehicle_id, action=body.action, command_id=command_id), actor(request))
         return {'command_id': command_id, 'status': 'pending', 'action': body.action}
 
 
@@ -1042,7 +1133,7 @@ def overrides(request: Request):
         v = vehicles.get(r['data'].get('vehicle_id'))
         if r['kind'] == 'ev_charge_now' and v and not r['data'].get('state') and r['starts'] <= stamp(now):
             if r['data'].get('charge_mode') == 'ready_by':
-                r['estimate'] = ev_schedule.remaining_estimate(db, v, now, r)
+                r['estimate'] = ev_schedule.remaining_estimate(db, v, now, r, settings)
             else:
                 decision = decision or engine.latest_decision()
                 r['estimate'] = advice.charging_preview(db, settings, v, now, datetime.fromisoformat(r['expires']),
@@ -1090,9 +1181,9 @@ async def add_override(body: OverrideIn, request: Request):
                     raise HTTPException(422, 'Enter the current battery percentage to schedule charging.')
                 data.update(charge_estimate={key: estimate[key] for key in (
                     'finish', 'energy_kwh', 'end_soc', 'kw', 'rate_basis', 'paid_grid_kwh', 'paid_grid_aud',
-                    'target_reachable', 'windows')},
+                    'target_reachable', 'windows', 'source_windows', 'expected_end_soc', 'expected_energy_kwh', 'expected_finish', 'expected_target_reachable', 'projection', 'expected_kw') if key in estimate},
                     charge_windows=estimate['windows'], schedule_kw=estimate['kw'],
-                    scheduled_end_soc=estimate['end_soc'], dispatch_policy=dispatch_policy(settings))
+                    scheduled_end_soc=estimate.get('expected_end_soc', estimate['end_soc']), dispatch_policy=dispatch_policy(settings))
         with db.connect() as c:
             if body.kind == 'ev_charge_planned':
                 conflict = c.execute("SELECT 1 FROM overrides WHERE kind='ev_charge_planned' AND cancelled_at IS NULL "
@@ -1117,6 +1208,8 @@ async def cancel_override(override_id: int, request: Request):
     async with engine.ev_lock:
         row = db.one('SELECT kind, data, expires FROM overrides WHERE id=? AND cancelled_at IS NULL', (override_id,))
         data = decode(row['data']) if row and row['kind'] == 'ev_charge_now' else {}
+        if data.get('vehicle_id'):
+            home_charging.cancel_probe(db, data['vehicle_id'], 'Owner cancelled the charging plan')
         if data.get('auto_schedule') and not data.get('state') and row['expires'] > stamp(utcnow() - ev_charging.END_GRACE):
             data['cancel_requested'] = True
             db.execute('UPDATE overrides SET data=? WHERE id=?', (encode(data), override_id))
@@ -1177,6 +1270,39 @@ async def delete_exclusion(exclusion_id: int, request: Request):
 
 # --------------------------------------------------------------- control
 CONFIRMATION = 'ENABLE BATTERY CONTROL'
+
+
+@router.post('/systems/{system_id}/mode')
+async def system_mode(system_id: str, body: SystemMode, request: Request):
+    db, _, engine, runtime = ctx(request)
+    if not runtime.worker:
+        raise HTTPException(409, 'Battery controls need the background worker running.')
+    async with engine.control_lock:
+        settings = db.settings()
+        system = next((s for s in settings.active_systems() if s.id == system_id and s.battery and s.controllable), None)
+        if not system:
+            raise HTTPException(422, 'Choose an enabled, controllable battery system.')
+        if body.mode == 'automatic':
+            battery_manual.cancel(db, system_id)
+            db.audit('battery_manual_cancelled', {'system': system_id}, actor(request))
+            result = await engine.controller.cycle(settings) if settings.mode == 'automatic' else await engine.controller.release(settings, system, 'Owner ended the temporary mode')
+            return {'mode': settings.mode, 'manual_mode': None, 'control': result}
+        reasons = engine.controller.guards(settings.model_copy(update={'mode': 'automatic'})) + engine.controller.recovery_reasons(utcnow())
+        if reasons:
+            raise HTTPException(409, 'Battery mode unavailable: ' + '; '.join(reasons))
+        try:
+            record = battery_manual.request(db, settings, system, utcnow(), mode=body.mode, minutes=body.minutes,
+                                             power_kw=body.power_kw, target_pct=body.target_pct)
+        except ValueError as error:
+            raise HTTPException(422, str(error)) from None
+        except Exception as error:
+            from ..devices import _message
+            raise HTTPException(422, _message(error)) from None
+        db.audit('battery_manual_requested', {'system': system_id, **record}, actor(request))
+        result = await engine.controller.cycle(settings)
+        engine.next['control'] = 0
+        engine.request_plan()
+        return {'mode': settings.mode, 'manual_mode': record, 'control': result}
 
 
 @router.post('/control/enable')

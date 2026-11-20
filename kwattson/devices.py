@@ -43,6 +43,10 @@ class Context(PluginContext):
     def record_raw(self, payload):
         self.db.raw(self.target_id, payload)
 
+    def home_coordinates(self):
+        site = self.db.settings().site
+        return (site.latitude, site.longitude) if site.latitude is not None and site.longitude is not None else None
+
     def check_url(self, url, expected_hosts=None):
         return safe_destination(url, expected_hosts)
 
@@ -149,7 +153,8 @@ class Devices:
         total, estimated = 0.0, False
         for v in settings.active_vehicles():
             latest = self.db.latest_vehicle(v.id)
-            if latest and latest['charging'] and latest['at_home'] != 0 and now - datetime.fromisoformat(latest['ts']) < timedelta(minutes=45):
+            from . import home_charging
+            if latest and latest['charging'] and home_charging.status(self.db, v, now)['confirmed'] and now - datetime.fromisoformat(latest['ts']) < timedelta(minutes=30):
                 total += latest['charge_kw'] or v.charger_kw
                 estimated = estimated or latest['charge_kw'] is None
         return total, estimated

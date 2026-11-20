@@ -6,6 +6,7 @@ import ListItemText from '@mui/material/ListItemText';
 import Button from '@mui/material/Button';
 import Chip from '@mui/material/Chip';
 import Typography from '@mui/material/Typography';
+import Stack from '@mui/material/Stack';
 import LuggageRounded from '@mui/icons-material/LuggageRounded';
 import ThunderstormRounded from '@mui/icons-material/ThunderstormRounded';
 import PauseCircleRounded from '@mui/icons-material/PauseCircleRounded';
@@ -16,6 +17,7 @@ import { del, errorText } from '../lib/api';
 import * as f from '../lib/fmt';
 import { ConfirmDialog, Empty, useToast } from './common';
 import type { ChargeEstimate } from './ChargeDialog';
+import ChargePlanGraph from './ChargePlanGraph';
 
 export interface Holiday { id: number; name: string; start: string; end: string; ev_away: number }
 export interface Override {
@@ -27,7 +29,7 @@ export interface Override {
   estimate?: ChargeEstimate;
 }
 
-interface Item { key: string; path: string; Icon: typeof LuggageRounded; title: string; detail: string; active: boolean; noun: string; battery: boolean; charging?: boolean; automatic?: boolean; cancelDetail?: string }
+interface Item { key: string; path: string; Icon: typeof LuggageRounded; title: string; detail: string; active: boolean; noun: string; battery: boolean; charging?: boolean; automatic?: boolean; cancelDetail?: string; estimate?: ChargeEstimate; target?: number; deadline?: string }
 
 export function describe(holidays: Holiday[], overrides: Override[], vehicles: { id: string; name: string }[], now = Date.now()): Item[] {
   const car = (id?: string) => vehicles.find((v) => v.id === id)?.name ?? 'Car';
@@ -47,6 +49,8 @@ export function describe(holidays: Holiday[], overrides: Override[], vehicles: {
         break;
       case 'ev_charge_now': {
         const estimate = o.estimate;
+        const expectedSoc = estimate?.expected_end_soc ?? estimate?.end_soc;
+        const reachable = estimate?.expected_target_reachable ?? estimate?.target_reachable;
         const goal = f.pct(o.data?.target_pct);
         const limit = o.data?.charge_mode === 'ready_by' ? `${goal} by ${f.when(o.expires, now)}`
           : o.data?.charge_mode === 'percentage' ? `to ${goal}`
@@ -62,15 +66,16 @@ export function describe(holidays: Holiday[], overrides: Override[], vehicles: {
           : [limit, o.data?.stop_at_limit ? 'Automatic stop enabled' : 'Set the stop on your car or charger'];
         if (!state && !o.data?.cancel_requested && estimate && (estimate.energy_kwh > 0 || estimate.target_reachable === false)) {
           if (estimate.soc != null) details.push(`current ${f.pct(estimate.soc)}`);
-          if (estimate.target_reachable === false) details.push(`estimated ${f.pct(estimate.end_soc)}`);
-          else details.push(`estimated finish ${f.when(estimate.finish, now)}`);
-          if (next) details.push(`charging ${f.when(next.start, now)}–${f.when(next.end, now)}`);
+          if (reachable === false) details.push(`estimated ${f.pct(expectedSoc)}`);
+          else details.push(`expected finish ${f.when(estimate.expected_finish ?? estimate.finish, now)}`);
+          if (next) details.push(`next window ${f.when(next.start, now)}–${f.when(next.end, now)}`);
           if (estimate.paid_grid_kwh) details.push(`about ${f.money(estimate.paid_grid_aud)} in paid grid power`);
           if (estimate.charging_outside_window && !o.data.auto_schedule) details.push('Car is charging outside this plan; imports may be billed');
           if (estimate.continuous_end_soc != null) details.push(`if charging continues, estimated ${f.pct(estimate.continuous_end_soc)} by the deadline`);
         }
         items.push({ ...base, active: !state || state === 'stopping', Icon: EvStationRounded,
-          title: `${car(o.data?.vehicle_id)} charge plan`, detail: details.join(' · '), noun: 'the charge plan', battery: true, charging: true, automatic: o.data?.auto_schedule });
+          title: `${car(o.data?.vehicle_id)} charge plan`, detail: details.join(' · '), noun: 'the charge plan', battery: true, charging: true, automatic: o.data?.auto_schedule,
+          estimate: !state ? estimate : undefined, target: o.data.target_pct, deadline: o.expires });
         break;
       }
       case 'ev_charge_planned':
@@ -123,12 +128,17 @@ export default function Scheduled({ items, canEdit, onChanged }: { items: Item[]
       <List disablePadding>
         {items.map((it) => (
           <ListItem key={it.key} disableGutters divider
-            secondaryAction={canEdit && <Button size="small" color="error" onClick={() => { setError(null); setConfirm(it); }} aria-label={`Cancel ${it.title}`}>Cancel</Button>}
-            sx={{ pr: canEdit ? 10 : 0 }}>
+            alignItems={it.estimate ? 'flex-start' : 'center'}
+            secondaryAction={canEdit && !it.estimate && <Button size="small" color="error" onClick={() => { setError(null); setConfirm(it); }} aria-label={`Cancel ${it.title}`}>Cancel</Button>}
+            sx={{ pr: canEdit && !it.estimate ? 10 : 0 }}>
             <ListItemIcon sx={{ minWidth: 40, color: it.battery ? 'battery.main' : 'primary.main' }}><it.Icon /></ListItemIcon>
             <ListItemText
-              primary={<>{it.title} {it.active && <Chip size="small" label="Active" color="battery" sx={{ height: 20, ml: 0.5, fontSize: '0.6875rem' }} />}</>}
-              secondary={it.detail} slotProps={{ primary: { variant: 'body2', sx: { fontWeight: 600 } } }} />
+              primary={<Stack component="span" direction="row" spacing={.5} sx={{ alignItems: 'flex-start', justifyContent: 'space-between' }}>
+                <span>{it.title} {it.active && <Chip size="small" label="Active" color="battery" sx={{ height: 20, ml: 0.5, fontSize: '0.6875rem' }} />}</span>
+                {canEdit && it.estimate && <Button size="small" color="error" onClick={() => { setError(null); setConfirm(it); }} aria-label={`Cancel ${it.title}`}>Cancel</Button>}
+              </Stack>}
+              secondary={<>{it.detail}{it.estimate && <ChargePlanGraph estimate={it.estimate} target={it.target} deadline={it.deadline} />}</>}
+              slotProps={{ primary: { variant: 'body2', sx: { fontWeight: 600 } }, secondary: { component: 'div' } }} />
           </ListItem>
         ))}
       </List>

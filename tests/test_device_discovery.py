@@ -107,6 +107,35 @@ def test_mg_recovers_once_when_phone_app_replaces_its_login(monkeypatch):
     assert plugin.retry_after == 0
 
 
+@pytest.mark.parametrize('engine,brake,parked', [(None, None, None), (1, 0, False), (0, 1, True)])
+def test_mg_climate_keeps_only_energy_fields_and_requires_parked_proof(monkeypatch, engine, brake, parked):
+    saic = pytest.importorskip('saic_ismart_client_ng')
+    api = AsyncMock()
+    api.vehicle_list.return_value = SimpleNamespace(vinList=[SimpleNamespace(vin='test-car')])
+    api.get_vehicle_status.return_value = SimpleNamespace(statusTime=utcnow().timestamp(),
+        basicVehicleStatus=SimpleNamespace(engineStatus=engine, handBrake=brake, remoteClimateStatus=0,
+                                          interiorTemperature=26, exteriorTemperature=87), gpsPosition={'never': 'store location'})
+    monkeypatch.setattr(saic, 'SaicApi', Mock(return_value=api))
+    context = SimpleNamespace(secret={'username': 'a@example.invalid', 'password': 'synthetic'}.get, record_raw=Mock())
+    plugin = MGiSmart(context, MGConfig(allow_climate_control=True), None)
+
+    async def run():
+        state = await plugin.read_climate()
+        assert state.parked is parked and state.mode == 'off'
+        assert state.interior_c == 26 and state.exterior_c is None
+        assert 'gpsPosition' not in str(context.record_raw.call_args)
+        if parked:
+            await plugin.set_climate(True, 22)
+            api.start_ac.assert_awaited_once_with('test-car', temperature_idx=8)
+            await plugin.set_climate(False)
+            api.stop_ac.assert_awaited_once_with('test-car')
+        else:
+            with pytest.raises(PluginError, match='parked'):
+                await plugin.set_climate(True, 22)
+            api.start_ac.assert_not_called()
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize('stage', ['sign-in', 'vehicle discovery', 'battery read'])
 def test_mg_failures_identify_stage_without_credentials(monkeypatch, stage):
     saic = pytest.importorskip('saic_ismart_client_ng')
@@ -177,3 +206,17 @@ def test_foxess_maps_cumulative_energy_without_altering_instantaneous_power():
                             {'variable': 'feedin', 'value': 'unavailable'}], '2026-11-19 00:05:00 UTC+0000')
     assert parsed.load_kw == 0.75
     assert parsed.extra['energy_counters_kwh'] == {'load_kwh': 5234.1, 'import_kwh': 400}
+
+
+@pytest.mark.parametrize('offset,age,fix,expected', [(0, 0, 3, True), (.1, 0, 3, None), (0, 900, 3, None), (0, 0, 0, None)])
+def test_mg_location_only_confirms_home_and_never_records_coordinates(monkeypatch, offset, age, fix, expected):
+    pytest.importorskip('saic_ismart_client_ng')
+    context = SimpleNamespace(home_coordinates=lambda: (-27.47, 153.03), record_raw=Mock())
+    plugin = MGiSmart(context, MGConfig(), None)
+    point = SimpleNamespace(latitude=int((-27.47 + offset) * 1_000_000), longitude=153030000)
+    gps = SimpleNamespace(gpsStatus=fix, timeStamp=utcnow().timestamp() - age, wayPoint=SimpleNamespace(position=point))
+    plugin._vehicle_call = AsyncMock(return_value=SimpleNamespace(gpsPosition=gps))
+    at_home, observed = asyncio.run(plugin._home_presence())
+    assert at_home is expected
+    assert (observed is not None) == (expected is True)
+    context.record_raw.assert_not_called()

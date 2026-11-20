@@ -72,6 +72,20 @@ class VehicleReading:
     at_home: bool | None = None
     charge_kw: float | None = None
     range_km: float | None = None
+    charge_session: str | None = None   # energy-session marker; hashed before metadata storage
+    battery_charge_kw: float | None = None  # DC lower bound; never substituted for AC wall power
+    home_source: str | None = None
+    home_seen_at: datetime | None = None
+
+
+@dataclass
+class VehicleClimate:
+    ts: datetime
+    time_verified: bool
+    parked: bool | None = None
+    mode: Literal['off', 'on', 'fan', 'defrost'] | None = None
+    interior_c: float | None = None
+    exterior_c: float | None = None
 
 
 BatteryMode = Literal['self_use', 'force_charge', 'force_discharge', 'hold', 'export_priority']
@@ -132,6 +146,10 @@ class PluginContext(ABC):
 
     timezone: str
 
+    def home_coordinates(self) -> tuple[float, float] | None:
+        """Configured site location, for positive home inference only; never record raw vehicle GPS."""
+        return None
+
 
 class SystemPlugin(ABC):
     """Reads (and optionally controls) one inverter/battery system."""
@@ -187,6 +205,7 @@ class VehiclePlugin(ABC):
     """Reads an EV’s state and optionally starts or stops charging."""
     supports_charge_stop: ClassVar[bool] = False
     supports_charge_schedule: ClassVar[bool] = False
+    supports_climate_control: ClassVar[bool] = False
     poll_seconds = 300
     kind: ClassVar[str] = 'vehicle'
     name: ClassVar[str]
@@ -215,6 +234,12 @@ class VehiclePlugin(ABC):
 
     async def stop_charging(self) -> None:
         raise PluginError('This connection cannot stop charging')
+
+    async def read_climate(self) -> VehicleClimate:
+        raise PluginError('This connection cannot read parked climate status')
+
+    async def set_climate(self, enabled: bool, temperature_c: int = 22) -> None:
+        raise PluginError('This connection cannot control parked climate')
 
     async def close(self) -> None:
         return None

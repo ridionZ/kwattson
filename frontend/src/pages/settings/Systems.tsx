@@ -42,6 +42,7 @@ import * as f from '../../lib/fmt';
 import { ConfirmDialog, Empty, Facts, HelpTip, PageHeader, Section, useToast } from '../../components/common';
 import { clone, useSettings } from './ctx';
 import { Num, SchemaField, slug } from './fields';
+import BatteryModeControls from '../../components/BatteryModeControls';
 
 const PLUGIN_ICON: Record<string, typeof CloudRounded> = { foxess: CloudRounded, homeassistant: HubRounded, push: CallReceivedRounded, simulator: ScienceRounded };
 
@@ -135,6 +136,7 @@ export default function Systems({ sub }: { sub?: string }) {
                   {(status?.mode !== 'automatic' || !s.controllable) && <Button size="small" color="error" onClick={() => setRemove(s)}>Remove</Button>}
                 </Stack>
               </Stack>
+              {live && <BatteryModeControls system={live} />}
             </Card>
           );
         })}

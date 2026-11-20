@@ -79,6 +79,19 @@ failed/released/...), `result` (JSON, credential-free), `verified_at`, `idempote
 `daily_schedule` actions contain the vendor-neutral command list and expiry. Results contain
 the confirmed vendor time groups and scheduler limit. `meta.control_schedules` retains the
 day's confirmed program and last read-only verification time; release removes it.
+`manual_<mode>` actions record temporary battery requests and any overlaid daily program.
+`meta.battery_manual` holds per-system start/end, mode, power, protected targets, command ID and
+verification state. It is cleared on expiry, cancellation or owner stop. `ev_climate_start` and
+`ev_climate_stop` record parked climate requests separately from confirmation. `meta.vehicle_climate`
+stores only parked state, remote climate mode, temperatures, timestamp, pending request and stop timer.
+Vehicle climate metadata contains no GPS, journey, VIN or credentials. These use the existing JSON
+metadata and command tables; there is no schema migration.
+`meta.vehicle_home` stores connection identity, plug/charge evidence timestamps, a hashed
+vendor session marker, positive home evidence, power-mismatch samples and one-test state.
+`meta.home_charge_probes` holds the brief verification stage, meter baseline/low/high samples,
+restart deadline and confirmation. No car coordinates or journeys are retained. Charge estimates
+include `source_windows`, `projection` (timestamp, expected SOC, conservative SOC),
+`expected_end_soc`, `expected_finish` and `expected_target_reachable`; these are modelled.
 **daily_outcomes** — per local day JSON: measured net cost, import cost, export credit, supply,
 counterfactual net costs (`self_use_net_aud`, `no_battery_net_aud`, `no_solar_net_aud`),
 `saving_vs_self_use_aud`, energy totals, coverage, decision/command counts.

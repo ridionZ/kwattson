@@ -195,6 +195,13 @@ Manual start/stop controls require the matching connection permission. Plugins c
 minimum polling interval. MG connector flags distinguish a connected stopped car from an unplugged
 car, and unrecognised charging codes remain unknown rather than confirming a stop.
 
+Parked climate is a separate capability: expose `supports_climate_control`, implement
+`read_climate() -> VehicleClimate` and `set_climate(enabled, temperature_c)`, and require connection
+opt-in. Keep only parked state, remote climate mode, temperatures and timestamp; discard GPS,
+journeys and VIN. Unknown parking is not permission to start. MG requires a fresh device-verified
+parked reading, maps 22 °C to temperature index 8, supports the common 17–28 °C range, and leaves
+unknown climate codes unknown. A receipt is separate from subsequent state confirmation.
+
 ## Testing your plugin
 
 - Unit-test parsing against recorded (anonymised) responses.

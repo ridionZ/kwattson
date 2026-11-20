@@ -19,6 +19,11 @@ async def request_control(db, settings, devices, vehicle, now, *, stop, source='
     """Record a request separately from later physical confirmation."""
     if not (can_stop(vehicle) if stop else can_schedule(vehicle)):
         raise PluginError('Enable the vehicle charging control permission first')
+    if source not in ('manual', 'home_probe'):
+        from . import home_charging
+        home = home_charging.status(db, vehicle, now)
+        if not home['confirmed']:
+            raise PluginError(home['reason'])
     pending = db.meta('ev_charge_pending', {})
     old = pending.get(vehicle.id)
     action = 'stop' if stop else 'start'
@@ -187,6 +192,25 @@ async def monitor(db: Database, settings: Settings, devices, notify, now: dateti
         state = data.get('state')
         if state in ('finished', 'confirmed', 'unconfirmed'):
             continue
+        from . import home_charging
+        home = home_charging.status(db, v, now)
+        if (data.get('auto_schedule') or data.get('stop_at_limit')) and not home['confirmed']:
+            if data.get('home_paused') != home['source']:
+                data['home_paused'] = home['source']
+                db.execute('UPDATE overrides SET data=? WHERE id=?', (encode(data), session['id']))
+                if home['source'] not in ('disconnected', 'verification'):
+                    notify.emit('ev_charge_session', {'vehicle': v.name, 'reason': 'Automatic charging commands paused. ' + home['reason']},
+                                key=f'ev-home:{session["id"]}:{home["source"]}', now=now)
+                changed = True
+            if not data.get('cancel_requested'):
+                continue
+            data['state'] = 'finished'
+            db.execute('UPDATE overrides SET data=?,cancelled_at=? WHERE id=?', (encode(data), stamp(now), session['id']))
+            changed = True
+            continue
+        elif data.pop('home_paused', None):
+            db.execute('UPDATE overrides SET data=? WHERE id=?', (encode(data), session['id']))
+            changed = True
         away = away_all or None in away_vehicles or sid in away_vehicles
         if data.get('charge_mode') == 'ready_by':
             changed |= await run_schedule(db, settings, v, session, devices, notify, now, away)
@@ -227,7 +251,7 @@ async def monitor(db: Database, settings: Settings, devices, notify, now: dateti
             data['state'] = 'unconfirmed'
             message = 'Charge monitoring expired before the target was confirmed. Check the car or charger.'
         elif away or (live and (
-                live['at_home'] == 0 or live['plugged_in'] == 0
+                live['plugged_in'] == 0
                 or (data.get('observed_charge') and live['charging'] == 0 and not limit))):
             data['state'] = 'finished'
             message = 'Charging plan ended because the car left, disconnected or stopped charging.'
@@ -240,7 +264,7 @@ async def monitor(db: Database, settings: Settings, devices, notify, now: dateti
             data['state'] = 'finished'
             message = f'{limit.capitalize()} reached. The car is already stopped.'
         elif data.get('stop_at_limit') and can_stop(v) and (not live or
-                (live['at_home'] != 0 and live['plugged_in'] != 0)):
+                live['plugged_in'] != 0):
             # Record the attempt before sending it. A worker restart must not repeat an uncertain write.
             data.update(state='stopping', stop_requested_at=stamp(now), stop_last_attempt_at=stamp(now),
                         stop_attempts=1, stop_reason=limit)

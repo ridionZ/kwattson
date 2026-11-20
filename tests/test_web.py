@@ -235,6 +235,63 @@ def test_vehicle_controls_require_plugged_start_and_confirm_new_physical_state(t
     plugin.stop_charging.assert_awaited_once()
 
 
+def test_timed_battery_modes_use_commissioned_controller(tmp_path, monkeypatch, settings):
+    from test_device_controls import ready_controller
+    monkeypatch.setenv('DEMO_MODE', 'false')
+    app = create_app(Runtime(data_dir=tmp_path, app_url=ORIGIN, dev_http=True, worker=False))
+    app.state.security.create_owner('demo', PASSWORD)
+    _, controller, device = ready_controller(app.state.db, settings, tmp_path)
+    app.state.engine.controller = controller
+    app.state.runtime.worker = True  # TestClient does not start the background lifespan here.
+    client = TestClient(app, base_url=ORIGIN)
+    headers = login(client)
+    rejected = client.post('/api/systems/main/mode', json={'mode': 'force_charge', 'power_kw': 100}, headers=headers)
+    assert rejected.status_code == 422
+    device.apply_schedule.assert_not_called()
+    response = client.post('/api/systems/main/mode', json={'mode': 'hold', 'minutes': 15}, headers=headers)
+    assert response.status_code == 200, response.text
+    assert response.json()['control']['executed']
+    assert client.get('/api/status').json()['systems'][0]['manual_mode']['mode'] == 'hold'
+    response = client.post('/api/systems/main/mode', json={'mode': 'automatic'}, headers=headers)
+    assert response.status_code == 200, response.text
+    assert not app.state.db.meta('battery_manual')
+
+
+def test_climate_api_preserves_charge_plan_and_verifies_new_status(tmp_path, monkeypatch):
+    from datetime import timedelta
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from kwattson.config import Vehicle, utcnow
+    from kwattson.db import encode
+    from kwattson.plugins.base import VehicleClimate
+    monkeypatch.setenv('DEMO_MODE', 'false')
+    app = create_app(Runtime(data_dir=tmp_path, app_url=ORIGIN, dev_http=True, worker=False))
+    app.state.security.create_owner('demo', PASSWORD)
+    app.state.runtime.worker = True
+    db, engine = app.state.db, app.state.engine
+    settings = db.settings()
+    settings.vehicles = [Vehicle(id='car', name='Car', plugin='mg_ismart', capacity_kwh=50,
+                                plugin_config={'allow_climate_control': True})]
+    db.save_settings(settings)
+    now = utcnow()
+    device = SimpleNamespace(read_climate=AsyncMock(return_value=VehicleClimate(now, True, True, 'off')),
+                             set_climate=AsyncMock())
+    monkeypatch.setattr(engine.devices, 'vehicle', lambda *_: device)
+    session = db.execute('INSERT INTO overrides(created_at,starts,expires,kind,data) VALUES(?,?,?,?,?)',
+               (now.isoformat(), now.isoformat(), (now + timedelta(hours=12)).isoformat(), 'ev_charge_now',
+                encode({'vehicle_id': 'car', 'auto_schedule': True})))
+    client = TestClient(app, base_url=ORIGIN)
+    headers = login(client)
+    response = client.post('/api/vehicles/car/climate', json={'action': 'start', 'temperature_c': 22}, headers=headers)
+    assert response.status_code == 200, response.text
+    assert response.json()['status'] == 'pending'
+    assert db.one('SELECT cancelled_at FROM overrides WHERE id=?', (session,))['cancelled_at'] is None
+    device.read_climate.return_value = VehicleClimate(now + timedelta(seconds=1), True, True, 'on')
+    response = client.post('/api/vehicles/car/climate/refresh', headers=headers)
+    assert response.status_code == 200, response.text
+    assert db.one('SELECT status FROM commands')['status'] == 'verified'
+
+
 @pytest.mark.parametrize('start_demo', [False, True])
 def test_data_directory_cannot_switch_between_demo_and_normal(tmp_path, monkeypatch, start_demo):
     monkeypatch.setenv('DEMO_MODE', str(start_demo))
