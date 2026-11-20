@@ -83,6 +83,10 @@ def test_candidate_is_retained_without_replacing_active_plan(db, settings):
     from kwattson.ingest import store_system
     from kwattson.plugins.base import SystemReading
     settings.mode = 'automatic'
+    override = {'vehicle_id': 'car', 'charge_mode': 'ready_by', 'target_pct': 100, 'auto_schedule': True,
+                'charge_windows': [{'start': stamp(NOW), 'end': stamp(NOW + timedelta(hours=2))}]}
+    override_id = db.execute('INSERT INTO overrides(created_at,starts,expires,kind,data) VALUES(?,?,?,?,?)',
+        (stamp(NOW), stamp(NOW), stamp(NOW + timedelta(hours=3)), 'ev_charge_now', encode(override)))
     store_system(db, 'main', 'simulator', SystemReading(ts=NOW, time_verified=True, soc=50))
     points = sunny_points(NOW, hours=48, peak_kw=0)
     def candidate(at):
@@ -92,12 +96,28 @@ def test_candidate_is_retained_without_replacing_active_plan(db, settings):
         return row
     first = candidate(NOW)
     adopted = plans.consider(db, settings, None, first, NOW)
+    override.update(surplus_guard={'good_last': stamp(NOW), 'good_samples': 1}, observed_plug=True,
+                    charge_command={'action': 'start', 'requested_at': stamp(NOW)}, native_start_warned_for=stamp(NOW))
+    db.execute('UPDATE overrides SET data=? WHERE id=?', (encode(override), override_id))
     second = candidate(NOW + timedelta(minutes=1))
     chosen = plans.consider(db, settings, adopted, second, NOW + timedelta(minutes=1))
     assert chosen['id'] == adopted['id']
     assert plans.latest(db)['id'] == adopted['id']
     assert db.one('SELECT COUNT(*) AS n FROM decisions')['n'] == 2
     assert db.meta('active_plan')['candidate_id'] == second['id']
+
+
+def test_ev_goals_and_control_changes_still_invalidate_plan_policy(db, settings):
+    data = dict(vehicle_id='car', charge_mode='ready_by', target_pct=80, auto_schedule=True,
+                charge_windows=[dict(start=stamp(NOW), end=stamp(NOW + timedelta(hours=2)))])
+    identity = db.execute('INSERT INTO overrides(created_at,starts,expires,kind,data) VALUES(?,?,?,?,?)',
+        (stamp(NOW), stamp(NOW), stamp(NOW + timedelta(hours=3)), 'ev_charge_now', encode(data)))
+    before = plans.policy(db, settings, NOW)
+    changes = [dict(target_pct=100), dict(auto_schedule=False), dict(cancel_requested=True),
+               dict(state='finished'), dict(charge_windows=[dict(start=stamp(NOW), end=stamp(NOW + timedelta(hours=1)))])]
+    for change in changes:
+        db.execute('UPDATE overrides SET data=? WHERE id=?', (encode({**data, **change}), identity))
+        assert plans.policy(db, settings, NOW) != before
 
 
 def test_manual_override_and_new_day_bypass_thresholds(db, settings):

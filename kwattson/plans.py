@@ -35,6 +35,15 @@ def reviewed_at(db, decision):
 def policy(db, settings, now):
     overrides = db.rows('SELECT id, kind, data, starts, expires FROM overrides WHERE cancelled_at IS NULL '
                         'AND starts<=? AND expires>? ORDER BY id', (stamp(now), stamp(now)))
+    for override in overrides:
+        if override['kind'] == 'ev_charge_now':
+            data = decode(override['data'])
+            # Poll/command evidence is not an owner change to the energy plan.
+            # Hash only fields that change the requested load or its control policy.
+            override['data'] = {key: data[key] for key in (
+                'vehicle_id', 'charge_mode', 'target_pct', 'starting_soc', 'charge_windows',
+                'schedule_kw', 'auto_schedule', 'stop_at_limit', 'dispatch_policy',
+                'cancel_requested', 'state') if key in data}
     relevant = dict(systems=[s.model_dump() for s in settings.systems],
                     vehicles=[v.model_dump() for v in settings.vehicles],
                     tariffs=[t.model_dump() for t in settings.tariffs], forecast=settings.forecast.model_dump(),

@@ -10,10 +10,10 @@ from . import plans
 STEP = timedelta(minutes=5)
 LEAD = timedelta(minutes=30)
 SAFETY_FACTOR = 0.8
-SURPLUS_READING_WINDOW = timedelta(minutes=7)  # Fox cloud telemetry updates about every five minutes.
+SURPLUS_READING_WINDOW = timedelta(minutes=10)  # Five-minute cloud samples plus publication/polling delay.
 SURPLUS_CONFIRM = timedelta(minutes=2)
 SURPLUS_RESTART_DELAY = timedelta(minutes=10)
-SURPLUS_MAX_AGE = timedelta(minutes=10)
+SURPLUS_MAX_AGE = SURPLUS_READING_WINDOW
 
 
 def projection(vehicle, now, deadline, soc, target, windows, nominal_kw, conservative_kw, energy_limit=None):
@@ -568,8 +568,10 @@ async def run_schedule(db, settings, vehicle, session, devices, notify, now, awa
                     stop_due = previous_end or programmed_at
                     if not window and charging == 1 and now - stop_due >= timedelta(minutes=2):
                         native_managed = False
-                    if window and charging != 1 and now - datetime.fromisoformat(candidate['start']) >= timedelta(minutes=10) and not data.get('native_start_warned'):
-                        data['native_start_warned'] = True
+                    start_due = max(datetime.fromisoformat(candidate['start']), programmed_at)
+                    if (window and live and live['ts'] > stamp(start_due) and charging != 1
+                            and now - start_due >= timedelta(minutes=10) and data.get('native_start_warned_for') != candidate['start']):
+                        data['native_start_warned_for'] = candidate['start']
                         save()
                         alert('The native timer is confirmed, but charging has not started. Check the car or charger.', 'native-start')
                         changed = True

@@ -159,7 +159,8 @@ def test_surplus_schedule_stops_on_paid_import_and_respects_cooldown(db, setting
         plugin.start_charging.assert_awaited_once()
         assert decode(db.one('SELECT data FROM overrides WHERE id=?', (identity,))['data'])['surplus_paused_until'] > stamp(at)
         assert ev_schedule.home_energy_available(db, settings, CAR, at + timedelta(minutes=5))
-        assert not ev_schedule.home_energy_available(db, settings, CAR, at + timedelta(minutes=8))
+        assert ev_schedule.home_energy_available(db, settings, CAR, at + timedelta(minutes=8))
+        assert not ev_schedule.home_energy_available(db, settings, CAR, at + timedelta(minutes=11))
         low = SystemReading(ts=at, time_verified=True, soc=16, import_kw=0, export_kw=0, load_kw=1,
                             pv_kw=0, charge_kw=0, discharge_kw=1)
         store_system(db, system.id, system.plugin, low)
@@ -349,3 +350,39 @@ def test_projection_shows_overnight_pause_and_expected_target_separately():
     assert result['expected_target_reachable'] is True
     assert points[stamp(NOW + timedelta(hours=2))]['soc'] == points[stamp(NOW + timedelta(hours=6))]['soc']
     assert points[stamp(NOW + timedelta(hours=8))]['conservative_soc'] < 100
+
+
+def test_delayed_five_minute_cloud_samples_allow_surplus_recovery(db, settings):
+    settings.vehicles = [CAR]
+    system = settings.systems[0]
+    window = dict(start=stamp(NOW - timedelta(hours=1)), end=stamp(NOW + timedelta(hours=1)), surplus_only=True)
+    data = dict(surplus_guard=dict(window=window['start'], paused=True, restart_after=stamp(NOW - timedelta(minutes=1)),
+        good_since=stamp(NOW - timedelta(minutes=13)), good_last=stamp(NOW - timedelta(minutes=13)), good_samples=1))
+
+    def meter(at):
+        live = SystemReading(at, True, soc=75, import_kw=.013, export_kw=0, load_kw=.6,
+                             pv_kw=0, charge_kw=0, discharge_kw=.587)
+        store_system(db, system.id, system.plugin, live)
+        store_site(db, combine(settings, {system.id: live}))
+
+    meter(NOW - timedelta(minutes=13))
+    allowed, _, _ = ev_schedule.surplus_permission(db, settings, CAR, data, window, None, NOW - timedelta(minutes=5))
+    assert not allowed  # Cooldown still applies; an eight-minute age must not erase this sample.
+    assert data['surplus_guard']['good_samples'] == 1
+    meter(NOW - timedelta(minutes=8))
+    allowed, _, _ = ev_schedule.surplus_permission(db, settings, CAR, data, window, None, NOW)
+    assert allowed
+    assert not data['surplus_guard'].get('paused')
+
+
+def test_frozen_home_telemetry_still_stops_a_running_surplus_window(db, settings):
+    system = settings.systems[0]
+    live = SystemReading(NOW - timedelta(minutes=11), True, soc=75, import_kw=0, export_kw=0,
+                         load_kw=7, pv_kw=0, charge_kw=0, discharge_kw=7)
+    store_system(db, system.id, system.plugin, live)
+    store_site(db, combine(settings, {system.id: live}))
+    window = dict(start=stamp(NOW - timedelta(hours=1)), end=stamp(NOW + timedelta(hours=1)), surplus_only=True)
+    data = {}
+    allowed, _, reason = ev_schedule.surplus_permission(db, settings, CAR, data, window, {'charging': 1}, NOW)
+    assert not allowed and data['surplus_guard']['paused']
+    assert 'ten minutes' in reason

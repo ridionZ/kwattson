@@ -153,3 +153,23 @@ def test_a_sustained_away_power_mismatch_clears_timer_without_stopping_away_char
         plugin.stop_charging.assert_not_called()
         assert not db.one('SELECT cancelled_at FROM overrides WHERE id=?', (identity,))['cancelled_at']
     asyncio.run(run())
+
+
+def test_late_timer_install_waits_for_car_before_alerting_about_start(db, settings):
+    identity, data, state, plugin, devices, notify = setup(db, settings)
+    at = NOW + timedelta(minutes=20)
+
+    async def run():
+        reading(db, at, 65, False)
+        await ev_charging.monitor(db, settings, devices, notify, at)
+        assert not decode(db.one('SELECT data FROM overrides WHERE id=?', (identity,))['data']).get('native_start_warned_for')
+        assert not any('has not started' in c.args[1]['reason'] for c in notify.emit.call_args_list)
+        reading(db, at + timedelta(minutes=2), 65, True)
+        await ev_charging.monitor(db, settings, devices, notify, at + timedelta(minutes=2))
+        assert not any('has not started' in c.args[1]['reason'] for c in notify.emit.call_args_list)
+        reading(db, at + timedelta(minutes=11), 65, False)
+        await ev_charging.monitor(db, settings, devices, notify, at + timedelta(minutes=11))
+        assert len([c for c in notify.emit.call_args_list if 'has not started' in c.args[1]['reason']]) == 1
+        plugin.start_charging.assert_not_called()
+        plugin.set_charge_timer.assert_awaited_once()
+    asyncio.run(run())
