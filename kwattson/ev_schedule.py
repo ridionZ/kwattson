@@ -564,7 +564,9 @@ async def run_schedule(db, settings, vehicle, session, devices, notify, now, awa
                     native_managed = native_installed = True
                     # Only a missed native stop gets a backup stop, after cloud settling.
                     previous_end = max((datetime.fromisoformat(w['end']) for w in windows if w['end'] <= now_stamp), default=None)
-                    if not window and charging == 1 and previous_end and now - previous_end >= timedelta(minutes=2):
+                    programmed_at = datetime.fromisoformat(db.meta(vehicle_timer.KEY)[vehicle.id]['attempted_at'])
+                    stop_due = previous_end or programmed_at
+                    if not window and charging == 1 and now - stop_due >= timedelta(minutes=2):
                         native_managed = False
                     if window and charging != 1 and now - datetime.fromisoformat(candidate['start']) >= timedelta(minutes=10) and not data.get('native_start_warned'):
                         data['native_start_warned'] = True

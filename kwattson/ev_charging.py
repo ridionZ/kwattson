@@ -197,7 +197,8 @@ async def monitor(db: Database, settings: Settings, devices, notify, now: dateti
     from . import vehicle_timer
     for vehicle in settings.active_vehicles():
         owned = db.meta(vehicle_timer.KEY, {}).get(vehicle.id)
-        if owned and (owned.get('state') == 'clearing' or not any(s['id'] == owned.get('session_id') and not s['data'].get('state') for s in active)):
+        if owned and (owned.get('state') == 'clearing' or not vehicle_timer.capable(vehicle)
+                      or not any(s['id'] == owned.get('session_id') and not s['data'].get('state') for s in active)):
             await vehicle_timer.clear(db, vehicle, devices.vehicle(settings, vehicle.id), notify, now, 'Charging plan ended')
     if not active:
         return changed

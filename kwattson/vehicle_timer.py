@@ -54,7 +54,11 @@ def warn(notify, vehicle, record, reason, now):
 
 
 async def ensure(db, vehicle, device, session_id, window, target, zone, notify, now):
-    wanted = desired(window, target, zone)
+    try:
+        wanted = desired(window, target, zone)
+    except PluginError:
+        warn(notify, vehicle, {'id': f'{vehicle.id}:{session_id}'}, 'The charging window cannot be represented by the car timer. Review its duration and clock changes.', now)
+        return False
     record = db.meta(KEY, {}).get(vehicle.id)
     same = record and record.get('desired') == wanted and record.get('session_id') == session_id
     if record and record.get('state') in ('clearing', 'conflict'):
@@ -79,7 +83,7 @@ async def ensure(db, vehicle, device, session_id, window, target, zone, notify, 
         if same and record.get('attempts', 0) >= 3:
             warn(notify, vehicle, record, 'The car has not confirmed its native charging timer. Check iSMART or the car.', now)
             return False
-        if record and not same and record.get('state') == 'verified' and not matches(state, record['desired'], record.get('native_target_pct')):
+        if record and not same and state.get('enabled') is not False and not matches(state, record['desired'], record.get('native_target_pct')):
             record['state'] = 'conflict'
             save(db, vehicle.id, record)
             warn(notify, vehicle, record, 'The car timer was changed manually. The next window was not installed.', now)
@@ -116,12 +120,14 @@ async def clear(db, vehicle, device, notify, now, reason):
         return True
     if record.get('clear_attempted_at') and now - datetime.fromisoformat(record['clear_attempted_at']) < timedelta(seconds=60):
         return False
+    command_id = None
     try:
         state = await device.read_charge_timer()
-        if state.get('enabled') is False:
+        restoring = record.get('restore_target_pct')
+        if state.get('enabled') is False and (restoring is None or state.get('target_pct') == restoring):
             save(db, vehicle.id, None)
             return True
-        if not matches(state, record['desired'], record.get('native_target_pct')):
+        if state.get('enabled') is not False and not matches(state, record['desired'], record.get('native_target_pct')):
             record['state'] = 'conflict'
             save(db, vehicle.id, record)
             warn(notify, vehicle, record, 'The timer no longer matches the one kWattson wrote. Clear it in iSMART before resuming automatic charging.', now)
@@ -130,11 +136,13 @@ async def clear(db, vehicle, device, notify, now, reason):
         if record.get('clear_attempts', 0) >= 3:
             warn(notify, vehicle, record, 'Clearing the car timer is unconfirmed. Disable it in iSMART, especially before charging away.', now)
             return False
-        record.update(clear_attempted_at=stamp(now), clear_attempts=record.get('clear_attempts', 0) + 1)
+        previous = record.get('previous_target_pct')
+        restore = restoring if restoring is not None else previous if previous is not None and previous != state.get('target_pct') else None
+        record.update(clear_attempted_at=stamp(now), clear_attempts=record.get('clear_attempts', 0) + 1, restore_target_pct=restore)
         save(db, vehicle.id, record)
         command_id = db.execute('INSERT INTO commands(created_at,action,payload,status,result,idempotency_key) VALUES(?,?,?,?,?,?)',
             (stamp(now), 'ev_native_timer_clear', encode(dict(vehicle=vehicle.id, reason=reason)), 'sending', '{}', 'ev-timer-clear:' + uuid4().hex))
-        result = await device.clear_charge_timer(record.get('previous_target_pct'))
+        result = await device.clear_charge_timer(restore)
         verified = result.verified and result.detail.get('enabled') is False
         db.execute('UPDATE commands SET status=?,result=?,verified_at=? WHERE id=?',
                    ('verified' if verified else 'unverified', encode(result.detail), stamp(now) if verified else None, command_id))
@@ -142,7 +150,9 @@ async def clear(db, vehicle, device, notify, now, reason):
             save(db, vehicle.id, None)
             db.audit('ev_native_timer_cleared', dict(vehicle_id=vehicle.id, reason=reason))
             return True
-    except Exception:
+    except Exception as error:
+        if command_id:
+            db.execute("UPDATE commands SET status='unverified',result=? WHERE id=?", (encode({'error': type(error).__name__}), command_id))
         record.update(state='clearing', clear_attempted_at=stamp(now))
         save(db, vehicle.id, record)
     warn(notify, vehicle, record, 'Clearing the car timer is unconfirmed. Disable it in iSMART, especially before charging away.', now)

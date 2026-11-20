@@ -113,3 +113,43 @@ def test_owner_timer_change_is_not_overwritten(db, settings):
         plugin.clear_charge_timer.assert_not_called()
         plugin.stop_charging.assert_not_called()
     asyncio.run(run())
+
+
+def test_backup_stop_keeps_the_morning_timer_and_is_confirmed_before_that_window(db, settings):
+    identity, data, state, plugin, devices, notify = setup(db, settings)
+
+    async def run():
+        reading(db, NOW, 65, True)
+        await ev_charging.monitor(db, settings, devices, notify, NOW)
+        at = MIDNIGHT + timedelta(hours=3, minutes=52)
+        reading(db, at, 85, True)
+        await ev_charging.monitor(db, settings, devices, notify, at)
+        plugin.stop_charging.assert_awaited_once()
+        plugin.clear_charge_timer.assert_not_called()
+        assert state['start_minute'] == 510
+        reading(db, at + timedelta(minutes=1), 85, False)
+        await ev_charging.monitor(db, settings, devices, notify, at + timedelta(minutes=1))
+        assert 'charge_command' not in decode(db.one('SELECT data FROM overrides WHERE id=?', (identity,))['data'])
+        at = MIDNIGHT + timedelta(hours=8, minutes=30)
+        reading(db, at, 85, True)
+        await ev_charging.monitor(db, settings, devices, notify, at)
+        assert not decode(db.one('SELECT data FROM overrides WHERE id=?', (identity,))['data']).get('state')
+        assert plugin.set_charge_timer.await_count == 2
+    asyncio.run(run())
+
+
+def test_a_sustained_away_power_mismatch_clears_timer_without_stopping_away_charge(db, settings):
+    from kwattson import home_charging
+    identity, data, state, plugin, devices, notify = setup(db, settings)
+
+    async def run():
+        reading(db, NOW, 65, True)
+        await ev_charging.monitor(db, settings, devices, notify, NOW)
+        records = db.meta(home_charging.KEY)
+        records[CAR.id]['rejected'] = 'Car power exceeds whole-home load on sustained readings.'
+        db.set_meta(home_charging.KEY, records)
+        await ev_charging.monitor(db, settings, devices, notify, NOW + timedelta(minutes=1))
+        plugin.clear_charge_timer.assert_awaited_once()
+        plugin.stop_charging.assert_not_called()
+        assert not db.one('SELECT cancelled_at FROM overrides WHERE id=?', (identity,))['cancelled_at']
+    asyncio.run(run())
