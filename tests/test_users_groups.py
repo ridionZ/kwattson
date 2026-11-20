@@ -43,6 +43,9 @@ def test_permission_table():
     assert required_role('GET', '/api/settings') == 'admin'
     assert required_role('POST', '/api/unknown-new-endpoint') == 'admin'  # default deny
     assert allowed('member', 'POST', '/api/control/stop') and not allowed('viewer', 'POST', '/api/control/stop')
+    assert allowed('member', 'POST', '/api/vehicles/car/charge')
+    assert not allowed('viewer', 'POST', '/api/vehicles/car/charge')
+    assert not allowed('viewer', 'POST', '/api/vehicles/car/refresh')
 
 
 def test_roles_are_enforced(client):

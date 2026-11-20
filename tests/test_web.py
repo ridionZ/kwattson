@@ -180,6 +180,61 @@ def test_wizard_saves_credentials_atomically_and_detects_conflicts(tmp_path, mon
     assert app.state.security.secret('system:meter:api_key') == sample_key
 
 
+def test_vehicle_controls_require_plugged_start_and_confirm_new_physical_state(tmp_path, monkeypatch):
+    from datetime import timedelta
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from kwattson.config import Vehicle, stamp, utcnow
+    from kwattson.db import encode
+    from kwattson.ingest import store_vehicle
+    from kwattson.plugins.base import VehicleReading
+    from kwattson.web import api
+
+    monkeypatch.setenv('DEMO_MODE', 'false')
+    app = create_app(Runtime(data_dir=tmp_path, app_url=ORIGIN, dev_http=True, worker=False))
+    app.state.security.create_owner('demo', PASSWORD)
+    db, engine = app.state.db, app.state.engine
+    settings = db.settings()
+    car = Vehicle(id='car', name='Car', plugin='mg_ismart', capacity_kwh=60,
+                  plugin_config={'allow_charge_schedule': True})
+    settings.vehicles = [car]
+    db.save_settings(settings)
+    plugin = SimpleNamespace(start_charging=AsyncMock(), stop_charging=AsyncMock())
+    monkeypatch.setattr(engine.devices, 'vehicle', lambda *_: plugin)
+    now = utcnow().replace(microsecond=0)
+    monkeypatch.setattr(api, 'utcnow', lambda: now)
+    def reading(at, charging, plugged):
+        store_vehicle(db, car.id, car.plugin, VehicleReading(ts=at, time_verified=False, soc=60,
+                                                            charging=charging, plugged_in=plugged))
+    client = TestClient(app, base_url=ORIGIN)
+    headers = login(client)
+    reading(now, False, False)
+    assert client.post('/api/vehicles/car/charge', json={'action': 'start'}, headers=headers).status_code == 409
+    plugin.start_charging.assert_not_called()
+    auto = db.execute('INSERT INTO overrides(created_at,starts,expires,kind,data) VALUES(?,?,?,?,?)',
+                      (stamp(now), stamp(now), stamp(now + timedelta(hours=1)), 'ev_charge_now',
+                       encode({'vehicle_id': car.id, 'auto_schedule': True})))
+    reading(now, False, True)
+    response = client.post('/api/vehicles/car/charge', json={'action': 'start'}, headers=headers)
+    assert response.status_code == 200, response.text
+    assert response.json()['status'] == 'pending'
+    assert db.one('SELECT cancelled_at FROM overrides WHERE id=?', (auto,))['cancelled_at']
+    plugin.start_charging.assert_awaited_once()
+    assert client.get('/api/status').json()['vehicles'][0]['pending_charge']['action'] == 'start'
+    refreshed_at = now + timedelta(seconds=1)
+    async def refresh(*_):
+        reading(refreshed_at, True, True)
+    monkeypatch.setattr(engine.devices, 'refresh_vehicle', refresh)
+    monkeypatch.setattr(api, 'utcnow', lambda: now + timedelta(seconds=2))
+    assert client.post('/api/vehicles/car/refresh', headers=headers).status_code == 200
+    assert db.one('SELECT status FROM commands')['status'] == 'verified'
+    # Stale/missing telemetry must not prevent an explicit stop request.
+    db.execute('DELETE FROM vehicle_readings')
+    response = client.post('/api/vehicles/car/charge', json={'action': 'stop'}, headers=headers)
+    assert response.status_code == 200, response.text
+    plugin.stop_charging.assert_awaited_once()
+
+
 @pytest.mark.parametrize('start_demo', [False, True])
 def test_data_directory_cannot_switch_between_demo_and_normal(tmp_path, monkeypatch, start_demo):
     monkeypatch.setenv('DEMO_MODE', str(start_demo))

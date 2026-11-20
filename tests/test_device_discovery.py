@@ -47,6 +47,66 @@ def test_mg_remote_stop_requires_opt_in():
     asyncio.run(run())
 
 
+@pytest.mark.parametrize('code, plugged, charging', [(8, 1, False), (255, 1, None), (0, 0, False), (5, 3, False)])
+def test_mg_connected_and_unknown_statuses_are_distinct(monkeypatch, code, plugged, charging):
+    saic = pytest.importorskip('saic_ismart_client_ng')
+    from saic_ismart_client_ng.api.vehicle_charging.schema import ChrgMgmtDataResp, ChrgMgmtData
+    api = AsyncMock()
+    api.vehicle_list.return_value = SimpleNamespace(vinList=[SimpleNamespace(vin='test-car')])
+    api.get_vehicle_charging_management_data.return_value = ChrgMgmtDataResp(chrgMgmtData=ChrgMgmtData(
+        bmsPackSOCDsp=610, bmsChrgSts=code, ccuOnbdChrgrPlugOn=plugged))
+    monkeypatch.setattr(saic, 'SaicApi', Mock(return_value=api))
+    plugin = MGiSmart(SimpleNamespace(secret={'username': 'a@example.invalid', 'password': 'synthetic'}.get,
+                                    record_raw=Mock()), MGConfig(allow_charge_schedule=True), None)
+
+    async def run():
+        result = await plugin.read()
+        assert result.charging is charging
+        assert result.plugged_in == bool(plugged)
+        await plugin.close()
+        await plugin.start_charging()
+        api.control_charging.assert_awaited_once_with('test-car', stop_charging=False)
+        assert plugin.poll_seconds <= 30
+        assert api.login.await_count == 2
+
+    asyncio.run(run())
+
+
+def test_mgs5_single_phase_wall_power_uses_ac_input_not_dc_battery_power(monkeypatch):
+    saic = pytest.importorskip('saic_ismart_client_ng')
+    from saic_ismart_client_ng.api.vehicle_charging.schema import ChrgMgmtDataResp, ChrgMgmtData
+    api = AsyncMock()
+    api.vehicle_list.return_value = SimpleNamespace(vinList=[SimpleNamespace(vin='test-car')])
+    api.get_vehicle_charging_management_data.return_value = ChrgMgmtDataResp(chrgMgmtData=ChrgMgmtData(
+        bmsPackSOCDsp=554, bmsChrgSts=1, ccuOnbdChrgrPlugOn=3, ccuOffBdChrgrPlugOn=0,
+        onBdChrgrAltrCrntInptCrnt=40, onBdChrgrAltrCrntInptVol=117,
+        bmsPackCrnt=19898, bmsPackVol=1327, bmsPackCrntV=0))
+    monkeypatch.setattr(saic, 'SaicApi', Mock(return_value=api))
+    context = SimpleNamespace(secret={'username': 'a@example.invalid', 'password': 'synthetic'}.get, record_raw=Mock())
+    plugin = MGiSmart(context, MGConfig(single_phase_ac=True), None)
+    result = asyncio.run(plugin.read())
+    assert result.charge_kw == 1.872
+    assert result.plugged_in and result.charging
+    plugin = MGiSmart(context, MGConfig(), None)
+    assert asyncio.run(plugin.read()).charge_kw is None
+
+
+def test_mg_recovers_once_when_phone_app_replaces_its_login(monkeypatch):
+    saic = pytest.importorskip('saic_ismart_client_ng')
+    from saic_ismart_client_ng.exceptions import SaicLogoutException
+    from saic_ismart_client_ng.api.vehicle_charging.schema import ChrgMgmtDataResp, ChrgMgmtData
+    api = AsyncMock()
+    api.vehicle_list.return_value = SimpleNamespace(vinList=[SimpleNamespace(vin='test-car')])
+    api.get_vehicle_charging_management_data.side_effect = [
+        SaicLogoutException('synthetic logout'), ChrgMgmtDataResp(chrgMgmtData=ChrgMgmtData(bmsPackSOCDsp=554, bmsChrgSts=1))]
+    monkeypatch.setattr(saic, 'SaicApi', Mock(return_value=api))
+    context = SimpleNamespace(secret={'username': 'a@example.invalid', 'password': 'synthetic'}.get, record_raw=Mock())
+    plugin = MGiSmart(context, MGConfig(), None)
+    assert asyncio.run(plugin.read()).soc == 55.4
+    assert api.login.await_count == 2
+    assert plugin.retry_after == 0
+
+
 @pytest.mark.parametrize('stage', ['sign-in', 'vehicle discovery', 'battery read'])
 def test_mg_failures_identify_stage_without_credentials(monkeypatch, stage):
     saic = pytest.importorskip('saic_ismart_client_ng')

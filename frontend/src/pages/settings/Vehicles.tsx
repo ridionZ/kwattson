@@ -229,7 +229,7 @@ function VehicleWizard({ editId, onClose }: { editId?: string; onClose: () => vo
       const reading = r?.reading;
       if (r && 'reading' in r && !reading) throw new Error('No reading yet. Check the source or skip the test and try again later.');
       setTested('ok');
-      setTestMsg({ ok: true, text: `Connected.${reading?.soc != null ? ` Car at ${f.pct(reading.soc)}.` : ''}` });
+      setTestMsg({ ok: true, text: `Connected.${reading?.soc != null ? ` Car at ${f.pct(reading.soc)}.` : ''}${reading?.charging === true ? ' Charging.' : reading?.plugged_in === true ? ' Plugged in, not charging.' : ''}${reading?.charge_kw != null ? ` AC input ${f.kw(reading.charge_kw)}.` : ''}` });
     } catch (e) {
       setTestMsg({ ok: false, text: errorText(e) });
     } finally {

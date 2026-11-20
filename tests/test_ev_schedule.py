@@ -9,7 +9,7 @@ from conftest import solarmax, ZONE
 from kwattson import ev_charging, ev_schedule, forecast, optimizer
 from kwattson.config import UTC, Vehicle, stamp
 from kwattson.db import decode, encode
-from kwattson.ingest import store_system, store_vehicle
+from kwattson.ingest import combine, store_site, store_system, store_vehicle
 from kwattson.plugins.base import SystemReading, VehicleReading
 from kwattson.web.api import ChargeOptions, charge_options
 
@@ -88,6 +88,72 @@ def test_battery_only_schedule_uses_available_energy_without_expected_grid(db, s
     assert result['solar_kwh'] == 0
 
 
+def test_automatic_free_grid_only_schedule_can_use_home_battery_at_paid_rates(db, settings):
+    system = settings.systems[0]
+    system.pv_kwp = 0
+    store_system(db, system.id, system.plugin, SystemReading(ts=NOW, time_verified=True, soc=90))
+    flows = {system.id: {'soc_kwh': 34}}
+    rows = [dict(ts=stamp(NOW), hours=3, systems=flows, action='self_use', import_kwh=0, export_kwh=0, discharge_kwh=0)]
+    decision = {'summary': {'dispatch_policy': optimizer.dispatch_policy(settings), 'terminal_value_per_kwh': .10},
+                'created_at': stamp(NOW)}
+    data = {'target_pct': 50, 'starting_soc': 42, 'grid_rates': [0], 'auto_schedule': True}
+    result = ev_schedule.preview(db, settings, CAR, NOW, NOW + timedelta(hours=3), data, decision, rows)
+    assert result['target_reachable']
+    assert result['paid_grid_aud'] == result['paid_grid_kwh'] == result['grid_kwh'] == 0
+    assert result['battery_kwh'] == 5.33
+    assert all(w['surplus_only'] for w in result['windows'])
+
+
+def test_car_can_redirect_optional_exports_without_spending_house_reserve(db, settings):
+    system = settings.systems[0]
+    system.controllable = True
+    system.pv_kwp = 0
+    store_system(db, system.id, system.plugin, SystemReading(ts=NOW, time_verified=True, soc=90))
+    rows = [dict(ts=stamp(NOW), hours=1, systems={system.id: {'soc_kwh': 20, 'dis': 5}},
+                 action='force_discharge', import_kwh=0, export_kwh=4, discharge_kwh=5),
+            dict(ts=stamp(NOW + timedelta(hours=1)), hours=1, systems={system.id: {'soc_kwh': 6, 'dis': 0}},
+                 action='self_use', import_kwh=0, export_kwh=0, discharge_kwh=0)]
+    deadline = NOW + timedelta(hours=2)
+    budget = sum(kwh for _, kwh in ev_schedule.home_battery(db, settings, NOW, deadline, rows))
+    assert budget == pytest.approx(3.2)  # 4 kWh of optional export with the 20% safety margin
+    system.controllable = False
+    assert ev_schedule.home_battery(db, settings, NOW, deadline, rows) == []
+
+
+def test_surplus_schedule_stops_on_paid_import_and_respects_cooldown(db, settings):
+    settings.vehicles = [CAR]
+    system = settings.systems[0]
+    identity, data = save_schedule(db, settings)
+    data.update(grid_rates=[0], charge_windows=[dict(start=stamp(NOW), end=stamp(NOW + timedelta(hours=2)), surplus_only=True)])
+    db.execute('UPDATE overrides SET data=? WHERE id=?', (encode(data), identity))
+    plugin = SimpleNamespace(start_charging=AsyncMock(), stop_charging=AsyncMock())
+    devices = SimpleNamespace(vehicle=lambda *_: plugin)
+    notify = SimpleNamespace(emit=Mock())
+    def meter(at, imp):
+        measured = SystemReading(ts=at, time_verified=True, soc=80, import_kw=imp, export_kw=0, load_kw=2,
+                                 pv_kw=0, charge_kw=0, discharge_kw=1)
+        store_system(db, system.id, system.plugin, measured)
+        store_site(db, combine(settings, {system.id: measured}))
+    async def run():
+        reading(db, NOW, 45, False)
+        meter(NOW, 0)
+        await ev_charging.monitor(db, settings, devices, notify, NOW)
+        plugin.start_charging.assert_awaited_once()
+        at = NOW + timedelta(minutes=1)
+        meter(at, .5)
+        reading(db, at, 45, True)
+        await ev_charging.monitor(db, settings, devices, notify, at)
+        plugin.stop_charging.assert_awaited_once()
+        at += timedelta(minutes=1)
+        meter(at, 0)
+        reading(db, at, 45, False)
+        await ev_charging.monitor(db, settings, devices, notify, at)
+        plugin.start_charging.assert_awaited_once()
+        assert decode(db.one('SELECT data FROM overrides WHERE id=?', (identity,))['data'])['surplus_paused_until'] > stamp(at)
+        assert not ev_schedule.home_energy_available(db, settings, CAR, at + timedelta(minutes=4))
+    asyncio.run(run())
+
+
 def save_schedule(db, settings):
     data = dict(vehicle_id=CAR.id, charge_mode='ready_by', auto_schedule=True,
                 dispatch_policy=optimizer.dispatch_policy(settings), target_pct=80,
@@ -105,6 +171,65 @@ def test_schedule_forecast_places_only_the_saved_window(db, settings):
     slots = [(MIDNIGHT + timedelta(minutes=30*i), .5) for i in range(-1, 3)]
     energy, _, _ = forecast.ev_plan(db, settings, NOW, slots, [], [session])
     assert energy == pytest.approx([0, 2.56, 2.56, 0])
+
+
+def test_manual_schedule_does_not_hide_observed_charging_or_confirm_a_stop(db, settings):
+    settings.vehicles = [CAR]
+    identity, data = save_schedule(db, settings)
+    data.update(auto_schedule=False, target_pct=50)
+    db.execute('UPDATE overrides SET data=? WHERE id=?', (encode(data), identity))
+    reading(db, NOW, 65, True)
+    session = dict(id=identity, starts=stamp(NOW), expires=stamp(DEPART), kind='ev_charge_now', data=data)
+    energy, _, _ = forecast.ev_plan(db, settings, NOW, [(NOW, .5), (NOW + timedelta(minutes=30), .5)], [], [session])
+    assert energy == pytest.approx([3.2, 3.2])
+    devices = SimpleNamespace(vehicle=Mock())
+    notify = SimpleNamespace(emit=Mock())
+    asyncio.run(ev_charging.monitor(db, settings, devices, notify, NOW))
+    devices.vehicle.assert_not_called()
+    assert decode(db.one('SELECT data FROM overrides WHERE id=?', (identity,))['data'])['state'] == 'finished'
+    assert 'did not stop' in notify.emit.call_args.args[1]['reason']
+
+
+def test_remaining_projection_uses_new_soc_and_only_future_windows(db, settings):
+    identity, data = save_schedule(db, settings)
+    data.update(auto_schedule=False, target_pct=100, charge_estimate={'end_soc': 55, 'paid_grid_aud': 12})
+    session = dict(id=identity, starts=stamp(NOW), expires=stamp(DEPART), data=data)
+    reading(db, NOW, 65, True)
+    estimate = ev_schedule.remaining_estimate(db, CAR, NOW, session)
+    assert estimate['soc'] == 65
+    assert estimate['end_soc'] == pytest.approx(72.68)
+    assert estimate['continuous_end_soc'] == 100
+    assert estimate['charging_outside_window']
+    assert estimate['paid_grid_aud'] is None
+    at = MIDNIGHT + timedelta(minutes=30)
+    reading(db, at, 70, True)
+    estimate = ev_schedule.remaining_estimate(db, CAR, at, session)
+    assert estimate['energy_kwh'] == pytest.approx(2.56)
+    assert estimate['end_soc'] == pytest.approx(73.84)
+    reading(db, DEPART, 77, False)
+    estimate = ev_schedule.remaining_estimate(db, CAR, DEPART, session)
+    assert estimate['end_soc'] == 77
+    assert estimate['energy_kwh'] == 0
+
+
+def test_saved_window_forecast_never_charges_past_target(db, settings):
+    settings.vehicles = [CAR]
+    identity, data = save_schedule(db, settings)
+    reading(db, MIDNIGHT, 79, True)
+    session = dict(id=identity, kind='ev_charge_now', starts=stamp(NOW), expires=stamp(DEPART), data=data)
+    energy, _, _ = forecast.ev_plan(db, settings, MIDNIGHT, [(MIDNIGHT, .5), (MIDNIGHT + timedelta(minutes=30), .5)], [], [session])
+    assert sum(energy) == pytest.approx(60 / .9 / 100)
+
+
+def test_adopted_forecast_can_supply_context_when_recently_reviewed(db, settings):
+    decision = dict(id=4, created_at=stamp(NOW - timedelta(hours=8)),
+                    summary={'dispatch_policy': optimizer.dispatch_policy(settings)})
+    db.set_meta('active_plan', dict(decision_id=4, reviewed_at=stamp(NOW), valid=True))
+    from kwattson import plans
+    rows = [{'example': True}]
+    assert ev_schedule.forecast_rows(decision, settings, NOW, rows, plans.reviewed_at(db, decision)) == rows
+    db.set_meta('active_plan', dict(decision_id=4, reviewed_at=stamp(NOW), valid=False))
+    assert ev_schedule.forecast_rows(decision, settings, NOW, rows, plans.reviewed_at(db, decision)) == []
 
 
 def test_automatic_schedule_starts_and_stops_once_and_waits_for_confirmation(db, settings):

@@ -31,7 +31,7 @@ import { useApp } from '../lib/app';
 import { action } from '../lib/actions';
 import { tokens, ACTION_COLOR } from '../theme';
 import * as f from '../lib/fmt';
-import { ErrorState, Facts, HelpTip, LoadingBlock, Section, useToast } from '../components/common';
+import { ConfirmDialog, ErrorState, Facts, HelpTip, LoadingBlock, Section, useToast } from '../components/common';
 import ControlRetry from '../components/ControlRetry';
 import QuickActions from '../components/QuickActions';
 import Scheduled, { describe, type Holiday, type Override } from '../components/Scheduled';
@@ -317,7 +317,6 @@ function LivePower({ st, now }: { st: any; now: number }) {
   const importing = (s.import_kw ?? 0) > 0.05;
   const exporting = (s.export_kw ?? 0) > 0.05;
   const solarTone = { fg: t.solarText, bg: t.solarContainer };
-  const batTone = { fg: t.batteryText, bg: t.batteryContainer };
   const neutral = { fg: 'text.secondary', bg: 'action.hover' };
   const vehicles = (st.vehicles ?? []).filter((v: any) => v.enabled);
   const nextBlock = (st.advice?.schedule ?? [])[1];
@@ -360,21 +359,61 @@ function LivePower({ st, now }: { st: any; now: number }) {
             {importing ? <ArrowDownwardRounded sx={{ fontSize: 14 }} /> : exporting ? <ArrowUpwardRounded sx={{ fontSize: 14, color: t.gridOut }} /> : null}
             <span>{importing ? `Importing at ${f.cents(st.tariff?.buy)}/kWh` : exporting ? `Exporting at ${f.cents(st.tariff?.sell)}/kWh` : 'Not importing or exporting'}</span>
           </Stack>} />
-        {vehicles.map((v: any) => {
-          const r = v.reading;
-          const soc = r?.soc ?? v.manual_soc;
-          const state = !r ? 'No live data' : r.at_home === 0 ? 'Away' : r.charging ? `Charging${r.charge_kw ? ` ${f.kw(r.charge_kw)}` : ''}` : r.plugged_in ? 'Plugged in' : 'Not plugged in';
-          return (
-            <Tile key={v.id} icon={<ElectricCarRounded />} tone={batTone} label={v.name} value={soc != null ? f.pct(soc) : '–'}
-              sub={`${state} · target ${f.pct(v.target_pct)}`}>
-              {soc != null && <LinearProgress variant="determinate" value={soc} aria-label={`${v.name} battery level`}
-                sx={{ bgcolor: t.battery + '33', '& .MuiLinearProgress-bar': { bgcolor: t.battery } }} />}
-            </Tile>
-          );
-        })}
+        {vehicles.map((v: any) => <VehicleTile key={v.id} vehicle={v} now={now} price={st.tariff?.buy} />)}
       </Box>
     </Section>
   );
+}
+
+function VehicleTile({ vehicle: v, now, price }: { vehicle: any; now: number; price?: number }) {
+  const { t } = useTokens();
+  const { can, reloadStatus } = useApp();
+  const toast = useToast();
+  const [busy, setBusy] = useState(false);
+  const [startOpen, setStartOpen] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const r = v.reading;
+  const fresh = r && f.ageMinutes(r.ts, now) <= 25;
+  const soc = r?.soc ?? v.manual_soc;
+  const state = !r ? 'No live data' : !fresh ? 'Reading is out of date' : r.at_home === 0 ? 'Away'
+    : r.charging === 1 ? `Charging${r.charge_kw ? ` ${f.kw(r.charge_kw)}` : ' (power estimated)'}`
+    : r.plugged_in === 1 ? 'Plugged in, not charging' : r.plugged_in === 0 ? 'Not plugged in' : 'Connection state unknown';
+  async function send(action: 'start' | 'stop' | 'refresh') {
+    setBusy(true);
+    setError(null);
+    try {
+      await post(`/api/vehicles/${encodeURIComponent(v.id)}/${action === 'refresh' ? 'refresh' : 'charge'}`,
+        action === 'refresh' ? undefined : { action });
+      setStartOpen(false);
+      toast(action === 'refresh' ? 'Car reading refreshed.' : `${action === 'start' ? 'Start' : 'Stop'} requested. Waiting for the car to confirm.`);
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setBusy(false);
+      await reloadStatus();
+    }
+  }
+  return <Tile icon={<ElectricCarRounded />} tone={{ fg: t.batteryText, bg: t.batteryContainer }} label={v.name}
+    value={soc != null ? f.pct(soc) : '–'} sub={`${state} · target ${f.pct(v.target_pct)}`}>
+    {soc != null && <LinearProgress variant="determinate" value={soc} aria-label={`${v.name} battery level`}
+      sx={{ bgcolor: t.battery + '33', '& .MuiLinearProgress-bar': { bgcolor: t.battery } }} />}
+    {r?.ts && <Typography variant="caption" component="p" sx={{ mt: .5 }}>Read {f.relative(r.ts, now)}</Typography>}
+    {v.poll?.ok === false && <Typography variant="caption" color="error" component="p">{v.poll.error}</Typography>}
+    {v.pending_charge && <Typography variant="caption" component="p">Waiting for confirmation: {v.pending_charge.action}</Typography>}
+    {error && <Typography variant="caption" color="error" component="p" role="alert">{error}</Typography>}
+    {can('member') && <Stack direction="row" spacing={.5} sx={{ flexWrap: 'wrap', mt: .5 }}>
+      <Button size="small" disabled={busy} onClick={() => void send('refresh')}>Refresh</Button>
+      {v.can_schedule_charging && r?.charging !== 1 && <Button size="small" disabled={busy || !!v.pending_charge || !fresh || r?.plugged_in !== 1}
+        onClick={() => { setError(null); setStartOpen(true); }}>Start charging</Button>}
+      {v.can_stop_charging && <Button size="small" color="error" disabled={busy || v.pending_charge?.action === 'stop'}
+        onClick={() => void send('stop')}>Stop charging</Button>}
+    </Stack>}
+    {can('member') && v.can_stop_charging && <Typography variant="caption" component="p">Manual commands end this car's automatic charging plans.</Typography>}
+    <ConfirmDialog open={startOpen} title={`Start charging ${v.name}?`} confirm="Start charging" busy={busy} error={error}
+      onConfirm={() => void send('start')} onClose={() => setStartOpen(false)}>
+      <Typography>Charging starts now{price != null ? `; the current grid rate is ${f.cents(price)}/kWh` : ''}. This replaces automatic charging control for this car. Set a new charge plan if you want an automatic cutoff.</Typography>
+    </ConfirmDialog>
+  </Tile>;
 }
 
 /* ------------------------------------------------------------------- today */

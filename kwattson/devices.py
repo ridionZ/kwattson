@@ -167,6 +167,25 @@ class Devices:
             except Exception as error:
                 self._mark(target, False, _message(error))
 
+    def vehicle_poll_seconds(self, settings: Settings) -> float:
+        return min((getattr(self.vehicle(settings, v.id), 'poll_seconds', 300)
+                    for v in settings.active_vehicles()), default=300)
+
+    async def refresh_vehicle(self, settings: Settings, vehicle_id: str):
+        spec = next(v for v in settings.active_vehicles() if v.id == vehicle_id)
+        target = f'vehicle:{spec.id}'
+        try:
+            reading = await self.vehicle(settings, vehicle_id).refresh()
+            if reading is not None:
+                if reading.soc is not None and not 0 <= reading.soc <= 100:
+                    raise ValueError('vehicle state of charge out of range')
+                store_vehicle(self.db, spec.id, spec.plugin, reading)
+            self._mark(target, True)
+            return reading
+        except Exception as error:
+            self._mark(target, False, _message(error))
+            raise
+
     async def close(self):
         for _, instance in self._instances.values():
             try:
@@ -179,7 +198,8 @@ class Devices:
 def _validate(r: SystemReading):
     for name in ('pv_kw', 'charge_kw', 'discharge_kw', 'ac_output_kw', 'import_kw', 'export_kw', 'load_kw'):
         value = getattr(r, name)
-        if value is not None and not 0 <= value <= 1000:
+        minimum = -1000 if name == 'ac_output_kw' else 0
+        if value is not None and not minimum <= value <= 1000:
             raise ValueError(f'{name} out of range')
     if r.soc is not None and not 0 <= r.soc <= 100:
         raise ValueError('state of charge out of range')

@@ -184,9 +184,10 @@ class SystemPlugin(ABC):
 
 
 class VehiclePlugin(ABC):
-    """Reads an EV’s state and optionally supports ending a charging session."""
+    """Reads an EV’s state and optionally starts or stops charging."""
     supports_charge_stop: ClassVar[bool] = False
     supports_charge_schedule: ClassVar[bool] = False
+    poll_seconds = 300
     kind: ClassVar[str] = 'vehicle'
     name: ClassVar[str]
     title: ClassVar[str]
@@ -201,6 +202,9 @@ class VehiclePlugin(ABC):
 
     @abstractmethod
     async def read(self) -> VehicleReading | None: ...
+
+    async def refresh(self) -> VehicleReading | None:
+        return await self.read()
 
     async def test(self) -> dict:
         reading = await self.read()

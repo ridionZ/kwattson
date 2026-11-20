@@ -60,7 +60,9 @@ def charging_preview(db: Database, settings: Settings, vehicle: Vehicle, now: da
     if estimate['energy_kwh'] == 0:
         return {**result, 'paid_grid_kwh': 0, 'paid_grid_aud': 0}
     grid_only = not any(s.pv_kwp > 0 or s.battery for s in settings.active_systems())
-    if (not decision or not timedelta(0) <= now - datetime.fromisoformat(decision['created_at']) <= timedelta(minutes=35)
+    from .plans import reviewed_at
+    checked = reviewed_at(db, decision)
+    if (not decision or not checked or not timedelta(0) <= now - datetime.fromisoformat(checked) <= timedelta(minutes=35)
             or decision['summary'].get('dispatch_policy') != dispatch_policy(settings)):
         return {**result, **grid_only_cost(db, settings, now, finish, rate)} if grid_only else result
     rows = plan_intervals(db, decision['id'])

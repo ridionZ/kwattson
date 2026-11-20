@@ -22,7 +22,7 @@ You often don't need a plugin at all:
   so the optimiser can reason about any vendor.
 - **Site meter**: exactly one system (or the only system) reports whole-site grid import/export
   and household load. Other systems report just PV/battery.
-- **Vehicle**: an EV with optional data plugin. Vehicle *control* is not part of the contract yet.
+- **Vehicle**: an EV with optional data and opt-in start/stop control.
 
 ## Build and install the example
 
@@ -190,6 +190,10 @@ Report command errors as `PluginError` without credentials. A successful call me
 was accepted. Subsequent `VehicleReading.charging` confirms whether the car stopped. Plugins that also support scheduling can expose
 `supports_charge_schedule` and implement `start_charging()`. Return `plugged_in` for ready-by
 automation. Settings and an individual session must both opt in to start requests.
+Manual start/stop controls require the matching connection permission. Plugins can override
+`poll_seconds` and `refresh()` for adaptive polling; repeated refreshes should respect the vendor's
+minimum polling interval. MG connector flags distinguish a connected stopped car from an unplugged
+car, and unrecognised charging codes remain unknown rather than confirming a stop.
 
 ## Testing your plugin
 

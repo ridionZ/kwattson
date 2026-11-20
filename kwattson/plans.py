@@ -24,6 +24,14 @@ def invalidate_review(db):
         db.set_meta('active_plan', {**active, 'valid': False})
 
 
+def reviewed_at(db, decision):
+    """Freshness of an adopted plan, including successful background reviews."""
+    review = db.meta('active_plan', {})
+    if review and decision and review.get('decision_id') == decision.get('id'):
+        return review.get('reviewed_at') if review.get('valid') else None
+    return decision.get('created_at') if decision else None
+
+
 def policy(db, settings, now):
     overrides = db.rows('SELECT id, kind, data, starts, expires FROM overrides WHERE cancelled_at IS NULL '
                         'AND starts<=? AND expires>? ORDER BY id', (stamp(now), stamp(now)))

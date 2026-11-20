@@ -38,9 +38,9 @@ from .weather import freshness_hours
 from .db import Database, decode, encode
 from .ingest import select_intervals
 
-LOAD_VERSION = 'profile-temperature-v3'
+LOAD_VERSION = 'profile-temperature-v4'
 SOLAR_VERSION = 'hourly-ratio-v3'
-VERSION = f'{LOAD_VERSION}+{SOLAR_VERSION}+ev-session-v3'
+VERSION = f'{LOAD_VERSION}+{SOLAR_VERSION}+ev-session-v4'
 WEATHER_PREFERRED_HOURS = 6
 WEATHER_MAX_HOURS = 24
 COLD_START_SHAPE = [.45, .35, .3, .3, .3, .35, .75, 1.15, .85, .65, .55, .6, .65, .65, .65, .7, .9, 1.25, 1.6, 1.5, 1.1, .85, .65, .5]
@@ -246,7 +246,7 @@ def ev_plan(db: Database, settings: Settings, now: datetime, slots: list[tuple[d
         fresh = (latest and latest['plugin'] == vehicle.plugin
                  and timedelta(0) <= now - datetime.fromisoformat(latest['ts']) < timedelta(hours=6))
         soc = latest['soc'] if fresh and latest['soc'] is not None else vehicle.manual_soc
-        charging = bool(fresh and latest['charging'])
+        charging = bool(fresh and latest['charging'] and now - datetime.fromisoformat(latest['ts']) <= timedelta(minutes=25))
         away_now = bool(fresh and latest['at_home'] == 0)
         mine = [o for o in overrides if o['data'].get('vehicle_id') in (None, vehicle.id)]
         session = max((o for o in mine if o['kind'] == 'ev_charge_now'), key=lambda o: o.get('id', 0), default=None)
@@ -279,6 +279,15 @@ def ev_plan(db: Database, settings: Settings, now: datetime, slots: list[tuple[d
             estimate = session_estimate(vehicle, rate, now, until, target, current)
             remaining = estimate['energy_kwh'] if force else 0.0
             first_session = False
+        # A forecast-only goal does not stop the physical car. Model the observed
+        # load until full rather than hiding it outside the suggested windows.
+        uncontrolled = bool(charging and session and (
+            not (session['data'].get('auto_schedule') or session['data'].get('stop_at_limit'))
+            or session['data'].get('state') in ('finished', 'unconfirmed')))
+        if uncontrolled:
+            windows = None
+            remaining = max(0, (100 - soc) / 100 * vehicle.capacity_kwh / vehicle.charger_efficiency) if soc is not None else per_session
+            force = False
         for i, (at, hours) in enumerate(slots):
             local = at.astimezone(zone)
             iso = stamp(at)
@@ -286,7 +295,7 @@ def ev_plan(db: Database, settings: Settings, now: datetime, slots: list[tuple[d
                 h['ev_away'] and h['start'] <= iso < h['end'] for h in holidays)
             away = marked_away or (away_now and i < 4)
             day = local.date()
-            session_slot = bool(session and at < until)
+            session_slot = bool(session and at < until and not uncontrolled)
             if session_slot:
                 started.add(day)
             if session and not session_slot and force:
@@ -309,7 +318,8 @@ def ev_plan(db: Database, settings: Settings, now: datetime, slots: list[tuple[d
                 continue
             if session_slot and windows is not None:
                 overlap = sum(max(0, (min(stop, end) - max(at, start)).total_seconds()) for start, end in windows)
-                energy = overlap * session['data']['schedule_kw'] / 3600
+                energy = min(remaining, overlap * session['data']['schedule_kw'] / 3600)
+                remaining -= energy
             else:
                 duration = min(hours, (until - at).total_seconds() / 3600) if session_slot else hours
                 energy = min(rate * duration, remaining)
