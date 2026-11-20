@@ -139,6 +139,31 @@ def test_failed_background_review_invalidates_control_and_keeps_plan(db, securit
     assert not db.meta('active_plan')['valid']
 
 
+def test_adopted_plan_uses_review_freshness_and_blocks_next_day(db, security, tmp_path, monkeypatch):
+    from kwattson.config import stamp
+    from kwattson import optimizer, plans
+    from kwattson.ingest import store_system
+    from kwattson.plugins.base import SystemReading
+    settings = make_test_site()
+    settings.systems[0].controllable = True
+    settings.mode = 'automatic'
+    settings.tariffs = [t for t in settings.tariffs if t.status != 'pending']
+    now = datetime(2026, 11, 20, 12, tzinfo=ZONE)
+    db.save_settings(settings)
+    store_system(db, 'main', 'simulator', SystemReading(ts=now, time_verified=True, soc=50, fault=False))
+    controller = Controller(db, Devices(db, security), Notifications(db, security),
+                            Runtime(data_dir=tmp_path, app_url='http://localhost:8080', dev_http=True, worker=False))
+    db.set_meta('control_commissioned', {'hash': commissioning_hash(settings)})
+    db.set_meta('active_plan', dict(decision_id=1, day='2026-11-20', valid=True, reviewed_at=stamp(now),
+                                    policy=plans.policy(db, settings, now)))
+    monkeypatch.setattr(controller, 'latest_decision', lambda: dict(id=1, created_at=stamp(now - timedelta(hours=6)),
+                        version=optimizer.VERSION, summary=dict(solver='HiGHS MILP', telemetry_fresh=True,
+                                                                 dispatch_policy=optimizer.dispatch_policy(settings))))
+    assert controller.guards(settings, now) == []
+    assert any('new local day' in reason for reason in controller.guards(settings, now + timedelta(days=1)))
+    assert any('older than 35 minutes' in reason for reason in controller.guards(settings, now + timedelta(minutes=36)))
+
+
 @pytest.mark.parametrize('failure', [None, 'planning', 'verification'])
 def test_enabling_control_builds_and_applies_first_step(db, security, tmp_path, monkeypatch, failure):
     from types import SimpleNamespace

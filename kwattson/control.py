@@ -75,6 +75,8 @@ class Controller:
                 reasons.append('Latest background plan was not verified with fresh readings')
             if review and review.get('policy') != plans.policy(self.db, settings, now):
                 reasons.append('Waiting for a plan with the current settings and manual overrides')
+            if review and review.get('day') != now.astimezone(settings.zone).date().isoformat():
+                reasons.append('Waiting for an adopted plan for the new local day')
             if not decision or now - datetime.fromisoformat(checked_at or decision['created_at']) > timedelta(minutes=35):
                 reasons.append('Plan missing or older than 35 minutes')
             elif decision['version'] != VERSION or decision['summary'].get('dispatch_policy') != dispatch_policy(settings):

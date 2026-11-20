@@ -128,7 +128,8 @@ def consider(db, settings: Settings, previous, candidate, now):
     summary = {**candidate['summary'], 'adopted': adopt, 'adoption': comparison}
     chosen = candidate if adopt else previous
     record = dict(decision_id=chosen['id'], reviewed_at=stamp(now), candidate_id=candidate['id'],
-                  valid=valid, candidate_policy=signature, policy=signature if adopt else active.get('policy'), day=day if adopt else active.get('day'))
+                  valid=valid, candidate_policy=signature, candidate_day=day,
+                  policy=signature if adopt else active.get('policy'), day=day if adopt else active.get('day'))
     with db.connect() as c:
         c.execute('UPDATE decisions SET summary=? WHERE id=?', (encode(summary), candidate['id']))
         c.execute("INSERT OR REPLACE INTO meta VALUES('active_plan', ?)", (encode(record),))

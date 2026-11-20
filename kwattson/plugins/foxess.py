@@ -342,6 +342,10 @@ class FoxESSCloud(SystemPlugin):
         for command in commands:
             if command.end <= command.start or command.start.astimezone(zone).date() != day:
                 raise PluginError('FoxESS daily schedule must stay within one local day')
+            local_end = command.end.astimezone(zone)
+            if local_end.date() != day and not (local_end.date() == day + timedelta(days=1) and
+                                                local_end.hour == 0 and local_end.minute == 0):
+                raise PluginError('FoxESS daily schedule must stay within one local day')
             if previous and command.start < previous:
                 raise PluginError('FoxESS daily schedule groups overlap')
             group = self._group(command, limit)
@@ -468,6 +472,8 @@ def _same_schedule(sent, result, local_now=None):
 
 
 def _validate_group(group, properties):
+    if group['endHour'] * 60 + group['endMinute'] <= group['startHour'] * 60 + group['startMinute']:
+        raise PluginError('FoxESS time groups must have a positive minute duration')
     normalized = {k.lower(): v for k, v in properties.items()}
     modes = (normalized.get('workmode') or {}).get('enumList')
     if modes and group['workMode'] not in modes:

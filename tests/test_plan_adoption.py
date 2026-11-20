@@ -122,6 +122,14 @@ def test_failed_candidate_blocks_control_without_erasing_adopted_plan(db, settin
     assert not db.meta('active_plan')['valid']
 
 
+def test_new_day_requires_a_new_adopted_plan_even_without_energy_changes(db, settings):
+    previous = {'id': 1, 'version': 'test', 'summary': {'solver': 'HiGHS MILP', 'telemetry_fresh': True}}
+    db.set_meta('active_plan', dict(decision_id=1, day='2026-11-19', policy=plans.policy(db, settings, NOW)))
+    chosen = plans.consider(db, settings, previous, {**previous, 'id': 2}, NOW)
+    assert chosen['id'] == 2
+    assert db.meta('active_plan')['day'] == '2026-11-20'
+
+
 def test_six_am_checkpoint_survives_background_runs(db, settings):
     from types import SimpleNamespace
     from kwattson import forecast

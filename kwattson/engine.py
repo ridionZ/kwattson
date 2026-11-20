@@ -53,7 +53,8 @@ class Engine:
         previous = self.latest_decision()
         active = self.db.meta('active_plan', {})
         if active:
-            self.db.set_meta('active_plan', {**active, 'candidate_policy': plans.policy(self.db, settings, utcnow())})
+            self.db.set_meta('active_plan', {**active, 'candidate_policy': plans.policy(self.db, settings, utcnow()),
+                                             'candidate_day': utcnow().astimezone(settings.zone).date().isoformat()})
         forecast_id, points, model = await asyncio.to_thread(forecast.build, self.db, settings)
         run = self.db.one('SELECT created_at FROM forecasts WHERE id=?', (forecast_id,))
         reviewed_at = datetime.fromisoformat(run['created_at'])
@@ -108,7 +109,8 @@ class Engine:
                 self.next['weather'] = now + 600
                 self.db.audit('weather_failed', {'error': type(error).__name__})
         active_plan = self.db.meta('active_plan', {})
-        if active_plan and active_plan.get('candidate_policy', active_plan.get('policy')) != plans.policy(self.db, settings, utcnow()):
+        if active_plan and (active_plan.get('candidate_policy', active_plan.get('policy')) != plans.policy(self.db, settings, utcnow())
+                            or active_plan.get('candidate_day', active_plan.get('day')) != utcnow().astimezone(settings.zone).date().isoformat()):
             self.next['plan'] = 0
         if now >= self.next['plan']:
             self.next['plan'] = now + PLAN_SECONDS
