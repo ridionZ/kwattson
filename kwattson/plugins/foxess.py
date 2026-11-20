@@ -8,7 +8,8 @@ Control caveats (also shown in the UI):
   while a group is enabled, that group recurs at the same time each day. Groups
   are kept short (<=30 min) and `release()` disables the scheduler.
 - ForceCharge power may be limited by the inverter's own configuration.
-- Write support has NOT been verified on hardware by this project yet.
+- Scheduler power limits describe AC power and can be lower than the battery's
+  DC charging limit. Read the inverter's advertised limit before each command.
 """
 from __future__ import annotations
 
@@ -91,7 +92,8 @@ class FoxESSCloud(SystemPlugin):
     can_control = True
     supported_modes = tuple(MODES)
     control_notes = ('Uses FoxESS cloud scheduler time groups. Groups repeat daily until replaced; the controller replaces '
-                     'them every cycle and disables the scheduler when control stops. Not yet verified on hardware.')
+                     'them every cycle and disables the scheduler when control stops. Scheduler power is capped '
+                     'at the inverter-reported limit; the configured battery charge limit is a DC limit.')
 
     _lock = asyncio.Lock()   # FoxESS allows ~1 request/second per key
     _last = 0.0
@@ -202,7 +204,7 @@ class FoxESSCloud(SystemPlugin):
                 continue  # Optional on older inverters.
         return {'reading': reading.as_dict(), 'hardware': hardware}
 
-    def _group(self, command: BatteryCommand) -> dict:
+    def _group(self, command: BatteryCommand, power_limit_w: int | None = None) -> dict:
         zone = ZoneInfo(self.context.timezone)
         start, end = command.start.astimezone(zone), command.end.astimezone(zone)
         if start.date() != end.date() and not (end.hour == 0 and end.minute == 0):
@@ -219,6 +221,8 @@ class FoxESSCloud(SystemPlugin):
         elif command.mode == 'force_discharge':
             extra['fdSoc'] = max(reserve, math.ceil(command.target_soc or reserve))
             extra['fdPwr'] = round(min(command.power_kw, self.system.battery.discharge_kw) * 1000)
+        if power_limit_w is not None:
+            extra['fdPwr'] = min(extra['fdPwr'], power_limit_w)
         return {'enable': 1, 'startHour': start.hour, 'startMinute': start.minute, 'endHour': end.hour,
                 'endMinute': end.minute, 'workMode': MODES[command.mode], 'extraParam': extra}
 
@@ -226,7 +230,12 @@ class FoxESSCloud(SystemPlugin):
         if (command.end - command.start) > timedelta(minutes=30):
             raise PluginError('Commands are limited to 30 minutes')
         sn = await self.serial()
-        group = self._group(command)
+        # FoxESS may acknowledge an out-of-range write while leaving the old
+        # schedule in place. BatterySpec.charge_kw is a DC limit, not the AC
+        # scheduler limit (e.g. 13 kW DC versus a reported 10,500 W fdPwr).
+        current = await self._request('/op/v2/device/scheduler/get', {'deviceSN': sn})
+        power_limit_w = _scheduler_power_limit(current.get('result'), self.system.ac_kw)
+        group = self._group(command, power_limit_w)
         await self._request('/op/v2/device/scheduler/enable', {'deviceSN': sn, 'groups': [group]}, write=True)
         await self._request('/op/v1/device/scheduler/set/flag', {'deviceSN': sn, 'enable': 1}, write=True)
         checks = []
@@ -266,7 +275,8 @@ class FoxESSCloud(SystemPlugin):
                 pass
         last_count = next((check['groups'] for check in reversed(checks) if 'groups' in check), 0)
         return CommandResult(accepted=True, verified=verified, detail={
-            'group': group, 'read_back_groups': last_count, 'read_back_checks': checks,
+            'group': group, 'scheduler_power_limit_w': power_limit_w,
+            'read_back_groups': last_count, 'read_back_checks': checks,
         })
 
     async def release(self) -> CommandResult:
@@ -287,6 +297,24 @@ class FoxESSCloud(SystemPlugin):
             pass
         return CommandResult(accepted=True, verified=disabled,
                              detail={'scheduler_enabled': not disabled, 'read_back_attempts': attempts})
+
+
+def _scheduler_power_limit(result: dict | None, ac_kw: float) -> int:
+    """Use advertised watts, or the configured AC rating on older firmware."""
+    properties = result.get('properties') if isinstance(result, dict) else None
+    properties = properties if isinstance(properties, dict) else {}
+    for name, prop in properties.items():
+        if name.lower() != 'fdpwr':
+            continue
+        try:
+            maximum = _number(prop['range']['max'])
+            unit = prop.get('unit', 'W')
+            if maximum is not None and 1 <= maximum <= 100_000 and unit == 'W':
+                return math.floor(maximum)
+        except (TypeError, ValueError, KeyError, OverflowError):
+            pass
+        raise PluginError('FoxESS returned an invalid scheduler power limit')
+    return math.floor(ac_kw * 1000)
 
 
 def _same_number(value, expected: int | float) -> bool:

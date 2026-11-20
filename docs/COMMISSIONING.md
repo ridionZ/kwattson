@@ -44,8 +44,15 @@ Missing weather uses a conservative fallback forecast.
   case is one ≤20-minute force charge/discharge window per day, bounded by your reserve. To clear it
   manually: FoxESS app → device → *Mode Scheduler* → turn off.
 - Force-charge power may be capped by the inverter's own settings.
-- Write support has not yet been verified on hardware by this project. Treat the first commissioning
-  as a test.
+- Before writing a schedule, the plugin reads the inverter's `fdPwr` range and caps the
+  requested power at that limit. The battery's configured charge limit describes DC power;
+  it can exceed the scheduler's AC limit (for example, 13 kW DC versus 10.5 kW AC).
+  Older firmware without this range uses the configured inverter AC rating. Invalid reported
+  limits block the write. The applied group and scheduler limit are stored in the command result.
+  FoxESS can acknowledge an out-of-range request without applying it, so matching read-back
+  remains mandatory.
+- Scheduler writes and release have been checked on a KH9.9. Treat commissioning on other
+  models or firmware as a test and confirm physical charging in the inverter app.
 
 ## Stopping
 - Dashboard: **Stop automatic control** (always visible in automatic mode).

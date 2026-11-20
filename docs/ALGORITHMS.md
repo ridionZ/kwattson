@@ -181,6 +181,16 @@ For past days with ≥90% coverage, uses measured load/solar as a *perfect* fore
 optimiser vs self-use under each tariff. PV in output-limited intervals is reconstructed from the
 solar model where higher. Upper bound on achievable savings; real results are lower.
 
+## 7. FoxESS command limits
+
+Before each scheduler write, the plugin reads the inverter's advertised maximum `fdPwr`
+in watts. It caps force-charge and force-discharge commands at this limit while retaining
+the configured battery DC limits for planning and solar charging. If older firmware omits
+the range, the configured inverter AC rating is the fallback. An invalid advertised limit
+prevents the write. This avoids acknowledged but unapplied commands when the DC charging
+limit exceeds the scheduler's AC limit. The command result records the applied group and
+the scheduler power limit; enabled-schedule read-back and telemetry checks still apply.
+
 ## Known gaps / ideas
 - Temperature response is one global linear term; per-hour responses would fit AC use better.
 - No ensemble weather or stochastic optimisation yet; risk is handled by the risk setting.
