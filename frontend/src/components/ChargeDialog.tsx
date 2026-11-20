@@ -41,6 +41,13 @@ export interface ChargingVehicle {
 interface Window { start: string; end: string }
 interface TariffWindow extends Window { rate: number; overflow_rate: number | null }
 export interface ChargeEstimate {
+  soc?: number | null;
+  soc_at?: string | null;
+  charging?: boolean;
+  automatic?: boolean;
+  charging_outside_window?: boolean;
+  continuous_end_soc?: number | null;
+  continuous_target_reachable?: boolean | null;
   finish: string;
   deadline?: string;
   energy_kwh: number;
@@ -121,8 +128,8 @@ export default function ChargeDialog({ vehicle, onClose, onDone }: {
   const [target, setTarget] = useState(TARGETS.includes(initialTarget) ? initialTarget : 'Custom');
   const [customTarget, setCustomTarget] = useState(initialTarget);
   const [startingSoc, setStartingSoc] = useState(vehicle.manual_soc == null ? '' : String(vehicle.manual_soc));
-  const [stop, setStop] = useState(false);
-  const [automatic, setAutomatic] = useState(false);
+  const [stop, setStop] = useState(!!vehicle.can_stop_charging);
+  const [automatic, setAutomatic] = useState(!!vehicle.can_schedule_charging);
   const [allowedRates, setAllowedRates] = useState<number[] | null>(null);
   const [rateOptions, setRateOptions] = useState<number[]>([]);
   const [tariffsOpen, setTariffsOpen] = useState(false);
@@ -131,7 +138,7 @@ export default function ChargeDialog({ vehicle, onClose, onDone }: {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
-  const hasLiveSoc = vehicle.reading?.soc != null && f.ageMinutes(vehicle.reading.ts, openedAt) <= 60;
+  const hasLiveSoc = vehicle.reading?.soc != null && f.ageMinutes(vehicle.reading.ts) <= 60;
   const readyBy = mode === 'ready_by';
   const duration = mode === 'time' && timeKind === 'in';
   const endAt = readyBy ? deadline : mode === 'time' && timeKind === 'at' ? clock : null;
@@ -181,7 +188,7 @@ export default function ChargeDialog({ vehicle, onClose, onDone }: {
       }
     }, 250);
     return () => { cancelled = true; window.clearTimeout(timer); };
-  }, [query, valid]);
+  }, [query, valid, vehicle.reading?.ts]);
 
   async function save(e: FormEvent) {
     e.preventDefault();
@@ -190,7 +197,8 @@ export default function ChargeDialog({ vehicle, onClose, onDone }: {
     setBusy(true);
     try {
       await post('/api/overrides', fields);
-      toast('Charging plan saved.');
+      toast(fields.auto_schedule ? 'Automatic charging schedule saved.' : fields.stop_at_limit
+        ? 'Charge limit saved. kWattson will request and verify a stop.' : 'Estimate saved. The car will not be controlled.');
       onDone();
     } catch (e) {
       setError(errorText(e));
@@ -280,6 +288,9 @@ export default function ChargeDialog({ vehicle, onClose, onDone }: {
               </Button>
             </Box>}
           </Alert>}
+          {readyBy && allowedRates !== null && <Alert severity="info">
+            Only the selected grid rates are permitted. A deadline does not override this restriction; allow another rate if the target cannot be reached.
+          </Alert>}
           {preview && preview.energy_kwh > 0 && preview.paid_grid_aud === null &&
             <Typography variant="body2" color="text.secondary">Grid cost estimate unavailable.</Typography>}
           {preview?.target_reachable == null && mode === 'percentage' && !hasLiveSoc && initialPct == null &&
@@ -297,7 +308,7 @@ export default function ChargeDialog({ vehicle, onClose, onDone }: {
               <AccordionDetails>
                 {preview?.tariffs && (Number(preview.grid_kwh) > 0 || allowedRates !== null) &&
                   <ChargeTimeline tariffs={preview.tariffs} windows={preview.windows ?? []} />}
-                <FormControlLabel label="Allow any grid rate" control={<Checkbox checked={allowedRates === null}
+                <FormControlLabel label="Allow any grid rate" control={<Checkbox checked={allowedRates === null} disabled={!rateOptions.length}
                   onChange={e => setAllowedRates(e.target.checked ? null : rateOptions.filter(r => r === 0))} />} />
                 {allowedRates !== null && <Stack direction="row" sx={{ flexWrap: "wrap" }} role="group" aria-label="Allowed grid rates">
                   {rateOptions.map(rate => <FormControlLabel key={rate} label={rateLabel(rate)}
@@ -305,8 +316,8 @@ export default function ChargeDialog({ vehicle, onClose, onDone }: {
                       setAllowedRates(e.target.checked ? [...allowedRates, rate].sort((a, b) => a - b) : allowedRates.filter(r => r !== rate))} />} />)}
                 </Stack>}
                 {allowedRates !== null && <Typography variant="caption" color="text.secondary">
-                  {automatic ? 'Automatic windows use rates that are safe for grid import even if solar or stored energy runs short.'
-                    : 'The estimate can also use expected spare solar or home battery where available.'}
+                  Spare solar and home battery energy can also supply the car outside these grid rates.
+                  {automatic && ' Charging pauses if home energy runs short or readings become stale. Delayed cloud readings or commands can allow brief paid imports.'}
                 </Typography>}
               </AccordionDetails>
             </Accordion>
@@ -318,6 +329,7 @@ export default function ChargeDialog({ vehicle, onClose, onDone }: {
                 <Typography variant="body2" color="text.secondary">{automatic
                   ? 'Leave the car plugged in at home. Automatic start and stop depend on the car connection staying online.'
                   : 'Set the charging windows on your car or charger.'}</Typography>
+                {!automatic && <Alert severity="warning" sx={{ mt: 1 }}>Estimate only. Saving this plan will not start or stop your car.</Alert>}
               </Box>
             : <Box>
                 {vehicle.can_stop_charging && <FormControlLabel label="Ask the car to stop at this limit"
@@ -325,6 +337,7 @@ export default function ChargeDialog({ vehicle, onClose, onDone }: {
                 <Typography variant="body2" color="text.secondary">{stop
                   ? 'Start charging at home. The car connection can take several minutes to report or confirm a stop.'
                   : 'Set the stop on your car or charger.'}</Typography>
+                {!stop && <Alert severity="warning" sx={{ mt: 1 }}>Automatic stopping is off. The car may keep charging beyond this target or time.</Alert>}
               </Box>}
           {!preview && valid && !previewError && <Typography variant="body2" color="text.secondary" role="status">Estimating charging…</Typography>}
           {(error || previewError) && <Alert severity="error">{error || previewError}</Alert>}
@@ -333,7 +346,7 @@ export default function ChargeDialog({ vehicle, onClose, onDone }: {
       <DialogActions sx={{ px: 3, pb: 2.5 }}>
         <Button onClick={onClose} disabled={busy}>Cancel</Button>
         <Button type="submit" variant="contained" disabled={busy || !valid || !!previewError || (readyBy && preview?.target_reachable == null)}>
-          {busy ? 'Saving…' : 'Save plan'}
+          {busy ? 'Saving…' : readyBy && automatic ? 'Save automatic schedule' : !readyBy && stop ? 'Save automatic stop' : 'Save estimate only'}
         </Button>
       </DialogActions>
     </Dialog>

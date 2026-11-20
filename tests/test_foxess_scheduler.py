@@ -1,6 +1,6 @@
 """Exercise FoxESS verification against synthetic scheduler replies."""
 import asyncio
-from datetime import timedelta
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import httpx
@@ -143,6 +143,11 @@ def test_daily_schedule_is_written_once_then_only_read(monkeypatch):
     start = utcnow().replace(second=0, microsecond=0)
     # Keep the synthetic test away from local midnight.
     start = start.astimezone(foxess.ZoneInfo('Australia/Brisbane')).replace(hour=11)
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return start.astimezone(tz)
+    monkeypatch.setattr(foxess, 'datetime', Clock)
     commands = [BatteryCommand('force_charge', start, start + timedelta(hours=2), 13, 80),
                 BatteryCommand('self_use', start + timedelta(hours=2), start + timedelta(hours=3))]
     state = {'enable': 0, 'groups': [], 'maxGroupCount': 96,

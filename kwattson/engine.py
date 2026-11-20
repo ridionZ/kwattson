@@ -96,11 +96,12 @@ class Engine:
             if first:
                 self.request_plan()
         if now >= self.next['vehicles']:
-            self.next['vehicles'] = now + 300
             await self.devices.poll_vehicles(settings)
+            self.next['vehicles'] = time.time() + self.devices.vehicle_poll_seconds(settings)
         async with self.ev_lock:
             if await ev_charging.monitor(self.db, self.db.settings(), self.devices, self.notifications, utcnow()):
                 self.request_plan()
+                self.next['vehicles'] = min(self.next['vehicles'], time.time() + 30)
         if not self.runtime.demo and settings.site.weather_enabled and now >= self.next['weather']:
             self.next['weather'] = now + 3600
             try:

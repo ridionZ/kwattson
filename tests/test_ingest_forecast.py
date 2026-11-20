@@ -14,6 +14,13 @@ from conftest import ZONE
 T0 = datetime(2026, 11, 10, 0, 0, tzinfo=timezone.utc)
 
 
+def test_net_ac_power_can_be_negative_during_grid_charging():
+    from kwattson.devices import _validate
+    _validate(SystemReading(ts=T0, time_verified=True, ac_output_kw=-4.959, charge_kw=5.2))
+    with pytest.raises(ValueError, match='charge_kw'):
+        _validate(SystemReading(ts=T0, time_verified=True, charge_kw=-1))
+
+
 def reading(minutes, load=2.0, solar=0.0, imp=2.0, exp=0.0, soc=50.0):
     return SystemReading(ts=T0 + timedelta(minutes=minutes), time_verified=True, soc=soc, pv_kw=solar, charge_kw=0, discharge_kw=0,
                          import_kw=imp, export_kw=exp, load_kw=load)

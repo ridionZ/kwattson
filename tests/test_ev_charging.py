@@ -75,10 +75,9 @@ def test_stop_uses_the_first_observed_limit_and_confirms_from_the_car(db, settin
 
 @pytest.mark.parametrize('stop_at_limit, at_home, age, state', [
     (False, True, 0, 'finished'),
-    (True, True, 26, 'unconfirmed'),
     (True, False, 0, 'finished'),
 ])
-def test_planning_only_stale_and_away_sessions_never_send_a_stop(db, settings, stop_at_limit, at_home, age, state):
+def test_planning_only_and_away_sessions_never_send_a_stop(db, settings, stop_at_limit, at_home, age, state):
     settings.vehicles = [CAR]
     expires = NOW + timedelta(hours=1)
     db.execute('INSERT INTO overrides(created_at, starts, expires, kind, data) VALUES(?,?,?,?,?)',
@@ -91,6 +90,69 @@ def test_planning_only_stale_and_away_sessions_never_send_a_stop(db, settings, s
     devices.vehicle.assert_not_called()
     assert decode(db.one('SELECT data FROM overrides')['data'])['state'] == state
     notify.emit.assert_called_once()
+
+
+def test_time_cutoff_stops_even_if_monitoring_is_stale_and_verifies_after_uncertain_receipt(db, settings):
+    settings.vehicles = [CAR]
+    until = NOW + timedelta(hours=1)
+    db.execute('INSERT INTO overrides(created_at,starts,expires,kind,data) VALUES(?,?,?,?,?)',
+               (stamp(NOW), stamp(NOW), stamp(until), 'ev_charge_now', encode({
+                   'vehicle_id': CAR.id, 'stop_at_limit': True})))
+    reading(db, until - timedelta(minutes=26), 60)
+    plugin = SimpleNamespace(stop_charging=AsyncMock(side_effect=TimeoutError))
+    devices = SimpleNamespace(vehicle=lambda *_: plugin)
+    notify = SimpleNamespace(emit=Mock())
+
+    async def run():
+        await ev_charging.monitor(db, settings, devices, notify, until)
+        assert decode(db.one('SELECT data FROM overrides')['data'])['state'] == 'stopping'
+        assert db.one('SELECT status FROM commands')['status'] == 'pending'
+        reading(db, until + timedelta(seconds=30), 60, charging=False)
+        await ev_charging.monitor(db, settings, devices, notify, until + timedelta(seconds=30))
+        assert db.one('SELECT status FROM commands')['status'] == 'verified'
+        assert decode(db.one('SELECT data FROM overrides')['data'])['state'] == 'confirmed'
+        plugin.stop_charging.assert_awaited_once()
+
+    asyncio.run(run())
+
+
+def test_stop_retries_only_on_new_proof_of_charging_and_has_a_limit(db, settings):
+    settings.vehicles = [CAR]
+    db.execute('INSERT INTO overrides(created_at,starts,expires,kind,data) VALUES(?,?,?,?,?)',
+               (stamp(NOW), stamp(NOW), stamp(NOW + timedelta(hours=1)), 'ev_charge_now', encode({
+                   'vehicle_id': CAR.id, 'target_pct': 50, 'stop_at_limit': True})))
+    plugin = SimpleNamespace(stop_charging=AsyncMock())
+    devices = SimpleNamespace(vehicle=lambda *_: plugin)
+    notify = SimpleNamespace(emit=Mock())
+
+    async def run():
+        reading(db, NOW, 60)
+        await ev_charging.monitor(db, settings, devices, notify, NOW)
+        await ev_charging.monitor(db, settings, devices, notify, NOW + timedelta(seconds=100))
+        plugin.stop_charging.assert_awaited_once()
+        for seconds in (120, 240, 280, 300, 320):
+            at = NOW + timedelta(seconds=seconds)
+            reading(db, at, 60)
+            await ev_charging.monitor(db, settings, devices, notify, at)
+        assert plugin.stop_charging.await_count == 3
+        assert decode(db.one('SELECT data FROM overrides')['data'])['state'] == 'unconfirmed'
+
+    asyncio.run(run())
+
+
+def test_command_requires_new_known_physical_state(db, settings):
+    settings.vehicles = [CAR]
+    devices = SimpleNamespace(vehicle=lambda *_: SimpleNamespace(stop_charging=AsyncMock()))
+    notify = SimpleNamespace(emit=Mock())
+    reading(db, NOW, 60, charging=False)
+    asyncio.run(ev_charging.request_control(db, settings, devices, CAR, NOW, stop=True))
+    assert not ev_charging.verify_requests(db, settings, notify, NOW)
+    reading(db, NOW + timedelta(seconds=30), 60, charging=None)
+    assert not ev_charging.verify_requests(db, settings, notify, NOW + timedelta(seconds=30))
+    assert db.one('SELECT status FROM commands')['status'] == 'pending'
+    reading(db, NOW + timedelta(seconds=60), 60, charging=False)
+    assert ev_charging.verify_requests(db, settings, notify, NOW + timedelta(seconds=60))
+    assert db.one('SELECT status FROM commands')['status'] == 'verified'
 
 
 def test_cost_preview_uses_surplus_and_grid_allowance_and_requires_coverage(db, settings, monkeypatch):

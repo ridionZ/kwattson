@@ -55,16 +55,19 @@ export function describe(holidays: Holiday[], overrides: Override[], vehicles: {
         const state = o.data?.state;
         const details = o.data?.cancel_requested ? ['Ending automatic schedule']
           : state === 'stopping' ? ['Waiting for the car to confirm charging stopped']
-          : state === 'confirmed' ? ['Car confirmed charging stopped']
+          : state === 'confirmed' ? [o.data?.auto_schedule || o.data?.stop_at_limit ? 'Car confirmed charging stopped' : 'Target reached; automatic control was off']
           : state === 'finished' ? ['Charge plan ended']
           : state === 'unconfirmed' ? ['Check the car or charger to confirm charging has stopped']
-          : o.data?.charge_mode === 'ready_by' ? [limit, o.data.auto_schedule ? 'Automatic schedule' : 'Set the times on your car or charger']
+          : o.data?.charge_mode === 'ready_by' ? [limit, o.data.auto_schedule ? 'Automatic schedule' : 'Estimate only — car is not controlled']
           : [limit, o.data?.stop_at_limit ? 'Automatic stop enabled' : 'Set the stop on your car or charger'];
         if (!state && !o.data?.cancel_requested && estimate && (estimate.energy_kwh > 0 || estimate.target_reachable === false)) {
+          if (estimate.soc != null) details.push(`current ${f.pct(estimate.soc)}`);
           if (estimate.target_reachable === false) details.push(`estimated ${f.pct(estimate.end_soc)}`);
           else details.push(`estimated finish ${f.when(estimate.finish, now)}`);
           if (next) details.push(`charging ${f.when(next.start, now)}–${f.when(next.end, now)}`);
           if (estimate.paid_grid_kwh) details.push(`about ${f.money(estimate.paid_grid_aud)} in paid grid power`);
+          if (estimate.charging_outside_window && !o.data.auto_schedule) details.push('Car is charging outside this plan; imports may be billed');
+          if (estimate.continuous_end_soc != null) details.push(`if charging continues, estimated ${f.pct(estimate.continuous_end_soc)} by the deadline`);
         }
         items.push({ ...base, active: !state || state === 'stopping', Icon: EvStationRounded,
           title: `${car(o.data?.vehicle_id)} charge plan`, detail: details.join(' · '), noun: 'the charge plan', battery: true, charging: true, automatic: o.data?.auto_schedule });

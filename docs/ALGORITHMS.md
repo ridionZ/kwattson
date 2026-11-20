@@ -61,7 +61,7 @@ level when available, then from weekly km × kWh/100km ÷ sessions. Away overrid
 The paid-grid estimate uses the latest plan's forecast imports, curtailed and exported solar, tariff
 tiers and remaining daily allowance. A plan covering the full session is required. The estimate can
 change as the household plan adapts to the extra load. Connected MG iSMART cars can be opted in to a
-single stop request with follow-up confirmation from vehicle readings. Manual cars use the plan and
+stop requests with follow-up confirmation from vehicle readings. Manual cars use the plan and
 time-limit reminder. A future charge adds demand at its saved time using the estimated wall
 charging rate. Its energy is capped at a full charge from empty, since the battery level on the
 future date may differ from today's reading. Longer-dated entries are used when they reach the home
@@ -76,11 +76,46 @@ Ready-by sessions initially plan at 80% of the measured, learned or configured r
 slots follow the local tariff and any active tariff changes. The scheduler ranks feasible charging
 energy by marginal cost and prefers a 30-minute margin before departure when feasible. Fresh
 planned spare solar and battery energy above reserve can reduce forecast imports. A restricted
-automatic schedule only runs in tariff windows safe for import even if those supplies disappear.
+schedule may redirect optional battery exports to the car while preserving the forecast household
+energy and reserve. Past intervals are excluded from that remaining battery budget. A restricted
+automatic schedule can also use surplus-only windows outside the chosen grid rates. Those windows
+must have forecast solar or battery capacity to cover the full configured charger power. At runtime,
+site metering no older than seven minutes, spare discharge capacity and a battery margin above reserve
+are required. The margin covers nine minutes of maximum discharge (telemetry age plus cloud stop time),
+or 2% of capacity, whichever is greater. This accommodates five-minute inverter cloud telemetry.
+Paid imports above 100 W, insufficient energy, or stale readings pause charging for at least ten
+minutes. Cloud command and meter delays can still allow brief paid imports; this is not a hard
+real-time grid interlock. Grid-rate windows keep a tariff-boundary buffer.
 Allowance-limited rates use a conservative allowance bound based on metered usage and the site's
 import limit. A saved plan records its windows and pricing settings. Later vehicle readings can
 confirm the target or warn of a shortfall. The worker leaves the user's selected grid rates in place.
 Automatic commands require vehicle and session opt-in, and the worker checks post-command readings.
+
+Charging state is checked every two minutes while an MG is connected, every five minutes while
+idle, and every 30 seconds for five minutes after a command. Requests allow 45 seconds for the
+vendor's asynchronous response. A command receipt is not a physical confirmation: a newer, known
+charging state must match before its command record is verified. Stops can be retried up to three
+times, at least 90 seconds apart, only when a newer reading still shows charging. Failure to confirm
+raises an alert. A time cutoff can request a stop even when telemetry is stale; a percentage cutoff
+requires a recently reported percentage. The application must stay online for these cutoffs.
+An explicit vendor logout triggers one reconnect rather than an immediate 15-minute cooldown.
+Other failures keep the cooldown. MGS5 connector code 3 remains connected after a remote stop.
+When single-phase AC measurement is enabled, OBC input current (0.2 A units) and voltage (2 V units)
+provide wall power; signed DC battery power is not substituted for wall power.
+
+The charging dialog defaults to automatic control only when the owner has enabled the matching
+vehicle permission. Previously saved forecast-only sessions keep their original permissions and
+are labelled as estimates. Reaching their target never claims that kWattson stopped the car.
+Ready-by projections update from current battery readings and remaining saved windows. They show
+the effect of continuing observed manual charging separately, including a warning outside planned
+windows. The home load forecast includes that uncontrolled charging until full. Saved window energy
+is capped at the remaining target. Context from an adopted household plan uses its last successful
+review time rather than its original creation time.
+
+Overview offers refresh, start and stop controls. A manual command replaces automatic EV sessions
+for that car and is recorded separately from confirmation. Start requires a fresh connected reading;
+stop remains available when readings are missing. Grid-rate restrictions on a plan do not restrict
+an explicit manual start, whose confirmation shows the current grid rate.
 
 **Risk setting**: `balanced` plans on the centre; `conservative` moves load halfway to p90 and solar
 halfway to p10; `optimistic` the opposite.

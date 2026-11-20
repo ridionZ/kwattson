@@ -84,6 +84,10 @@ class ChargeOptions(Body):
     auto_schedule: bool = False
 
 
+class VehicleCharge(Body):
+    action: Literal['start', 'stop']
+
+
 class OverrideIn(ChargeOptions):
     kind: str = Field(pattern='^(hold|no_battery_export|reserve|ev_charge_now|ev_charge_planned|ev_away)$')
     start_at: str | None = Field(None, max_length=48)
@@ -332,7 +336,8 @@ async def status(request: Request):
                             reading=latest, poll=engine.devices.status.get(f'system:{s.id}')))
     vehicles = [dict(id=v.id, name=v.name, plugin=v.plugin, enabled=v.enabled, reading=db.latest_vehicle(v.id), manual_soc=v.manual_soc,
                      target_pct=v.target_pct, can_stop_charging=ev_charging.can_stop(v),
-                     can_schedule_charging=ev_charging.can_schedule(v), poll=engine.devices.status.get(f'vehicle:{v.id}')) for v in settings.vehicles]
+                     can_schedule_charging=ev_charging.can_schedule(v), poll=engine.devices.status.get(f'vehicle:{v.id}'),
+                     pending_charge=db.meta('ev_charge_pending', {}).get(v.id)) for v in settings.vehicles]
     try:
         today = outcomes.today_so_far(db, settings, now)
     except Exception:
@@ -912,6 +917,58 @@ def charging_vehicle(settings: Settings, vehicle_id: str | None) -> Vehicle:
     return vehicle
 
 
+@router.post('/vehicles/{vehicle_id}/refresh')
+async def refresh_vehicle(vehicle_id: str, request: Request):
+    db, _, engine, _ = ctx(request)
+    settings = db.settings()
+    charging_vehicle(settings, vehicle_id)
+    async with engine.ev_lock:
+        try:
+            await engine.devices.refresh_vehicle(settings, vehicle_id)
+        except Exception:
+            raise HTTPException(502, 'The car could not be refreshed. Check its connection status.') from None
+        ev_charging.verify_requests(db, settings, engine.notifications, utcnow())
+        engine.request_plan()
+    return db.latest_vehicle(vehicle_id)
+
+
+@router.post('/vehicles/{vehicle_id}/charge')
+async def vehicle_charge(vehicle_id: str, body: VehicleCharge, request: Request):
+    db, _, engine, _ = ctx(request)
+    async with engine.ev_lock:
+        settings = db.settings()
+        vehicle = charging_vehicle(settings, vehicle_id)
+        stop = body.action == 'stop'
+        if not (ev_charging.can_stop(vehicle) if stop else ev_charging.can_schedule(vehicle)):
+            raise HTTPException(422, 'Enable this charging control in the vehicle connection first.')
+        if not stop:
+            live = ev_charging.recent_reading(db, vehicle, utcnow(), timedelta(minutes=2))
+            if not live:
+                try:
+                    await engine.devices.refresh_vehicle(settings, vehicle_id)
+                except Exception:
+                    raise HTTPException(502, 'Could not read the car before starting charging.') from None
+                live = ev_charging.recent_reading(db, vehicle, utcnow(), timedelta(minutes=2))
+            if not live or live['plugged_in'] != 1 or live['at_home'] == 0:
+                raise HTTPException(409, 'Starting requires a fresh reading showing the car connected and not away.')
+        now = utcnow()
+        # An explicit manual command replaces automatic charging control for this
+        # car, so a background schedule cannot immediately undo the owner's action.
+        for session in ev_charging.sessions(db, now):
+            data = session['data']
+            if data.get('vehicle_id') == vehicle_id and (data.get('auto_schedule') or data.get('stop_at_limit')):
+                db.execute('UPDATE overrides SET cancelled_at=? WHERE id=?', (stamp(now), session['id']))
+        try:
+            command_id = await ev_charging.request_control(db, settings, engine.devices, vehicle, now, stop=stop)
+        except Exception:
+            raise HTTPException(502, 'Command receipt is uncertain. Checking the car for confirmation; check the car or charger.') from None
+        finally:
+            engine.next['vehicles'] = 0
+            engine.request_plan()
+        db.audit('ev_manual_command', dict(vehicle_id=vehicle_id, action=body.action, command_id=command_id), actor(request))
+        return {'command_id': command_id, 'status': 'pending', 'action': body.action}
+
+
 def charge_options(settings, vehicle, now, body):
     mode = body.charge_mode
     if (mode in ('percentage', 'ready_by') and body.target_pct is None
@@ -985,7 +1042,7 @@ def overrides(request: Request):
         v = vehicles.get(r['data'].get('vehicle_id'))
         if r['kind'] == 'ev_charge_now' and v and not r['data'].get('state') and r['starts'] <= stamp(now):
             if r['data'].get('charge_mode') == 'ready_by':
-                r['estimate'] = r['data']['charge_estimate']
+                r['estimate'] = ev_schedule.remaining_estimate(db, v, now, r)
             else:
                 decision = decision or engine.latest_decision()
                 r['estimate'] = advice.charging_preview(db, settings, v, now, datetime.fromisoformat(r['expires']),

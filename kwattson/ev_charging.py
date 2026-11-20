@@ -3,13 +3,67 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 from statistics import median
+from uuid import uuid4
 
 from .config import Settings, Vehicle, stamp
 from .db import Database, decode, encode
 from .plugins import registry
+from .plugins.base import PluginError
 
 LIVE_WINDOW = timedelta(minutes=25)
 END_GRACE = timedelta(minutes=30)
+CONTROL_CONFIRM_WINDOW = timedelta(minutes=5)
+
+
+async def request_control(db, settings, devices, vehicle, now, *, stop, source='manual'):
+    """Record a request separately from later physical confirmation."""
+    if not (can_stop(vehicle) if stop else can_schedule(vehicle)):
+        raise PluginError('Enable the vehicle charging control permission first')
+    pending = db.meta('ev_charge_pending', {})
+    old = pending.get(vehicle.id)
+    action = 'stop' if stop else 'start'
+    if old and old['action'] == action and now - datetime.fromisoformat(old['requested_at']) < timedelta(seconds=90):
+        return old['command_id']
+    if old:
+        db.execute("UPDATE commands SET status='superseded' WHERE id=? AND status='pending'", (old['command_id'],))
+    command_id = db.execute('INSERT INTO commands(created_at,action,payload,status,result,idempotency_key) VALUES(?,?,?,?,?,?)',
+                            (stamp(now), 'ev_' + action, encode(dict(vehicle=vehicle.id, source=source)), 'pending', '{}',
+                             'ev:' + vehicle.id + ':' + uuid4().hex))
+    pending[vehicle.id] = dict(action=action, requested_at=stamp(now), command_id=command_id, source=source)
+    db.set_meta('ev_charge_pending', pending)
+    try:
+        plugin = devices.vehicle(settings, vehicle.id)
+        await (plugin.stop_charging() if stop else plugin.start_charging())
+    except Exception as error:
+        db.execute('UPDATE commands SET result=? WHERE id=?', (encode({'receipt_error': type(error).__name__}), command_id))
+        raise
+    return command_id
+
+
+def verify_requests(db, settings, notify, now):
+    pending = db.meta('ev_charge_pending', {})
+    changed = False
+    vehicles = {v.id: v for v in settings.active_vehicles()}
+    for vehicle_id, command in list(pending.items()):
+        vehicle = vehicles.get(vehicle_id)
+        live = recent_reading(db, vehicle, now) if vehicle else None
+        expected = command['action'] == 'start'
+        if live and live['ts'] > command['requested_at'] and live['charging'] is not None and bool(live['charging']) == expected:
+            db.execute("UPDATE commands SET status='verified', verified_at=?, result=? WHERE id=?",
+                       (stamp(now), encode({'charging': expected, 'reading_at': live['ts']}), command['command_id']))
+            pending.pop(vehicle_id)
+            changed = True
+        elif now - datetime.fromisoformat(command['requested_at']) >= CONTROL_CONFIRM_WINDOW:
+            db.execute("UPDATE commands SET status='unverified' WHERE id=?", (command['command_id'],))
+            if vehicle and command.get('source', 'manual') == 'manual':
+                notify.emit('ev_charge_session', {'vehicle': vehicle.name,
+                            'reason': f'The car has not confirmed the {command["action"]} request. Check the car or charger.'},
+                            key=f'ev-control:{command["command_id"]}', now=now)
+            pending.pop(vehicle_id)
+            changed = True
+    if changed:
+        db.set_meta('ev_charge_pending', pending)
+    return changed
 
 
 def can_stop(vehicle: Vehicle) -> bool:
@@ -113,10 +167,10 @@ async def monitor(db: Database, settings: Settings, devices, notify, now: dateti
     """Evaluate limits, and confirm a stop with a subsequent charging reading."""
     from .ev_schedule import run_schedule
 
+    changed = verify_requests(db, settings, notify, now)
     active = sessions(db, now)
     if not active:
-        return False
-    changed = False
+        return changed
     seen = set()
     away_all = db.one('SELECT 1 FROM holidays WHERE ev_away AND start<=? AND end>?', (stamp(now), stamp(now)))
     away_vehicles = {decode(r['data']).get('vehicle_id') for r in db.rows(
@@ -152,9 +206,21 @@ async def monitor(db: Database, settings: Settings, devices, notify, now: dateti
             if live and live['ts'] > data['stop_requested_at'] and live['charging'] == 0:
                 data['state'] = 'confirmed'
                 message = 'Charging stopped and the car confirmed it.'
-            elif now - requested >= LIVE_WINDOW:
+            elif now - requested >= CONTROL_CONFIRM_WINDOW:
                 data['state'] = 'unconfirmed'
-                message = 'The car hasn’t confirmed that charging stopped. Check the car or charger.'
+                message = 'The car has not confirmed that charging stopped. Check the car or charger now.'
+            elif (live and live['ts'] > data.get('stop_last_attempt_at', data['stop_requested_at'])
+                  and live['charging'] == 1 and data.get('stop_attempts', 1) < 3
+                  and now - datetime.fromisoformat(data.get('stop_last_attempt_at', data['stop_requested_at'])) >= timedelta(seconds=90)):
+                data['stop_attempts'] = data.get('stop_attempts', 1) + 1
+                data['stop_last_attempt_at'] = stamp(now)
+                db.execute('UPDATE overrides SET data=? WHERE id=?', (encode(data), session['id']))
+                try:
+                    await request_control(db, settings, devices, v, now, stop=True, source=f'session:{session["id"]}')
+                except Exception:
+                    pass  # A timeout may follow a successful write; keep verifying.
+                changed = True
+                continue
             else:
                 continue
         elif data.get('charge_mode') == 'percentage' and now >= deadline and not limit:
@@ -173,15 +239,16 @@ async def monitor(db: Database, settings: Settings, devices, notify, now: dateti
         elif live and live['charging'] == 0:
             data['state'] = 'finished'
             message = f'{limit.capitalize()} reached. The car is already stopped.'
-        elif data.get('stop_at_limit') and can_stop(v) and live and live['charging'] == 1 and live['at_home'] != 0 and live['plugged_in'] != 0:
+        elif data.get('stop_at_limit') and can_stop(v) and (not live or
+                (live['at_home'] != 0 and live['plugged_in'] != 0)):
             # Record the attempt before sending it. A worker restart must not repeat an uncertain write.
-            data.update(state='stopping', stop_requested_at=stamp(now), stop_reason=limit)
+            data.update(state='stopping', stop_requested_at=stamp(now), stop_last_attempt_at=stamp(now),
+                        stop_attempts=1, stop_reason=limit)
             db.execute('UPDATE overrides SET data=? WHERE id=?', (encode(data), session['id']))
             try:
-                await devices.vehicle(settings, sid).stop_charging()
+                await request_control(db, settings, devices, v, now, stop=True, source=f'session:{session["id"]}')
             except Exception:
-                data['state'] = 'unconfirmed'
-                message = 'The charging stop could not be confirmed. Check the car or charger.'
+                message = 'The stop request receipt is uncertain. Checking whether the car stopped.'
             changed = True
         else:
             data['state'] = 'finished' if not data.get('stop_at_limit') else 'unconfirmed'
