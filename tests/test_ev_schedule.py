@@ -150,7 +150,14 @@ def test_surplus_schedule_stops_on_paid_import_and_respects_cooldown(db, setting
         await ev_charging.monitor(db, settings, devices, notify, at)
         plugin.start_charging.assert_awaited_once()
         assert decode(db.one('SELECT data FROM overrides WHERE id=?', (identity,))['data'])['surplus_paused_until'] > stamp(at)
-        assert not ev_schedule.home_energy_available(db, settings, CAR, at + timedelta(minutes=4))
+        assert ev_schedule.home_energy_available(db, settings, CAR, at + timedelta(minutes=5))
+        assert not ev_schedule.home_energy_available(db, settings, CAR, at + timedelta(minutes=8))
+        low = SystemReading(ts=at, time_verified=True, soc=16, import_kw=0, export_kw=0, load_kw=1,
+                            pv_kw=0, charge_kw=0, discharge_kw=1)
+        store_system(db, system.id, system.plugin, low)
+        store_site(db, combine(settings, {system.id: low}))
+        reading(db, at, 45, True)
+        assert not ev_schedule.home_energy_available(db, settings, CAR, at)
     asyncio.run(run())
 
 

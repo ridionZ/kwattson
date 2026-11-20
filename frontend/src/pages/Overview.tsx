@@ -405,7 +405,7 @@ function VehicleTile({ vehicle: v, now, price }: { vehicle: any; now: number; pr
       <Button size="small" disabled={busy} onClick={() => void send('refresh')}>Refresh</Button>
       {v.can_schedule_charging && r?.charging !== 1 && <Button size="small" disabled={busy || !!v.pending_charge || !fresh || r?.plugged_in !== 1}
         onClick={() => { setError(null); setStartOpen(true); }}>Start charging</Button>}
-      {v.can_stop_charging && <Button size="small" color="error" disabled={busy || v.pending_charge?.action === 'stop'}
+      {v.can_stop_charging && <Button size="small" color="error" disabled={busy || (v.pending_charge?.action === 'stop' && f.ageMinutes(v.pending_charge.requested_at, now) < 1.5)}
         onClick={() => void send('stop')}>Stop charging</Button>}
     </Stack>}
     {can('member') && v.can_stop_charging && <Typography variant="caption" component="p">Manual commands end this car's automatic charging plans.</Typography>}

@@ -308,7 +308,7 @@ export default function ChargeDialog({ vehicle, onClose, onDone }: {
               <AccordionDetails>
                 {preview?.tariffs && (Number(preview.grid_kwh) > 0 || allowedRates !== null) &&
                   <ChargeTimeline tariffs={preview.tariffs} windows={preview.windows ?? []} />}
-                <FormControlLabel label="Allow any grid rate" control={<Checkbox checked={allowedRates === null}
+                <FormControlLabel label="Allow any grid rate" control={<Checkbox checked={allowedRates === null} disabled={!rateOptions.length}
                   onChange={e => setAllowedRates(e.target.checked ? null : rateOptions.filter(r => r === 0))} />} />
                 {allowedRates !== null && <Stack direction="row" sx={{ flexWrap: "wrap" }} role="group" aria-label="Allowed grid rates">
                   {rateOptions.map(rate => <FormControlLabel key={rate} label={rateLabel(rate)}
@@ -317,7 +317,7 @@ export default function ChargeDialog({ vehicle, onClose, onDone }: {
                 </Stack>}
                 {allowedRates !== null && <Typography variant="caption" color="text.secondary">
                   Spare solar and home battery energy can also supply the car outside these grid rates.
-                  {automatic && ' Charging pauses if home energy runs short or readings become stale. Cloud control delays can allow brief paid imports.'}
+                  {automatic && ' Charging pauses if home energy runs short or readings become stale. Delayed cloud readings or commands can allow brief paid imports.'}
                 </Typography>}
               </AccordionDetails>
             </Accordion>

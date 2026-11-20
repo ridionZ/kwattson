@@ -10,6 +10,7 @@ from . import plans
 STEP = timedelta(minutes=5)
 LEAD = timedelta(minutes=30)
 SAFETY_FACTOR = 0.8
+SURPLUS_READING_WINDOW = timedelta(minutes=7)  # Fox cloud telemetry updates about every five minutes.
 
 
 def forecast_rows(decision, settings, now, rows, reviewed_at=None):
@@ -309,7 +310,7 @@ def grid_allowed_now(db, settings, now, allowed):
 def home_energy_available(db, settings, vehicle, now):
     """Require current metering and spare discharge capacity before a surplus-only start."""
     site = db.latest_site()
-    if (not site or not timedelta(0) <= now - datetime.fromisoformat(site['ts']) <= timedelta(minutes=3)
+    if (not site or not timedelta(0) <= now - datetime.fromisoformat(site['ts']) <= SURPLUS_READING_WINDOW
             or site['fault'] or site['import_kw'] is None or site['import_kw'] > .1):
         return False
     spare = site['export_kw'] or 0
@@ -318,10 +319,11 @@ def home_energy_available(db, settings, vehicle, now):
         battery = system.battery
         live = db.latest_system(system.id) if battery else None
         if (not live or live['soc'] is None or live['fault']
-                or not timedelta(0) <= now - datetime.fromisoformat(live['ts']) <= timedelta(minutes=3)):
+                or not timedelta(0) <= now - datetime.fromisoformat(live['ts']) <= SURPLUS_READING_WINDOW):
             continue
         # Leave time to see reserve approaching and complete a cloud stop.
-        margin = max(.02 * battery.capacity_kwh, vehicle.charger_kw * (settings.site.poll_seconds + 120) / 3600)
+        margin = max(.02 * battery.capacity_kwh,
+                     min(battery.discharge_kw, system.ac_kw) * (SURPLUS_READING_WINDOW.total_seconds() + 120) / 3600)
         available = (live['soc'] - battery.reserve_pct) / 100 * battery.capacity_kwh
         if available > margin:
             spare += max(0, min(battery.discharge_kw, system.ac_kw) - (live['discharge_kw'] or 0))

@@ -80,7 +80,9 @@ schedule may redirect optional battery exports to the car while preserving the f
 energy and reserve. Past intervals are excluded from that remaining battery budget. A restricted
 automatic schedule can also use surplus-only windows outside the chosen grid rates. Those windows
 must have forecast solar or battery capacity to cover the full configured charger power. At runtime,
-fresh site metering, spare discharge capacity and a battery margin above reserve are required.
+site metering no older than seven minutes, spare discharge capacity and a battery margin above reserve
+are required. The margin covers nine minutes of maximum discharge (telemetry age plus cloud stop time),
+or 2% of capacity, whichever is greater. This accommodates five-minute inverter cloud telemetry.
 Paid imports above 100 W, insufficient energy, or stale readings pause charging for at least ten
 minutes. Cloud command and meter delays can still allow brief paid imports; this is not a hard
 real-time grid interlock. Grid-rate windows keep a tariff-boundary buffer.
