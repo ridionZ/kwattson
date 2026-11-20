@@ -237,6 +237,8 @@ def test_vehicle_controls_require_plugged_start_and_confirm_new_physical_state(t
 
 def test_timed_battery_modes_use_commissioned_controller(tmp_path, monkeypatch, settings):
     from test_device_controls import ready_controller
+    # Match settings loaded from storage, including validated numeric defaults.
+    settings = type(settings).model_validate(settings.model_dump())
     monkeypatch.setenv('DEMO_MODE', 'false')
     app = create_app(Runtime(data_dir=tmp_path, app_url=ORIGIN, dev_http=True, worker=False))
     app.state.security.create_owner('demo', PASSWORD)
@@ -246,7 +248,7 @@ def test_timed_battery_modes_use_commissioned_controller(tmp_path, monkeypatch, 
     client = TestClient(app, base_url=ORIGIN)
     headers = login(client)
     rejected = client.post('/api/systems/main/mode', json={'mode': 'force_charge', 'power_kw': 100}, headers=headers)
-    assert rejected.status_code == 422
+    assert rejected.status_code == 422, rejected.text
     device.apply_schedule.assert_not_called()
     response = client.post('/api/systems/main/mode', json={'mode': 'hold', 'minutes': 15}, headers=headers)
     assert response.status_code == 200, response.text
