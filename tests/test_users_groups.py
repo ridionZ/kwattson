@@ -94,7 +94,7 @@ def test_alert_groups(client):
     admin = login(client)
     groups = client.get('/api/notification-groups').json()
     car = next(g for g in groups if g['id'] == 'car')
-    assert {e['event'] for e in car['events']} == {'ev_charge_opportunity', 'ev_charge_reminder', 'ev_charge_session'}
+    assert {e['event'] for e in car['events']} == {'ev_charge_opportunity', 'ev_charge_reminder', 'ev_charge_session', 'vehicle_climate'}
     channel = client.post('/api/channels', json={'name': 'Phone', 'kind': 'ntfy', 'config': {'topic': 'abc-123'}}, headers=admin).json()['id']
     r = client.put('/api/notification-groups/car', json={'events': {'ev_charge_reminder': False}, 'channels': [channel],
                                                         'cooldown_minutes': 90, 'respect_quiet': True}, headers=admin)
@@ -102,7 +102,7 @@ def test_alert_groups(client):
     car = next(g for g in client.get('/api/notification-groups').json() if g['id'] == 'car')
     assert car['channels'] == [channel] and car['cooldown_minutes'] == 90
     assert {e['event']: e['enabled'] for e in car['events']} == {
-        'ev_charge_opportunity': True, 'ev_charge_reminder': False, 'ev_charge_session': True,
+        'ev_charge_opportunity': True, 'ev_charge_reminder': False, 'ev_charge_session': True, 'vehicle_climate': True,
     }
     bad = client.put('/api/notification-groups/car', json={'events': {'high_price': True}}, headers=admin)
     assert bad.status_code == 422

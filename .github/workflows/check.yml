@@ -13,7 +13,21 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
       - run: pip install --disable-pip-version-check -r deploy/requirements.lock 'pytest>=8,<10'
-      - run: pytest -q
+      - run: pytest -q --junitxml=pytest-results.xml
+      - name: Annotate test failures
+        if: failure()
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          path = Path('pytest-results.xml')
+          if path.exists():
+              for case in ET.parse(path).iter('testcase'):
+                  for failure in [*case.findall('failure'), *case.findall('error')]:
+                      message = (case.get('classname', '') + '.' + case.get('name', '') + ': ' + (failure.text or '')[-10000:])
+                      message = message.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+                      print('::error::' + message)
+          PY
   dashboard:
     runs-on: ubuntu-latest
     container: node:24-slim
